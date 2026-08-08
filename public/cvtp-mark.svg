@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-labelledby="cvtp-mark-title cvtp-mark-description">
+  <title id="cvtp-mark-title">CVTP signal mark</title>
+  <desc id="cvtp-mark-description">Four black, cyan, magenta, and yellow signal modules connected in motion.</desc>
+  <g fill="none" stroke-linecap="square" stroke-linejoin="round">
+    <path d="M96 390 232 246l142 126 166-168" stroke="#F4F1EA" stroke-width="30" opacity=".2"/>
+    <path d="M96 390 232 246l142 126 166-168" stroke="#F4F1EA" stroke-width="10"/>
+  </g>
+  <g transform="rotate(-8 112 390)">
+    <rect x="64" y="342" width="96" height="96" rx="20" fill="#101010" stroke="#F4F1EA" stroke-width="10"/>
+    <path d="m88 390 48-24v48z" fill="#F4F1EA" opacity=".92"/>
+  </g>
+  <g transform="rotate(7 232 246)">
+    <rect x="178" y="192" width="108" height="108" rx="22" fill="#27D9D4" stroke="#0B0D10" stroke-width="10"/>
+    <path d="m207 246 50-25v50z" fill="#0B0D10" opacity=".78"/>
+  </g>
+  <g transform="rotate(-6 374 372)">
+    <rect x="316" y="314" width="116" height="116" rx="24" fill="#ED63C7" stroke="#0B0D10" stroke-width="10"/>
+    <path d="m347 372 54-27v54z" fill="#0B0D10" opacity=".78"/>
+  </g>
+  <g transform="rotate(8 540 204)">
+    <rect x="476" y="140" width="128" height="128" rx="26" fill="#F2CC52" stroke="#0B0D10" stroke-width="10"/>
+    <path d="m510 204 60-30v60z" fill="#0B0D10" opacity=".78"/>
+  </g>
+</svg>

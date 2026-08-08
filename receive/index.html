@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>CVTP — capture</title>
+    <meta name="description" content="Capture and reconstruct a CVTP optical fountain stream." />
+    <meta name="theme-color" content="#0B0D10" />
+    <link rel="icon" href="../cvtp-mark.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="../apple-touch-icon.png" />
+    <link rel="stylesheet" href="../shared/style.css" />
+  </head>
+  <body class="receiver-page">
+    <header class="site-header">
+      <a class="brand" data-brand href="../" aria-label="CVTP home">
+        <svg class="brand-logo" viewBox="0 0 640 640" aria-hidden="true" focusable="false">
+          <g fill="none" stroke-linecap="square" stroke-linejoin="round">
+            <path d="M96 390 232 246l142 126 166-168" stroke="#F4F1EA" stroke-width="30" opacity=".2" />
+            <path d="M96 390 232 246l142 126 166-168" stroke="#F4F1EA" stroke-width="10" />
+          </g>
+          <g transform="rotate(-8 112 390)"><rect x="64" y="342" width="96" height="96" rx="20" fill="#101010" stroke="#F4F1EA" stroke-width="10"/><path d="m88 390 48-24v48z" fill="#F4F1EA" opacity=".92"/></g>
+          <g transform="rotate(7 232 246)"><rect x="178" y="192" width="108" height="108" rx="22" fill="#27D9D4" stroke="#0B0D10" stroke-width="10"/><path d="m207 246 50-25v50z" fill="#0B0D10" opacity=".78"/></g>
+          <g transform="rotate(-6 374 372)"><rect x="316" y="314" width="116" height="116" rx="24" fill="#ED63C7" stroke="#0B0D10" stroke-width="10"/><path d="m347 372 54-27v54z" fill="#0B0D10" opacity=".78"/></g>
+          <g transform="rotate(8 540 204)"><rect x="476" y="140" width="128" height="128" rx="26" fill="#F2CC52" stroke="#0B0D10" stroke-width="10"/><path d="m510 204 60-30v60z" fill="#0B0D10" opacity=".78"/></g>
+        </svg>
+        <span class="brand-wordmark">CVTP</span>
+        <span class="brand-name">Color Visual Transfer Protocol</span>
+      </a>
+      <nav class="mode-nav" aria-label="Workspace">
+        <a href="../send/">Transmit</a><a href="../receive/">Capture</a>
+      </nav>
+    </header>
+
+    <main class="receiver-shell">
+      <section class="receiver-primary">
+        <div class="receiver-heading">
+          <div>
+            <p class="eyebrow">RX / Camera workbench</p>
+            <h1>Capture a signal</h1>
+          </div>
+          <p>Match the carrier, frame the transmitting screen and let fountain recovery rebuild the payload.</p>
+        </div>
+
+        <div class="receiver-workbench">
+          <aside class="receiver-console" aria-label="Capture controls and diagnostics">
+            <div class="rack-heading">
+              <span class="rack-index">01</span>
+              <div><strong>Receiver console</strong><span>Carrier, camera and telemetry</span></div>
+            </div>
+
+            <div class="mode-picker carrier-picker" id="carrier-picker" role="radiogroup" aria-label="Optical carrier">
+              <label>
+                <input type="radio" name="carrier" value="qr" checked />
+                <span>QR compatible</span>
+              </label>
+              <label id="carrier-color-option">
+                <input type="radio" name="carrier" value="color4" />
+                <span>COLOR_4</span>
+              </label>
+            </div>
+
+            <button id="start">Start camera</button>
+            <div class="hint status-line console-status" id="stats">Ready to scan a file or text stream</div>
+
+            <details class="settings diagnostics" id="diagnostics" style="display: none">
+              <summary>Live diagnostics</summary>
+              <div class="metrics" id="metrics" style="display: none">
+                <div class="metric"><div class="k">capture fps</div><div class="v" id="m-cap">—</div></div>
+                <div class="metric"><div class="k">decode fps</div><div class="v amber" id="m-dec">—</div></div>
+                <div class="metric"><div class="k">goodput</div><div class="v amber" id="m-rate">—</div></div>
+                <div class="metric"><div class="k">elapsed</div><div class="v" id="m-time">—</div></div>
+                <div class="metric"><div class="k">frames new/dup</div><div class="v" id="m-frames">—</div></div>
+                <div class="metric"><div class="k">blocks K</div><div class="v" id="m-k">—</div></div>
+                <div class="metric"><div class="k">block len</div><div class="v" id="m-block">—</div></div>
+                <div class="metric"><div class="k">transfer</div><div class="v" id="m-payload">—</div></div>
+                <div class="metric"><div class="k">carrier accepted/rejected</div><div class="v" id="m-carrier">—</div></div>
+                <div class="metric"><div class="k">RS corrected/erasures</div><div class="v" id="m-rs">—</div></div>
+              </div>
+              <div class="experiment-actions">
+                <button id="export-metrics" class="secondary-button" type="button">Export measurements</button>
+                <button id="clear-metrics" class="secondary-button" type="button">Clear history</button>
+              </div>
+            </details>
+
+            <details class="settings" id="settings">
+              <summary>Receive settings</summary>
+              <div class="row">
+                <label>capture width
+                  <select id="cfg-width"><option>960</option><option selected>1280</option><option>1920</option></select>
+                </label>
+                <label>capture fps
+                  <select id="cfg-capfps"><option>30</option><option selected>60</option></select>
+                </label>
+                <label data-qr-setting>decode workers
+                  <select id="cfg-workers"><option>1</option><option selected>2</option><option>3</option></select>
+                </label>
+                <label data-color-setting hidden>COLOR_4 palette
+                  <select id="cfg-color-palette">
+                    <option value="0" selected>KCMY (stable)</option>
+                    <option value="1">KRGB (Labs)</option>
+                  </select>
+                </label>
+              </div>
+              <p class="hint settings-actual" id="camera-actual">Applied when the camera starts.</p>
+            </details>
+          </aside>
+
+          <section class="capture-bay" aria-label="Camera preview">
+            <div class="stage-bay-heading">
+              <div><span class="stage-state-dot"></span><strong>Camera field</strong></div>
+              <span class="telemetry">RX / LIVE CAPTURE</span>
+            </div>
+
+            <div class="capture-placeholder" aria-hidden="true">
+              <div class="capture-reticle"><span></span></div>
+              <strong>Camera standing by</strong>
+              <span>The live field appears here after permission is granted.</span>
+            </div>
+
+            <div class="preview-zone" id="preview" style="display: none">
+              <div class="no-signal-toast" id="no-signal" role="status" hidden>
+                <span>Nothing happening?</span>
+                <button id="no-signal-help" class="text-button" type="button">Help</button>
+                <button id="no-signal-dismiss" class="text-button no-signal-dismiss" type="button">Dismiss</button>
+              </div>
+              <div class="preview">
+                <video id="video" muted playsinline></video>
+                <div class="transfer-hud">
+                  <div class="progress-status" id="progress-status" style="display: none" aria-live="polite">
+                    <strong id="progress-label">0% · 0 frames</strong>
+                    <span id="eta-label">Estimating time…</span>
+                  </div>
+                  <div
+                    class="progress"
+                    id="progress"
+                    style="display: none"
+                    role="progressbar"
+                    aria-label="Transfer recovery progress"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow="0"
+                  ><div id="bar"></div></div>
+                </div>
+              </div>
+            </div>
+            <div id="result"></div>
+
+            <div class="stage-bay-footer">
+              <span>Keep the entire transmitted frame in view</span>
+              <span class="telemetry">PERSPECTIVE / CALIBRATION / FEC</span>
+            </div>
+          </section>
+        </div>
+
+        <dialog class="help-dialog" id="no-signal-dialog" aria-labelledby="no-signal-title">
+          <h2 id="no-signal-title" tabindex="-1" autofocus>Troubleshooting tips</h2>
+          <ul id="no-signal-tips"></ul>
+          <button id="no-signal-close" class="secondary-button" type="button">Got it</button>
+        </dialog>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span class="footer-id">
+        <span>Color Visual Transfer Protocol · CVTP</span>
+        <span class="footer-build">v%APP_VERSION% · build %BUILD_ID% · based on Decimen © 2026 Evan Crawley · <a href="https://github.com/ThomasSerna/color-visual-transfer-protocol/blob/main/NOTICE.md">MIT notices</a></span>
+      </span>
+      <nav class="footer-links" aria-label="Project links">
+        <a href="https://github.com/ThomasSerna/color-visual-transfer-protocol">GitHub</a>
+        <a href="https://github.com/bashalarmistalt/decimen-optical-transfer">Decimen upstream</a>
+      </nav>
+    </footer>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

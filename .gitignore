@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+dist-standalone/
+artifacts/
+playwright-report/
+test-results/
+scratch/
+.opencode/
+.env

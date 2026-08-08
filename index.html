@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Color Visual Transfer Protocol — files through light</title>
+    <meta
+      name="description"
+      content="Transmit files and text from one screen to another device's camera with QR-compatible or four-colour optical frames."
+    />
+    <meta name="theme-color" content="#0B0D10" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Color Visual Transfer Protocol" />
+    <meta property="og:title" content="Color Visual Transfer Protocol — files through light" />
+    <meta
+      property="og:description"
+      content="A browser-based signal workshop for fountain-coded QR and COLOR_4 transfers. No account, pairing or backend."
+    />
+    <meta property="og:url" content="%SITE_URL%" />
+    <meta property="og:image" content="%OG_IMAGE%" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="CVTP signal cells moving between a transmitting screen and a receiving camera."
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <link rel="icon" href="./cvtp-mark.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <link rel="stylesheet" href="./shared/style.css" />
+  </head>
+  <body class="home-page">
+    <header class="site-header">
+      <a class="brand" data-brand href="./" aria-label="CVTP home">
+        <svg class="brand-logo" viewBox="0 0 640 640" aria-hidden="true" focusable="false">
+          <g fill="none" stroke-linecap="square" stroke-linejoin="round">
+            <path d="M96 390 232 246l142 126 166-168" stroke="#F4F1EA" stroke-width="30" opacity=".2" />
+            <path d="M96 390 232 246l142 126 166-168" stroke="#F4F1EA" stroke-width="10" />
+          </g>
+          <g transform="rotate(-8 112 390)"><rect x="64" y="342" width="96" height="96" rx="20" fill="#101010" stroke="#F4F1EA" stroke-width="10"/><path d="m88 390 48-24v48z" fill="#F4F1EA" opacity=".92"/></g>
+          <g transform="rotate(7 232 246)"><rect x="178" y="192" width="108" height="108" rx="22" fill="#27D9D4" stroke="#0B0D10" stroke-width="10"/><path d="m207 246 50-25v50z" fill="#0B0D10" opacity=".78"/></g>
+          <g transform="rotate(-6 374 372)"><rect x="316" y="314" width="116" height="116" rx="24" fill="#ED63C7" stroke="#0B0D10" stroke-width="10"/><path d="m347 372 54-27v54z" fill="#0B0D10" opacity=".78"/></g>
+          <g transform="rotate(8 540 204)"><rect x="476" y="140" width="128" height="128" rx="26" fill="#F2CC52" stroke="#0B0D10" stroke-width="10"/><path d="m510 204 60-30v60z" fill="#0B0D10" opacity=".78"/></g>
+        </svg>
+        <span class="brand-wordmark">CVTP</span>
+        <span class="brand-name">Color Visual Transfer Protocol</span>
+      </a>
+      <nav class="mode-nav" aria-label="Workspace">
+        <a href="./send/">Transmit</a><a href="./receive/">Capture</a>
+      </nav>
+    </header>
+
+    <main class="home-shell">
+      <section class="hero">
+        <div class="hero-main">
+          <p class="eyebrow">Signal workshop · browser to browser</p>
+          <h1><span>Color Visual</span><span>Transfer Protocol</span></h1>
+          <p class="hero-copy">
+            Turn a screen into a data signal. Rebuild the payload through another
+            device's camera using compatible QR or four-colour fountain frames.
+          </p>
+          <dl class="hero-specs" aria-label="Protocol characteristics">
+            <div><dt>Path</dt><dd>screen / camera</dd></div>
+            <div><dt>Carriers</dt><dd>QR + COLOR_4</dd></div>
+            <div><dt>Network</dt><dd>not required</dd></div>
+          </dl>
+        </div>
+
+        <div class="signal-field" aria-hidden="true">
+          <div class="signal-grid"></div>
+          <div class="signal-route"></div>
+          <span class="signal-node node-k"></span>
+          <span class="signal-node node-c"></span>
+          <span class="signal-node node-m"></span>
+          <span class="signal-node node-y"></span>
+          <div class="signal-reticle"><span></span></div>
+          <div class="signal-readout">
+            <span>VISIBLE CARRIER</span>
+            <span>4 CHANNELS / FOUNTAIN STREAM</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="transfer-grid" aria-label="Choose a role">
+        <article class="transfer-card transmit-card file-card">
+          <div class="card-number" aria-hidden="true">TX / 01</div>
+          <div class="card-content">
+            <p class="card-kicker">Role · Transmit</p>
+            <h2>Put the payload on screen.</h2>
+            <p>
+              Load any file up to %MAX_FILE_LABEL% or paste a text snippet up to
+              %MAX_SNIPPET_LABEL%. CVTP compresses when useful, then emits an
+              open-ended optical stream.
+            </p>
+          </div>
+          <div class="card-actions">
+            <a class="action" href="./send/">
+              Open transmitter
+              <svg class="action-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h15"/><path d="M12 5l7 7-7 7"/></svg>
+            </a>
+          </div>
+        </article>
+
+        <article class="transfer-card capture-card note-feature-card">
+          <div class="card-number" aria-hidden="true">RX / 02</div>
+          <div class="card-content">
+            <p class="card-kicker">Role · Capture</p>
+            <h2>Point, recover, verify.</h2>
+            <p>
+              Match the carrier, point the camera at the transmitting screen and
+              let fountain recovery reconstruct the original bytes with SHA-256
+              verification.
+            </p>
+          </div>
+          <div class="card-actions">
+            <a class="action" href="./receive/">
+              Open receiver
+              <svg class="action-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v15"/><path d="M5 12l7 7 7-7"/></svg>
+            </a>
+          </div>
+        </article>
+      </section>
+
+      <div class="home-share">
+        <button id="share-open" class="secondary-button share-site" type="button">
+          <svg class="share-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7"/><path d="M16 6l-4-4-4 4"/><path d="M12 2v13"/></svg>
+          Share CVTP
+        </button>
+      </div>
+
+      <dialog class="help-dialog share-dialog" id="share-dialog" aria-labelledby="share-title" data-share-title="Color Visual Transfer Protocol — files through light">
+        <h2 id="share-title" tabindex="-1" autofocus>Share this workshop</h2>
+        <p class="share-hint">Scan this with another device's camera, or send it the link.</p>
+        <canvas id="share-qr" width="16" height="16"></canvas>
+        <div class="share-url-row">
+          <input id="share-url" readonly value="%SITE_URL%" data-share-target="app" aria-label="Site link" />
+          <button id="share-copy" class="secondary-button" type="button">Copy</button>
+        </div>
+        <div class="note-actions">
+          <button id="share-native" class="secondary-button" type="button" hidden>Share…</button>
+          <button id="share-close" class="secondary-button" type="button">Close</button>
+        </div>
+      </dialog>
+
+      <p class="privacy-note">
+        The bytes travel as visible light; no network path is required between devices.
+        Transfers are not encrypted, so any camera aimed at the signal can read them.
+      </p>
+    </main>
+
+    <footer class="site-footer">
+      <span class="footer-id">
+        <span>Color Visual Transfer Protocol · CVTP</span>
+        <span class="footer-build">v%APP_VERSION% · build %BUILD_ID% · based on Decimen © 2026 Evan Crawley · <a href="https://github.com/ThomasSerna/color-visual-transfer-protocol/blob/main/NOTICE.md">MIT notices</a></span>
+      </span>
+      <nav class="footer-links" aria-label="Project links">
+        <a href="https://github.com/ThomasSerna/color-visual-transfer-protocol">GitHub</a>
+        <a href="https://github.com/bashalarmistalt/decimen-optical-transfer">Decimen upstream</a>
+      </nav>
+    </footer>
+    <script type="module" src="./home/main.ts"></script>
+  </body>
+</html>
