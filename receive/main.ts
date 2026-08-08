@@ -50,6 +50,7 @@ import {
   type ExperimentSummary,
 } from "../shared/experiments";
 import type { Color4CameraDecoder } from "./color4-carrier";
+import type { VisionDebugController } from "./color4-debug-ui";
 import type { QrLegacyCameraDecoder } from "./qr-carrier";
 
 const startBtn = document.getElementById("start") as HTMLButtonElement;
@@ -70,6 +71,9 @@ const cfgCapFps = document.getElementById("cfg-capfps") as HTMLSelectElement;
 const cfgWorkers = document.getElementById("cfg-workers") as HTMLSelectElement;
 const cfgColorPalette = __COLOR4_ENABLED__
   ? document.getElementById("cfg-color-palette") as HTMLSelectElement | null
+  : null;
+const cfgVisionDebug = __COLOR4_ENABLED__
+  ? document.getElementById("cfg-vision-debug") as HTMLInputElement | null
   : null;
 const carrierPicker = document.getElementById("carrier-picker")!;
 const carrierColorOption = __COLOR4_ENABLED__
@@ -113,6 +117,8 @@ let statsTimer: ReturnType<typeof setInterval> | undefined;
 let activeCarrier: CarrierChoice | null = null;
 let colorDecoder: Color4CameraDecoder | null = null;
 let qrDecoder: QrLegacyCameraDecoder | null = null;
+let visionDebugController: VisionDebugController | null = null;
+let visionDebugPromise: Promise<VisionDebugController> | null = null;
 let experiment: ExperimentMetrics | null = null;
 let latestExperiment: ExperimentSummary | undefined;
 let experimentSave: Promise<void> = Promise.resolve();
@@ -123,6 +129,7 @@ let negotiatedCamera:
 const noSignal = new NoSignalHintTimer(NO_SIGNAL_FIRST_MS, NO_SIGNAL_DISMISSED_MS);
 const captureTimes: number[] = [];
 const decodeTimes: number[] = [];
+let latestCarrierDiagnostics: BrowserCarrierDiagnostics | undefined;
 startBtn.disabled = true;
 startBtn.onclick = () => void start();
 
@@ -146,6 +153,28 @@ function applyCarrierControls(): void {
   const carrier = currentCarrier();
   qrSettings.forEach((element) => { element.hidden = carrier !== "qr"; });
   colorSettings.forEach((element) => { element.hidden = carrier !== "color4"; });
+}
+
+async function ensureVisionDebugController(): Promise<VisionDebugController> {
+  if (!__COLOR4_ENABLED__) throw new Error("Debug Vision is unavailable in this build.");
+  if (visionDebugController) return visionDebugController;
+  visionDebugPromise ??= import("./color4-debug-ui").then((module) =>
+    module.createVisionDebugController({
+      currentExperiment: () => experimentSnapshot(false),
+    }),
+  );
+  try {
+    visionDebugController = await visionDebugPromise;
+    return visionDebugController;
+  } catch (error) {
+    visionDebugPromise = null;
+    throw error;
+  }
+}
+
+function deactivateVisionDebug(): void {
+  visionDebugController?.setTransferActive(false);
+  latestCarrierDiagnostics = undefined;
 }
 
 function experimentSnapshot(
@@ -194,6 +223,7 @@ function cancelActiveReceiver(message: string): void {
   qrDecoder = null;
   colorDecoder?.dispose();
   colorDecoder = null;
+  deactivateVisionDebug();
   void releaseScreenWakeLock();
   activeCarrier = null;
   decoder = null;
@@ -231,6 +261,23 @@ async function initialiseReceiverControls(): Promise<void> {
     cfgColorPalette!.addEventListener("change", () => {
       cancelActiveReceiver("Palette changed — tap Start camera for a new session.");
       void savePreference("receive.color4Palette", Number(cfgColorPalette!.value));
+    });
+    cfgVisionDebug?.addEventListener("change", () => {
+      if (!cfgVisionDebug.checked) return;
+      void ensureVisionDebugController().then((controller) => {
+        if (!cfgVisionDebug.checked || !controller.enabled) return;
+        if (activeCarrier !== "color4" || !stream || done) return;
+        controller.setTransferActive(true);
+        experiment?.setVisionContext({
+          debugEnabled: true,
+          canonicalScale: controller.canonicalScale,
+          detectionDimension: controller.maxDetectionDimension,
+          conditions: controller.conditions(),
+        });
+      }).catch((error) => {
+        cfgVisionDebug.checked = false;
+        showError(error instanceof Error ? error.message : String(error));
+      });
     });
   }
   applyCarrierControls();
@@ -321,6 +368,7 @@ function offerRetry(message: string) {
   qrDecoder = null;
   colorDecoder?.dispose();
   colorDecoder = null;
+  deactivateVisionDebug();
   void releaseScreenWakeLock();
   activeCarrier = null;
   startBtn.disabled = false;
@@ -353,11 +401,24 @@ async function start() {
     startBtn.disabled = true;
     startBtn.textContent = "Loading COLOR_4…";
     try {
-      const module = await loadColor4Receiver();
+      const [module] = await Promise.all([
+        loadColor4Receiver(),
+        // The controller also owns the experiment settings lock. Create it for
+        // every COLOR_4 session even while live debug remains opt-in/off.
+        ensureVisionDebugController(),
+      ]);
       if (startGeneration !== captureGen) return;
       const paletteId = Number(cfgColorPalette!.value) === 1 ? 1 : 0;
       colorDecoder = module.createColor4Decoder(paletteId);
+      startBtn.textContent = "Initializing COLOR_4 vision…";
+      await colorDecoder.ready;
+      if (startGeneration !== captureGen) {
+        colorDecoder?.dispose();
+        colorDecoder = null;
+        return;
+      }
     } catch (error) {
+      if (startGeneration !== captureGen) return;
       offerRetry(error instanceof Error ? error.message : String(error));
       return;
     }
@@ -375,6 +436,7 @@ async function start() {
           cancelActiveReceiver("The QR decoder worker stopped — tap Start camera to retry."),
       });
     } catch (error) {
+      if (startGeneration !== captureGen) return;
       offerRetry(error instanceof Error ? error.message : String(error));
       return;
     }
@@ -403,6 +465,7 @@ async function start() {
       });
     }
   } catch (err) {
+    if (startGeneration !== captureGen) return;
     const denied = err instanceof DOMException && err.name === "NotAllowedError";
     offerRetry(
       denied
@@ -441,6 +504,16 @@ async function start() {
     "receive",
     __COLOR4_ENABLED__ ? carrierId(requestedCarrier) : "QR_LEGACY",
   );
+  latestCarrierDiagnostics = undefined;
+  if (__COLOR4_ENABLED__ && requestedCarrier === "color4") {
+    visionDebugController?.setTransferActive(true);
+    experiment.setVisionContext({
+      debugEnabled: visionDebugController?.enabled ?? false,
+      canonicalScale: visionDebugController?.canonicalScale ?? 4,
+      detectionDimension: visionDebugController?.maxDetectionDimension ?? 960,
+      conditions: visionDebugController?.conditions(),
+    });
+  }
   setStatus(
     `camera ${settings?.width}×${settings?.height}@${settings?.frameRate} — searching for a stream…`,
   );
@@ -560,16 +633,34 @@ function captureFrame() {
     grab.width = vw;
     grab.height = vh;
   }
+  const captureStarted = performance.now();
   const ctx = grab.getContext("2d", { willReadFrequently: true })!;
   ctx.drawImage(video, 0, 0);
   const img = ctx.getImageData(0, 0, vw, vh);
+  const capturedAt = performance.now();
+  const captureMs = Math.max(0, capturedAt - captureStarted);
   if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder) {
     const decoderGeneration = captureGen;
-    void colorDecoder.decode({ source: img, timestamp: performance.now() }).then(
+    const debugOptions = visionDebugController?.decodeOptions(capturedAt);
+    void colorDecoder.decode(
+      { source: img, timestamp: capturedAt },
+      { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
+    ).then(
       (decoded) => {
         if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
         decodeTimes.push(performance.now());
         const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
+        latestCarrierDiagnostics = diagnostics;
+        if (decoded.debug && visionDebugController) {
+          visionDebugController.handleFrame({
+            ...decoded.debug,
+            diagnostics: {
+              carrier: diagnostics,
+              classifier: decoded.debug.classifier,
+              unwrap: decoded.debug.unwrap,
+            },
+          });
+        }
         experiment?.setProfile(diagnostics.profile);
         experiment?.recordAttempt(decoded.status, diagnostics);
         if (decoded.status === "valid") onDecoded(decoded.innerFrame);
@@ -577,6 +668,7 @@ function captureFrame() {
       (error) => {
         if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
         decodeTimes.push(performance.now());
+        visionDebugController?.failSnapshot("Snapshot failed because the vision worker stopped.");
         experiment?.recordAttempt("rejected", { stage: "wire" });
         const failureReason =
           error instanceof Error ? error.message : "The COLOR_4 vision worker stopped.";
@@ -693,6 +785,7 @@ async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
   qrDecoder = null;
   colorDecoder?.dispose();
   colorDecoder = null;
+  deactivateVisionDebug();
   void releaseScreenWakeLock();
   preview.style.display = "none";
   // The transfer is over and the pipeline is gone: settings for a camera that
@@ -931,6 +1024,20 @@ function updateStats() {
     metric("m-carrier").textContent = `${measured.validFrames}/${measured.carrierRejected}`;
     metric("m-rs").textContent =
       `${measured.rsCorrectedSymbols}/${measured.erasureBytes}`;
+  }
+  if (__COLOR4_ENABLED__) {
+    metric("m-stage").textContent = latestCarrierDiagnostics?.stage ?? "—";
+    metric("m-reason").textContent =
+      latestCarrierDiagnostics?.vision?.rejectReason ?? latestCarrierDiagnostics?.rejectReason ?? "—";
+    const fiducials = latestCarrierDiagnostics?.vision?.fiducials;
+    metric("m-fiducials").textContent = fiducials
+      ? `${(["TL", "TR", "BR", "BL"] as const).filter((id) => fiducials[id]?.found).length}/4`
+      : "—";
+    const visionSummary = experimentSnapshot(false)?.vision ?? latestExperiment?.vision;
+    const workerTiming = visionSummary?.timingsMs.workerTotal;
+    metric("m-pipeline").textContent = workerTiming
+      ? `${workerTiming.p50.toFixed(0)}/${workerTiming.p95.toFixed(0)} ms`
+      : "—";
   }
   if (noSignal.tick(now)) showNoSignalHint();
   if (!decoder) return;

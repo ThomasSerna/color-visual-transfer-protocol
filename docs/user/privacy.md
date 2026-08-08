@@ -15,6 +15,12 @@
   contain counters, timings, selected settings and optional device labels, but
   never file bytes, snippets, optical frames or fountain equations. They can be
   exported as JSON and cleared from the diagnostics panel.
+- **Debug Vision snapshots are explicit downloads.** They are never stored in
+  IndexedDB, but their raw PNG is a real camera image and may reveal people,
+  screens, reflections or the surrounding room. CVTP releases its temporary
+  pixel buffers and object URLs after the ZIP is downloaded or cancelled; the
+  downloaded file remains on disk until you delete it. Inspect it before
+  sharing. See [Debug Vision](debug-vision.md).
 - The service worker's offline **precache** holds only the app itself. The
   separate `received-media` runtime cache is the temporary media exception
   described above and can be cleared from the receiver UI.

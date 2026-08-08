@@ -86,6 +86,20 @@ export function rewriteStandaloneLinks(page: "send" | "receive"): Plugin {
         throw new Error("standalone COLOR settings rewrite missed its target");
       }
       html = html.replace(colorSettings, "");
+      if (page === "receive") {
+        const debugMetrics = /<div\b(?=[^>]*\bdata-color-debug-metric(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?)(?=[\s>])[^>]*>\s*<div\b[^>]*>[\s\S]*?<\/div>\s*<div\b[^>]*>[\s\S]*?<\/div>\s*<\/div>/gi;
+        const metricMatches = [...html.matchAll(debugMetrics)];
+        if (metricMatches.length !== 4) {
+          throw new Error(`standalone Debug Vision metric rewrite expected four targets, found ${metricMatches.length}`);
+        }
+        html = html.replace(debugMetrics, "");
+        const debugBlocks = /<(details|div|section)\b(?=[^>]*\bdata-color-debug(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?)(?=[\s>])[^>]*>[\s\S]*?<\/\1>/gi;
+        const matches = [...html.matchAll(debugBlocks)];
+        if (matches.length !== 3) {
+          throw new Error(`standalone Debug Vision rewrite expected three targets, found ${matches.length}`);
+        }
+        html = html.replace(debugBlocks, "");
+      }
       return html;
     },
   };

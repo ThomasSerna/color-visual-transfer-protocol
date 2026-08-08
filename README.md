@@ -54,6 +54,7 @@ a receiver can join an active stream at any point.
 
 **Using CVTP** — [quick start](docs/user/quick-start.md) ·
 [transmitting](docs/user/sending.md) · [capturing](docs/user/receiving.md) ·
+[Debug Vision](docs/user/debug-vision.md) ·
 [troubleshooting](docs/user/troubleshooting.md) ·
 [install & offline](docs/user/install-and-offline.md) ·
 [privacy](docs/user/privacy.md)

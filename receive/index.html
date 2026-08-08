@@ -75,6 +75,10 @@
                 <div class="metric"><div class="k">transfer</div><div class="v" id="m-payload">—</div></div>
                 <div class="metric"><div class="k">carrier accepted/rejected</div><div class="v" id="m-carrier">—</div></div>
                 <div class="metric"><div class="k">RS corrected/erasures</div><div class="v" id="m-rs">—</div></div>
+                <div class="metric" data-color-setting data-color-debug-metric hidden><div class="k">last vision stage</div><div class="v" id="m-stage">—</div></div>
+                <div class="metric" data-color-setting data-color-debug-metric hidden><div class="k">last reject reason</div><div class="v" id="m-reason">—</div></div>
+                <div class="metric" data-color-setting data-color-debug-metric hidden><div class="k">worker p50/p95</div><div class="v amber" id="m-pipeline">—</div></div>
+                <div class="metric" data-color-setting data-color-debug-metric hidden><div class="k">fiducials found</div><div class="v" id="m-fiducials">—</div></div>
               </div>
               <div class="experiment-actions">
                 <button id="export-metrics" class="secondary-button" type="button">Export measurements</button>
@@ -103,6 +107,45 @@
               </div>
               <p class="hint settings-actual" id="camera-actual">Applied when the camera starts.</p>
             </details>
+
+            <details class="settings vision-debug-settings" data-color-setting data-color-debug hidden>
+              <summary>Debug Vision</summary>
+              <label class="debug-toggle">
+                <input id="cfg-vision-debug" type="checkbox" />
+                <span>Enable live optical diagnostics</span>
+              </label>
+              <div class="row debug-controls">
+                <label>view
+                  <select id="cfg-debug-view">
+                    <option value="raw">Raw camera</option>
+                    <option value="grayscale">Grayscale</option>
+                    <option value="threshold">Threshold</option>
+                    <option value="contours">Contours / quads</option>
+                    <option value="fiducials" selected>Detected fiducials</option>
+                    <option value="warped">Warped frame</option>
+                    <option value="calibration">Calibration swatches</option>
+                  </select>
+                </label>
+                <label>canonical scale
+                  <select id="cfg-debug-scale"><option selected>4</option><option>6</option><option>8</option></select>
+                </label>
+                <label>detection limit
+                  <select id="cfg-debug-detection"><option value="960" selected>960 px</option><option value="1280">1280 px</option><option value="source">source resolution</option></select>
+                </label>
+              </div>
+              <fieldset class="experiment-conditions">
+                <legend>Physical test metadata</legend>
+                <div class="row">
+                  <label>run label<input id="cfg-debug-label" type="text" maxlength="80" placeholder="baseline-01" /></label>
+                  <label>TX fps<select id="cfg-debug-tx"><option>1</option><option>2</option><option selected>5</option><option>10</option></select></label>
+                  <label>distance<select id="cfg-debug-distance"><option>0.3</option><option selected>0.5</option><option>1</option></select></label>
+                  <label>angle<select id="cfg-debug-angle"><option value="0" selected>0°</option><option value="15">15°</option></select></label>
+                  <label>brightness<select id="cfg-debug-brightness"><option value="high">high</option><option value="maximum" selected>maximum</option></select></label>
+                </div>
+              </fieldset>
+              <button id="capture-debug-snapshot" class="secondary-button" type="button" disabled>Capture debug snapshot</button>
+              <p class="hint" id="debug-snapshot-status">Off by default. A snapshot ZIP contains a real camera image and is never stored by CVTP.</p>
+            </details>
           </aside>
 
           <section class="capture-bay" aria-label="Camera preview">
@@ -125,6 +168,9 @@
               </div>
               <div class="preview">
                 <video id="video" muted playsinline></video>
+                <div class="vision-overlay-wrap" data-color-debug hidden>
+                  <canvas id="vision-overlay" aria-hidden="true"></canvas>
+                </div>
                 <div class="transfer-hud">
                   <div class="progress-status" id="progress-status" style="display: none" aria-live="polite">
                     <strong id="progress-label">0% · 0 frames</strong>
@@ -143,6 +189,13 @@
                 </div>
               </div>
             </div>
+            <section class="vision-debug-output" id="vision-debug-output" data-color-debug hidden aria-label="Selected vision stage">
+              <div class="vision-debug-heading">
+                <strong id="vision-debug-title">Detected fiducials</strong>
+                <span class="telemetry" id="vision-debug-summary">WAITING FOR A FRAME</span>
+              </div>
+              <canvas id="vision-debug-canvas"></canvas>
+            </section>
             <div id="result"></div>
 
             <div class="stage-bay-footer">

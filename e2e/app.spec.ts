@@ -1,9 +1,45 @@
 import { expect, test } from "@playwright/test";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
+import {
+  COLOR4_CAMERA_PAYLOAD,
+  COLOR4_CAMERA_SCHEDULE,
+} from "./global-setup";
 
 const retiredPrimaryBrand = ["Decimen", "COLOR_4"].join(" ");
+
+interface StoredZipEntry {
+  readonly name: string;
+  readonly data: Uint8Array;
+}
+
+function storedZipEntries(bytes: Uint8Array): StoredZipEntry[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const decoder = new TextDecoder();
+  const entries: StoredZipEntry[] = [];
+  let offset = 0;
+  while (offset + 4 <= bytes.length && view.getUint32(offset, true) === 0x04034b50) {
+    if (offset + 30 > bytes.length) throw new Error("Truncated ZIP local header.");
+    const method = view.getUint16(offset + 8, true);
+    const size = view.getUint32(offset + 18, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const extraLength = view.getUint16(offset + 28, true);
+    if (method !== 0) throw new Error("Debug snapshot ZIP must use STORE entries.");
+    const nameStart = offset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const dataEnd = dataStart + size;
+    if (dataEnd > bytes.length) throw new Error("Truncated ZIP entry.");
+    entries.push({
+      name: decoder.decode(bytes.subarray(nameStart, nameStart + nameLength)),
+      data: Uint8Array.from(bytes.subarray(dataStart, dataEnd)),
+    });
+    offset = dataEnd;
+  }
+  if (entries.length === 0) throw new Error("Debug snapshot ZIP has no local entries.");
+  return entries;
+}
 
 test("the public shell presents CVTP with Transmit and Capture roles", async ({ page }) => {
   await page.goto("/");
@@ -104,6 +140,157 @@ test("receiver exposes one explicit carrier and carrier-specific settings", asyn
   await expect(qr).not.toBeChecked();
   await expect(page.locator("#cfg-color-palette")).toBeVisible();
   await expect(page.locator("#cfg-workers")).toBeHidden();
+  await expect(page.locator("details:has(> summary:text-is('Debug Vision'))")).toBeVisible();
+  await expect(page.locator("#cfg-vision-debug")).not.toBeChecked();
+  expect(errors).toEqual([]);
+});
+
+test("Debug Vision renders every stage, exports one private snapshot, and stops cleanly", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(browserName !== "chromium", "Chromium provides Playwright's deterministic fake camera.");
+  test.setTimeout(120_000);
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const openCvLoaded = page.waitForResponse(
+    (response) => /\/assets\/opencv-[^/]+\.js$/.test(response.url()) && response.status() === 200,
+  );
+  await page.goto("/receive/");
+  await page.locator("#carrier-color-option").click();
+  const debugPanel = page.locator("details:has(> summary:text-is('Debug Vision'))");
+  await debugPanel.locator("summary").click();
+  await page.locator("#settings > summary").click();
+  await page.locator("#cfg-color-palette").selectOption("1");
+  await page.locator("#cfg-debug-label").fill("playwright-debug-baseline");
+  await page.locator("#cfg-debug-tx").selectOption("5");
+  await page.locator("#cfg-debug-distance").selectOption("0.5");
+  await page.locator("#cfg-debug-angle").selectOption("0");
+  await page.locator("#cfg-debug-brightness").selectOption("maximum");
+  await page.locator("#cfg-debug-view").selectOption("raw");
+  await page.locator("#start").click();
+  await openCvLoaded;
+  // Enabling after capture starts must activate diagnostics without restarting
+  // the camera; advanced controls are already locked to the session config.
+  await page.locator("#cfg-vision-debug").check();
+
+  await expect(page.locator("#capture-debug-snapshot")).toBeEnabled({ timeout: 30_000 });
+  await expect(page.locator("#cfg-debug-scale")).toBeDisabled();
+  await expect(page.locator("#cfg-debug-detection")).toBeDisabled();
+  await expect(page.locator("#vision-debug-output")).toBeVisible();
+  await expect(page.locator("#vision-overlay")).toBeVisible();
+
+  const stages = [
+    { value: "raw", title: "Raw camera", width: 1280 },
+    { value: "grayscale", title: "Grayscale", width: 1280 },
+    { value: "threshold", title: "Threshold", width: 960 },
+    { value: "contours", title: "Contours / quads", width: 960 },
+    { value: "fiducials", title: "Detected fiducials", width: 960 },
+    { value: "warped", title: "Warped frame", width: 688 },
+    { value: "calibration", title: "Calibration swatches", width: 688 },
+  ] as const;
+  for (const stage of stages) {
+    await page.locator("#cfg-debug-view").selectOption(stage.value);
+    await expect(page.locator("#vision-debug-title")).toHaveText(stage.title);
+    await expect.poll(
+      () => page.locator("#vision-debug-canvas").evaluate((canvas: HTMLCanvasElement) => ({
+        width: canvas.width,
+        // The view-change handler clears the existing bitmap without changing
+        // its dimensions. Alpha therefore proves that a frame from the new
+        // debug generation rendered, even for adjacent 960 px stages.
+        alpha: canvas.getContext("2d")?.getImageData(0, 0, 1, 1).data[3] ?? 0,
+      })),
+      { message: `${stage.title} must receive a plane from the current debug generation` },
+    ).toEqual({ width: stage.width, alpha: 255 });
+  }
+
+  await expect.poll(
+    () => page.locator("#vision-overlay").evaluate((canvas: HTMLCanvasElement) => {
+      const context = canvas.getContext("2d");
+      if (!context || canvas.width === 0 || canvas.height === 0) return 0;
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let opaque = 0;
+      for (let offset = 3; offset < pixels.length; offset += 4) {
+        if (pixels[offset]! > 0) opaque++;
+      }
+      return opaque;
+    }),
+    { message: "the sibling overlay must contain projected fiducial diagnostics" },
+  ).toBeGreaterThan(0);
+
+  const snapshotDownload = page.waitForEvent("download");
+  await page.locator("#capture-debug-snapshot").click();
+  const snapshotArtifact = await snapshotDownload;
+  expect(snapshotArtifact.suggestedFilename()).toMatch(
+    /^cvtp-vision-.+-capture-\d{6}\.zip$/,
+  );
+  const snapshotPath = await snapshotArtifact.path();
+  expect(snapshotPath).not.toBeNull();
+  const snapshotEntries = storedZipEntries(await readFile(snapshotPath!));
+  const names = snapshotEntries.map((entry) => entry.name);
+  expect(names).toHaveLength(4);
+  expect(names).toEqual(expect.arrayContaining([
+    expect.stringMatching(/^capture-\d{6}-raw\.png$/),
+    expect.stringMatching(/^capture-\d{6}-threshold\.png$/),
+    expect.stringMatching(/^capture-\d{6}-warped\.png$/),
+    expect.stringMatching(/^capture-\d{6}\.json$/),
+  ]));
+  for (const entry of snapshotEntries.filter((candidate) => candidate.name.endsWith(".png"))) {
+    expect(Array.from(entry.data.subarray(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
+  }
+  const jsonEntry = snapshotEntries.find((entry) => entry.name.endsWith(".json"));
+  expect(jsonEntry).toBeDefined();
+  const snapshot = JSON.parse(new TextDecoder().decode(jsonEntry!.data)) as {
+    schema: string;
+    version: number;
+    configuration: {
+      canonicalScale: number;
+      maxDetectionDimension: number | string;
+      paletteId: number;
+      palette: string;
+    };
+    conditions: { label?: string; expectedTxFps: number; distanceM: number; angleDeg: number };
+    artifacts: { raw: { available: boolean }; threshold: { available: boolean }; warped: { available: boolean } };
+    vision: { traces: unknown[] };
+    experiment?: { vision?: { debugEnabled?: boolean } };
+  };
+  expect(snapshot).toMatchObject({
+    schema: "cvtp-color4-vision-snapshot",
+    version: 1,
+    configuration: {
+      canonicalScale: 4,
+      maxDetectionDimension: 960,
+      paletteId: 1,
+      palette: "KRGB",
+    },
+    conditions: {
+      label: "playwright-debug-baseline",
+      expectedTxFps: 5,
+      distanceM: 0.5,
+      angleDeg: 0,
+    },
+    artifacts: {
+      raw: { available: true },
+      threshold: { available: true },
+      warped: { available: true },
+    },
+  });
+  expect(snapshot.vision.traces.length).toBeGreaterThanOrEqual(4);
+  expect(snapshot.experiment?.vision?.debugEnabled).toBe(true);
+  await expect(page.locator("#debug-snapshot-status")).toContainText(
+    "No camera images were retained",
+  );
+
+  // A carrier change cancels the camera and invalidates pending callbacks.
+  // Waiting after cancellation catches any stale worker response that tries to
+  // resurrect the selected-stage canvas or overlay.
+  await page.locator('label:has(input[name="carrier"][value="qr"])').click();
+  await expect(page.locator("#stats")).toContainText("Carrier changed");
+  await expect(page.locator("#preview")).toBeHidden();
+  await expect(page.locator("#vision-debug-output")).toBeHidden();
+  await expect(page.locator("#cfg-debug-scale")).toBeEnabled();
+  await page.waitForTimeout(750);
+  await expect(page.locator("#vision-debug-output")).toBeHidden();
   expect(errors).toEqual([]);
 });
 
@@ -126,6 +313,17 @@ test("the COLOR_4 camera worker reconstructs a complete file", async ({ page, br
   await expect(page.locator('#result a[download="camera-e2e.bin"]')).toHaveText(
     "Save camera-e2e.bin",
   );
+  await expect(page.locator("#result .hint")).toContainText("SHA-256 verified");
+  const recovered = await page.locator('#result a[download="camera-e2e.bin"]').evaluate(
+    async (anchor: HTMLAnchorElement) =>
+      Array.from(new Uint8Array(await (await fetch(anchor.href)).arrayBuffer())),
+  );
+  const recoveredBytes = Buffer.from(recovered);
+  expect(recoveredBytes).toEqual(Buffer.from(COLOR4_CAMERA_PAYLOAD));
+  expect(createHash("sha256").update(recoveredBytes).digest("hex")).toBe(
+    createHash("sha256").update(COLOR4_CAMERA_PAYLOAD).digest("hex"),
+  );
+  expect(COLOR4_CAMERA_SCHEDULE.filter((entry) => entry.sequence === 1)).toHaveLength(2);
   await expect(page.locator("#m-carrier")).toContainText(/^\d+\/\d+$/);
   await page.locator("#diagnostics > summary").click();
   await expect(page.locator("#export-metrics")).toBeVisible();
@@ -144,6 +342,9 @@ test("the COLOR_4 camera worker reconstructs a complete file", async ({ page, br
       cameraWidth?: number;
       cameraHeight?: number;
       validFrames: number;
+      newFrames: number;
+      duplicateFrames: number;
+      resolvedBlocks: number;
     }>;
   };
   expect(metrics.current).toBeUndefined();
@@ -155,7 +356,10 @@ test("the COLOR_4 camera worker reconstructs a complete file", async ({ page, br
     cameraWidth: 1280,
     cameraHeight: 960,
   });
-  expect(metrics.history[0]!.validFrames).toBeGreaterThan(0);
+  expect(metrics.history[0]!.validFrames).toBeGreaterThanOrEqual(2);
+  expect(metrics.history[0]!.newFrames).toBeGreaterThanOrEqual(2);
+  expect(metrics.history[0]!.duplicateFrames).toBeGreaterThan(0);
+  expect(metrics.history[0]!.resolvedBlocks).toBe(2);
   expect(errors).toEqual([]);
 });
 
@@ -257,6 +461,16 @@ test("standalone artifacts are QR-only and contain no OpenCV payload", async ({ 
     expect(html).not.toContain("cfg-color-palette");
     expect(html).not.toContain("carrier-color-option");
     expect(html).not.toContain("data-color-setting");
+    expect(html).not.toContain("data-color-debug");
+    expect(html).not.toContain("Debug Vision");
+    expect(html).not.toContain("capture-debug-snapshot");
+    expect(html).not.toContain("last vision stage");
+    expect(html).not.toContain("m-reason");
+    expect(html).not.toContain("m-pipeline");
+    expect(html).not.toContain("m-fiducials");
+    expect(html).not.toContain("createStoredZip");
+    expect(html).not.toContain("cvtp-vision-");
+    expect(html).not.toContain("zip-store");
     expect(html).not.toContain('"color4"');
 
     await page.goto(pathToFileURL(path).href);
@@ -345,5 +559,45 @@ test("Signal Workshop stays usable at desktop and mobile viewports", async ({ pa
       expect(layout.checkedControls, `${entry.path} at ${viewport.width}px has no key controls`).toBeGreaterThan(0);
       expect(layout.undersized, `${entry.path} at ${viewport.width}px has touch targets under 44px`).toEqual([]);
     }
+
+    await page.goto("/receive/");
+    await page.locator("#carrier-color-option").click();
+    await page.locator("details:has(> summary:text-is('Debug Vision')) > summary").click();
+    const debugLayout = await page.evaluate(() => {
+      const selectors = [
+        ".debug-toggle",
+        "#cfg-debug-view",
+        "#cfg-debug-scale",
+        "#cfg-debug-detection",
+        "#cfg-debug-label",
+        "#cfg-debug-tx",
+        "#cfg-debug-distance",
+        "#cfg-debug-angle",
+        "#cfg-debug-brightness",
+        "#capture-debug-snapshot",
+      ];
+      const undersized: string[] = [];
+      for (const selector of selectors) {
+        const element = document.querySelector<HTMLElement>(selector);
+        if (!element) {
+          undersized.push(`${selector} missing`);
+          continue;
+        }
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        if (style.display === "none" || style.visibility === "hidden") {
+          undersized.push(`${selector} hidden`);
+        } else if (rect.width + 0.5 < 44 || rect.height + 0.5 < 44) {
+          undersized.push(`${selector} ${rect.width.toFixed(1)}×${rect.height.toFixed(1)}`);
+        }
+      }
+      return {
+        overflow: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) -
+          document.documentElement.clientWidth,
+        undersized,
+      };
+    });
+    expect(debugLayout.overflow, `Debug Vision at ${viewport.width}px overflows`).toBeLessThanOrEqual(1);
+    expect(debugLayout.undersized, `Debug Vision at ${viewport.width}px has inaccessible controls`).toEqual([]);
   }
 });

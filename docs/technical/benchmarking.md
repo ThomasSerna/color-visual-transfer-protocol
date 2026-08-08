@@ -40,6 +40,10 @@ Compression must be disabled by using incompressible input or explicitly
 reported. The original Decimen 128 KB/s observation is not a COLOR_4 baseline
 unless reproduced under this method.
 
+For the frozen first receiver run, diagnostic ZIP contents and the subsequent
+1/2/5/10 fps by 960/1280/1920 by 0.3/0.5/1 m matrix, follow
+[Debug Vision](../user/debug-vision.md). Treat the ZIP as sensitive camera data.
+
 ## Synthetic and soak gates
 
 Before physical claims, run the frozen corpus over all four rotations,

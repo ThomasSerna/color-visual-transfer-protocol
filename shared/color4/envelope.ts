@@ -26,6 +26,109 @@ export const COLOR4_OUTER_HEADER_BYTES = 16;
 export const COLOR4_FLAGS = 0x03 as const;
 export const COLOR4_PALETTE_IDS: readonly Color4PaletteId[] = Object.freeze([0, 1]);
 
+export interface Color4RsShardObservation {
+  readonly shard: number;
+  readonly erasuresRequested: number;
+  readonly durationMs: number;
+  readonly status: "corrected" | "uncorrectable" | "not-attempted";
+  readonly reason?:
+    | "invalid-length"
+    | "invalid-erasure"
+    | "too-many-erasures"
+    | "locator"
+    | "verification"
+    | "invalid-global-erasure";
+  readonly errors: number;
+  readonly correctedBytes: number;
+}
+
+export interface Color4RsObservation {
+  readonly stage: "rs";
+  readonly durationMs: number;
+  readonly outcome: "completed" | "rejected";
+  readonly profileId: Color4ProfileId;
+  readonly paletteId: Color4PaletteId;
+  readonly requestedErasures: number;
+  readonly uniqueErasures: number;
+  readonly invalidErasures: number;
+  readonly correctedErrors: number;
+  readonly correctedBytes: number;
+  readonly correctedShards: number;
+  readonly shards: readonly Color4RsShardObservation[];
+}
+
+export interface Color4CrcObservation {
+  readonly stage: "crc";
+  readonly durationMs: number;
+  readonly outcome: "completed" | "rejected";
+  readonly profileId: Color4ProfileId;
+  readonly paletteId: Color4PaletteId;
+  readonly valid: boolean;
+}
+
+export interface Color4WireObservation {
+  readonly stage: "wire";
+  readonly durationMs: number;
+  readonly outcome: "completed" | "rejected";
+  readonly profileId: Color4ProfileId;
+  readonly paletteId: Color4PaletteId;
+  readonly reason?: RejectReason;
+  readonly outerHeaderValid: boolean;
+  readonly lengthValid: boolean;
+  readonly innerFrameChecked: boolean;
+  readonly innerFrameValid: boolean;
+  readonly identityChecked: boolean;
+  readonly identityValid: boolean;
+}
+
+export type Color4UnwrapObservation =
+  | Color4RsObservation
+  | Color4CrcObservation
+  | Color4WireObservation;
+
+export type Color4UnwrapObserver = (observation: Color4UnwrapObservation) => void;
+
+/** Instrumentation is deliberately private to the unwrap call and never enters wire types. */
+export interface InstrumentedColor4UnwrapOptions extends Color4UnwrapOptions {
+  readonly clock?: () => number;
+  readonly observer?: Color4UnwrapObserver;
+}
+
+function defaultClock(): number {
+  return typeof globalThis.performance?.now === "function"
+    ? globalThis.performance.now()
+    : Date.now();
+}
+
+function readClock(clock: (() => number) | undefined): number {
+  try {
+    const value = (clock ?? defaultClock)();
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function elapsedSince(clock: (() => number) | undefined, startedAt: number): {
+  readonly endedAt: number;
+  readonly durationMs: number;
+} {
+  const endedAt = readClock(clock);
+  return { endedAt, durationMs: Math.max(0, endedAt - startedAt) };
+}
+
+function notifyObserver(
+  observer: Color4UnwrapObserver | undefined,
+  observation: Color4UnwrapObservation,
+): void {
+  if (observer === undefined) return;
+  try {
+    observer(Object.freeze(observation));
+  } catch {
+    // Diagnostic consumers must never influence protocol validation.
+  }
+}
+
 function isPaletteId(id: number): id is Color4PaletteId {
   return COLOR4_PALETTE_IDS.includes(id as Color4PaletteId);
 }
@@ -154,33 +257,82 @@ function erasureValues(input: Color4ErasureInput | undefined): number[] {
   return input instanceof Set ? [...input] : Array.from(input);
 }
 
-interface FecDecodeSuccess {
-  readonly pdu: Uint8Array;
+interface FecDecodeSummary {
   readonly erasures: number;
   readonly correctedErrors: number;
   readonly correctedBytes: number;
   readonly correctedShards: number;
 }
 
+interface FecDecodeSuccess extends FecDecodeSummary {
+  readonly status: "corrected";
+  readonly pdu: Uint8Array;
+}
+
+interface FecDecodeFailure extends FecDecodeSummary {
+  readonly status: "uncorrectable";
+}
+
+type FecDecodeResult = FecDecodeSuccess | FecDecodeFailure;
+
 function decodeFec(
   codedBytes: Uint8Array,
   profile: Color4Profile,
   paletteId: Color4PaletteId,
   erasureInput: Color4ErasureInput | undefined,
-): FecDecodeSuccess | null {
+  observer: Color4UnwrapObserver | undefined,
+  clock: (() => number) | undefined,
+): FecDecodeResult {
+  const observing = observer !== undefined;
+  const startedAt = observing ? readClock(clock) : 0;
   const erasures = erasureValues(erasureInput);
-  if (
-    erasures.some(
-      (index) => !Number.isInteger(index) || index < 0 || index >= profile.codedBytes,
-    )
-  ) {
-    return null;
-  }
-  const uniqueErasures = [...new Set(erasures)];
+  const validErasures = erasures.filter(
+    (index) => Number.isInteger(index) && index >= 0 && index < profile.codedBytes,
+  );
+  const invalidErasures = erasures.length - validErasures.length;
+  const uniqueErasures = [...new Set(validErasures)];
   const byShard = Array.from({ length: profile.shards }, () => new Set<number>());
   for (const index of uniqueErasures) {
     const mapped = shardPosition(index, profile.shards);
     byShard[mapped.shard]!.add(mapped.position);
+  }
+
+  if (invalidErasures > 0) {
+    const timing = observing
+      ? elapsedSince(clock, startedAt)
+      : { endedAt: 0, durationMs: 0 };
+    const shards = Object.freeze(
+      byShard.map((positions, shard) => Object.freeze({
+        shard,
+        erasuresRequested: positions.size,
+        durationMs: 0,
+        status: "not-attempted" as const,
+        reason: "invalid-global-erasure" as const,
+        errors: 0,
+        correctedBytes: 0,
+      })),
+    );
+    notifyObserver(observer, {
+      stage: "rs",
+      durationMs: timing.durationMs,
+      outcome: "rejected",
+      profileId: profile.id,
+      paletteId,
+      requestedErasures: erasures.length,
+      uniqueErasures: uniqueErasures.length,
+      invalidErasures,
+      correctedErrors: 0,
+      correctedBytes: 0,
+      correctedShards: 0,
+      shards,
+    });
+    return {
+      status: "uncorrectable",
+      erasures: uniqueErasures.length,
+      correctedErrors: 0,
+      correctedBytes: 0,
+      correctedShards: 0,
+    };
   }
 
   const unwhitened = whiten(codedBytes, profile.id, paletteId);
@@ -190,15 +342,90 @@ function decodeFec(
   let correctedErrors = 0;
   let correctedBytes = 0;
   let correctedShards = 0;
+  const shardObservations: Color4RsShardObservation[] = [];
   for (let shard = 0; shard < profile.shards; shard++) {
+    const shardStartedAt = observing ? readClock(clock) : 0;
     const decoded = codec.decode(codewords[shard]!, byShard[shard]!);
-    if (decoded.status === "uncorrectable") return null;
+    const shardTiming = observing
+      ? elapsedSince(clock, shardStartedAt)
+      : { endedAt: 0, durationMs: 0 };
+    if (decoded.status === "uncorrectable") {
+      shardObservations.push(Object.freeze({
+        shard,
+        erasuresRequested: byShard[shard]!.size,
+        durationMs: shardTiming.durationMs,
+        status: "uncorrectable",
+        reason: decoded.reason,
+        errors: 0,
+        correctedBytes: 0,
+      }));
+      for (let remaining = shard + 1; remaining < profile.shards; remaining++) {
+        shardObservations.push(Object.freeze({
+          shard: remaining,
+          erasuresRequested: byShard[remaining]!.size,
+          durationMs: 0,
+          status: "not-attempted",
+          errors: 0,
+          correctedBytes: 0,
+        }));
+      }
+      const timing = observing
+        ? elapsedSince(clock, startedAt)
+        : { endedAt: 0, durationMs: 0 };
+      notifyObserver(observer, {
+        stage: "rs",
+        durationMs: timing.durationMs,
+        outcome: "rejected",
+        profileId: profile.id,
+        paletteId,
+        requestedErasures: erasures.length,
+        uniqueErasures: uniqueErasures.length,
+        invalidErasures,
+        correctedErrors,
+        correctedBytes,
+        correctedShards,
+        shards: Object.freeze(shardObservations),
+      });
+      return {
+        status: "uncorrectable",
+        erasures: uniqueErasures.length,
+        correctedErrors,
+        correctedBytes,
+        correctedShards,
+      };
+    }
     pdu.set(decoded.data, shard * profile.rsK);
     correctedErrors += decoded.errors;
     correctedBytes += decoded.correctedBytes;
     if (decoded.correctedBytes > 0) correctedShards++;
+    shardObservations.push(Object.freeze({
+      shard,
+      erasuresRequested: byShard[shard]!.size,
+      durationMs: shardTiming.durationMs,
+      status: "corrected",
+      errors: decoded.errors,
+      correctedBytes: decoded.correctedBytes,
+    }));
   }
+  const timing = observing
+    ? elapsedSince(clock, startedAt)
+    : { endedAt: 0, durationMs: 0 };
+  notifyObserver(observer, {
+    stage: "rs",
+    durationMs: timing.durationMs,
+    outcome: "completed",
+    profileId: profile.id,
+    paletteId,
+    requestedErasures: erasures.length,
+    uniqueErasures: uniqueErasures.length,
+    invalidErasures,
+    correctedErrors,
+    correctedBytes,
+    correctedShards,
+    shards: Object.freeze(shardObservations),
+  });
   return {
+    status: "corrected",
     pdu,
     erasures: uniqueErasures.length,
     correctedErrors,
@@ -212,7 +439,7 @@ function diagnostics(
   paletteId: Color4PaletteId | undefined,
   attemptedProfiles: number,
   attemptedPalettes: number,
-  fec?: FecDecodeSuccess,
+  fec?: FecDecodeSummary,
 ): Color4DecodeDiagnostics {
   return {
     profileId,
@@ -239,6 +466,8 @@ function validateDecodedPdu(
   paletteId: Color4PaletteId,
   attemptedProfiles: number,
   attemptedPalettes: number,
+  observer: Color4UnwrapObserver | undefined,
+  clock: (() => number) | undefined,
 ): Color4UnwrapResult {
   const diagnostic = diagnostics(
     profile.id,
@@ -247,27 +476,101 @@ function validateDecodedPdu(
     attemptedPalettes,
     fec,
   );
+  const observing = observer !== undefined;
+  let wireDurationMs = 0;
+  let wireStartedAt = observing ? readClock(clock) : 0;
   const header = parseColor4OuterHeader(fec.pdu);
-  if (
-    header === null ||
-    header.profileId !== profile.id ||
-    header.paletteId !== paletteId ||
-    header.innerLength !== profile.innerFrameBytes
-  ) {
+  const outerHeaderValid =
+    header !== null &&
+    header.profileId === profile.id &&
+    header.paletteId === paletteId;
+  const headerLengthValid = header !== null && header.innerLength === profile.innerFrameBytes;
+  let wireTiming = observing
+    ? elapsedSince(clock, wireStartedAt)
+    : { endedAt: 0, durationMs: 0 };
+  wireDurationMs += wireTiming.durationMs;
+  const notifyWire = (
+    outcome: "completed" | "rejected",
+    reason: RejectReason | undefined,
+    lengthValid: boolean,
+    innerFrameChecked: boolean,
+    innerFrameValid: boolean,
+    identityChecked: boolean,
+    identityValid: boolean,
+  ): void => notifyObserver(observer, {
+    stage: "wire",
+    durationMs: wireDurationMs,
+    outcome,
+    profileId: profile.id,
+    paletteId,
+    ...(reason === undefined ? {} : { reason }),
+    outerHeaderValid,
+    lengthValid,
+    innerFrameChecked,
+    innerFrameValid,
+    identityChecked,
+    identityValid,
+  });
+  if (header === null || !outerHeaderValid || !headerLengthValid) {
+    notifyWire("rejected", "invalid-outer-header", headerLengthValid, false, false, false, false);
     return reject("invalid-outer-header", diagnostic);
   }
-  if (!hasValidCrc32c(fec.pdu)) return reject("crc-mismatch", diagnostic);
+
+  const crcStartedAt = observing ? readClock(clock) : 0;
+  const crcValid = hasValidCrc32c(fec.pdu);
+  const crcTiming = observing
+    ? elapsedSince(clock, crcStartedAt)
+    : { endedAt: 0, durationMs: 0 };
+  notifyObserver(observer, {
+    stage: "crc",
+    durationMs: crcTiming.durationMs,
+    outcome: crcValid ? "completed" : "rejected",
+    profileId: profile.id,
+    paletteId,
+    valid: crcValid,
+  });
+  if (!crcValid) {
+    notifyWire("completed", undefined, true, false, false, false, false);
+    return reject("crc-mismatch", diagnostic);
+  }
+
+  wireStartedAt = observing ? readClock(clock) : 0;
   const innerEnd = COLOR4_OUTER_HEADER_BYTES + header.innerLength;
-  if (innerEnd + 4 !== fec.pdu.length) return reject("invalid-outer-header", diagnostic);
+  const pduLengthValid = innerEnd + 4 === fec.pdu.length;
+  if (!pduLengthValid) {
+    wireTiming = observing
+      ? elapsedSince(clock, wireStartedAt)
+      : { endedAt: 0, durationMs: 0 };
+    wireDurationMs += wireTiming.durationMs;
+    notifyWire("rejected", "invalid-outer-header", false, false, false, false, false);
+    return reject("invalid-outer-header", diagnostic);
+  }
   const innerFrame = fec.pdu.slice(COLOR4_OUTER_HEADER_BYTES, innerEnd);
   const parsed = validateInnerFrame(innerFrame, profile);
-  if (parsed === null) return reject("invalid-inner-frame", diagnostic);
+  if (parsed === null) {
+    wireTiming = observing
+      ? elapsedSince(clock, wireStartedAt)
+      : { endedAt: 0, durationMs: 0 };
+    wireDurationMs += wireTiming.durationMs;
+    notifyWire("rejected", "invalid-inner-frame", true, true, false, false, false);
+    return reject("invalid-inner-frame", diagnostic);
+  }
   if (
     parsed.header.sessionId !== header.sessionId ||
     parsed.header.seq !== header.sequence
   ) {
+    wireTiming = observing
+      ? elapsedSince(clock, wireStartedAt)
+      : { endedAt: 0, durationMs: 0 };
+    wireDurationMs += wireTiming.durationMs;
+    notifyWire("rejected", "identity-mismatch", true, true, true, true, false);
     return reject("identity-mismatch", diagnostic);
   }
+  wireTiming = observing
+    ? elapsedSince(clock, wireStartedAt)
+    : { endedAt: 0, durationMs: 0 };
+  wireDurationMs += wireTiming.durationMs;
+  notifyWire("completed", undefined, true, true, true, true, true);
   return {
     status: "valid",
     innerFrame,
@@ -279,7 +582,7 @@ function validateDecodedPdu(
 
 export function unwrapColor4Frame(
   codedBytes: Uint8Array,
-  options: Color4UnwrapOptions = {},
+  options: InstrumentedColor4UnwrapOptions = {},
 ): Color4UnwrapResult {
   const candidateProfiles = options.profileId === undefined
     ? COLOR4_PROFILES.filter((profile) => profile.codedBytes === codedBytes.length)
@@ -310,19 +613,32 @@ export function unwrapColor4Frame(
   let attemptedProfiles = 0;
   let attemptedPalettes = 0;
   let lastSemanticRejection: Color4UnwrapResult | undefined;
+  let lastFecFailure: FecDecodeFailure | undefined;
   for (const profile of candidateProfiles) {
     if (profile.codedBytes !== codedBytes.length) continue;
     attemptedProfiles++;
     for (const paletteId of palettes) {
       attemptedPalettes++;
-      const fec = decodeFec(codedBytes, profile, paletteId, options.erasures);
-      if (fec === null) continue;
+      const fec = decodeFec(
+        codedBytes,
+        profile,
+        paletteId,
+        options.erasures,
+        options.observer,
+        options.clock,
+      );
+      if (fec.status === "uncorrectable") {
+        lastFecFailure = fec;
+        continue;
+      }
       const result = validateDecodedPdu(
         fec,
         profile,
         paletteId,
         attemptedProfiles,
         attemptedPalettes,
+        options.observer,
+        options.clock,
       );
       if (result.status === "valid") return result;
       lastSemanticRejection = result;
@@ -335,6 +651,7 @@ export function unwrapColor4Frame(
       options.paletteId,
       attemptedProfiles,
       attemptedPalettes,
+      lastFecFailure,
     ),
   );
 }

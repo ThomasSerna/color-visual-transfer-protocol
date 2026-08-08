@@ -1,4 +1,10 @@
-import type { BrowserCarrierDiagnostics, CarrierId } from "./carrier";
+import type {
+  BrowserCarrierDiagnostics,
+  BrowserVisionDiagnostics,
+  CarrierId,
+  VisionDetectionDiagnostics,
+  VisionTimingKey,
+} from "./carrier";
 
 const DATABASE = "decimen-experiments";
 const VERSION = 1;
@@ -7,6 +13,56 @@ const RUNS = "runs";
 const MAX_STORED_RUNS = 100;
 
 export type ExperimentDirection = "send" | "receive";
+
+export interface TimingDistribution {
+  readonly count: number;
+  readonly average: number;
+  readonly min: number;
+  readonly max: number;
+  readonly p50: number;
+  readonly p95: number;
+}
+
+export interface VisionExperimentConditions {
+  readonly label?: string;
+  readonly expectedTxFps?: 1 | 2 | 5 | 10;
+  readonly distanceM?: 0.3 | 0.5 | 1;
+  readonly angleDeg?: 0 | 15;
+  readonly brightness?: "high" | "maximum";
+}
+
+export interface VisionExperimentSummary {
+  readonly debugEnabled: boolean;
+  readonly configuration?: Readonly<{
+    canonicalScale: 4 | 6 | 8;
+    detectionDimension: 960 | 1280 | "source";
+  }>;
+  readonly conditions?: VisionExperimentConditions;
+  readonly rejectReasons: Readonly<Record<string, number>>;
+  readonly stageRejections: Readonly<Record<string, number>>;
+  readonly detection: Readonly<{
+    contours: number;
+    areaTooSmall: number;
+    areaTooLarge: number;
+    nonQuads: number;
+    nonConvex: number;
+    quads: number;
+    decodedMarkers: number;
+    uniqueFiducials: number;
+    duplicateIds: number;
+    ambiguousCandidates: number;
+    tooManyErrorCandidates: number;
+    decodeFailures: number;
+  }>;
+  readonly fiducials: Readonly<Record<"TL" | "TR" | "BR" | "BL", Readonly<{
+    observations: number;
+    found: number;
+    errorSamples: number;
+    averageErrors: number;
+    maximumErrors: number;
+  }>>>;
+  readonly timingsMs: Readonly<Partial<Record<VisionTimingKey, TimingDistribution>>>;
+}
 
 export interface ExperimentSummary {
   schemaVersion: 1;
@@ -38,13 +94,8 @@ export interface ExperimentSummary {
   resolvedBlocks: number;
   carrierRejected: number;
   erasureBytes: number;
-  decodeLatencyMs: Readonly<{
-    count: number;
-    average: number;
-    min: number;
-    max: number;
-    p50: number;
-  }>;
+  decodeLatencyMs: TimingDistribution;
+  vision?: VisionExperimentSummary;
   containerBitrateBps?: number;
   fileGoodputBps?: number;
   failureReason?: string;
@@ -76,6 +127,47 @@ export class ExperimentMetrics {
   carrierRejected = 0;
   erasureBytes = 0;
   private readonly latencySamples: number[] = [];
+  private visionSeen = false;
+  private visionDebugEnabled = false;
+  private visionConfiguration: VisionExperimentSummary["configuration"];
+  private visionConditions: VisionExperimentConditions | undefined;
+  private readonly visionRejectReasons = new Map<string, number>();
+  private readonly visionStageRejections = new Map<string, number>();
+  private readonly visionTimings = new Map<VisionTimingKey, number[]>();
+  private readonly visionDetection: Record<
+    | "contours"
+    | "areaTooSmall"
+    | "areaTooLarge"
+    | "nonQuads"
+    | "nonConvex"
+    | "quads"
+    | "decodedMarkers"
+    | "uniqueFiducials"
+    | "duplicateIds"
+    | "ambiguousCandidates"
+    | "tooManyErrorCandidates"
+    | "decodeFailures",
+    number
+  > = {
+    contours: 0,
+    areaTooSmall: 0,
+    areaTooLarge: 0,
+    nonQuads: 0,
+    nonConvex: 0,
+    quads: 0,
+    decodedMarkers: 0,
+    uniqueFiducials: 0,
+    duplicateIds: 0,
+    ambiguousCandidates: 0,
+    tooManyErrorCandidates: 0,
+    decodeFailures: 0,
+  };
+  private readonly visionFiducials = {
+    TL: { observations: 0, found: 0, errorSamples: 0, totalErrors: 0, maximumErrors: 0 },
+    TR: { observations: 0, found: 0, errorSamples: 0, totalErrors: 0, maximumErrors: 0 },
+    BR: { observations: 0, found: 0, errorSamples: 0, totalErrors: 0, maximumErrors: 0 },
+    BL: { observations: 0, found: 0, errorSamples: 0, totalErrors: 0, maximumErrors: 0 },
+  };
 
   constructor(
     readonly direction: ExperimentDirection,
@@ -96,6 +188,21 @@ export class ExperimentMetrics {
 
   setProfile(profile: string | undefined): void {
     if (profile) this.profile = profile;
+  }
+
+  setVisionContext(input: {
+    debugEnabled: boolean;
+    canonicalScale: 4 | 6 | 8;
+    detectionDimension: 960 | 1280 | "source";
+    conditions?: VisionExperimentConditions;
+  }): void {
+    this.visionSeen = true;
+    this.visionDebugEnabled ||= input.debugEnabled;
+    this.visionConfiguration = {
+      canonicalScale: input.canonicalScale,
+      detectionDimension: input.detectionDimension,
+    };
+    this.visionConditions = input.conditions;
   }
 
   recordAttempt(status: "valid" | "rejected", diagnostics?: BrowserCarrierDiagnostics): void {
@@ -119,6 +226,71 @@ export class ExperimentMetrics {
       if (this.latencySamples.length === 256) this.latencySamples.shift();
       this.latencySamples.push(Math.max(0, diagnostics.decodeMs));
     }
+    if (diagnostics?.vision) this.recordVision(status, diagnostics, diagnostics.vision);
+  }
+
+  private recordVision(
+    status: "valid" | "rejected",
+    diagnostics: BrowserCarrierDiagnostics,
+    vision: BrowserVisionDiagnostics,
+  ): void {
+    this.visionSeen = true;
+    this.visionDebugEnabled ||= vision.debugEnabled === true;
+    if (vision.canonicalScale !== undefined && vision.detectionDimension !== undefined) {
+      this.visionConfiguration = {
+        canonicalScale: vision.canonicalScale,
+        detectionDimension: vision.detectionDimension,
+      };
+    }
+    if (status === "rejected") {
+      const reason = vision.rejectReason ?? diagnostics.rejectReason ?? "unknown";
+      this.increment(this.visionRejectReasons, reason);
+      this.increment(this.visionStageRejections, diagnostics.stage ?? "unknown");
+    }
+    this.addDetection(vision.detection);
+    for (const id of ["TL", "TR", "BR", "BL"] as const) {
+      const observed = vision.fiducials?.[id];
+      if (observed === undefined) continue;
+      const aggregate = this.visionFiducials[id];
+      aggregate.observations++;
+      if (observed.found) aggregate.found++;
+      if (observed.errors !== undefined && Number.isFinite(observed.errors)) {
+        const errors = Math.max(0, observed.errors);
+        aggregate.errorSamples++;
+        aggregate.totalErrors += errors;
+        aggregate.maximumErrors = Math.max(aggregate.maximumErrors, errors);
+      }
+    }
+    if (vision.timings) {
+      for (const [stage, raw] of Object.entries(vision.timings) as Array<
+        [VisionTimingKey, number | undefined]
+      >) {
+        if (raw === undefined || !Number.isFinite(raw)) continue;
+        let samples = this.visionTimings.get(stage);
+        if (!samples) {
+          samples = [];
+          this.visionTimings.set(stage, samples);
+        }
+        this.pushBounded(samples, Math.max(0, raw));
+      }
+    }
+  }
+
+  private increment(values: Map<string, number>, key: string): void {
+    values.set(key, (values.get(key) ?? 0) + 1);
+  }
+
+  private pushBounded(values: number[], value: number): void {
+    if (values.length === 256) values.shift();
+    values.push(value);
+  }
+
+  private addDetection(detection: VisionDetectionDiagnostics | undefined): void {
+    if (!detection) return;
+    for (const key of Object.keys(this.visionDetection) as Array<keyof typeof this.visionDetection>) {
+      const value = detection[key];
+      if (value !== undefined && Number.isFinite(value)) this.visionDetection[key] += value;
+    }
   }
 
   snapshot(input: {
@@ -136,9 +308,7 @@ export class ExperimentMetrics {
   }): ExperimentSummary {
     const now = input.now ?? Date.now();
     const elapsedMs = Math.max(0, now - this.startedAtMs);
-    const sorted = [...this.latencySamples].sort((a, b) => a - b);
-    const latencyTotal = sorted.reduce((total, value) => total + value, 0);
-    const p50 = sorted.length === 0 ? 0 : sorted[Math.floor((sorted.length - 1) / 2)]!;
+    const decodeLatencyMs = distribution(this.latencySamples);
     return {
       schemaVersion: 1,
       startedAt: this.startedAt,
@@ -169,13 +339,8 @@ export class ExperimentMetrics {
       resolvedBlocks: input.resolvedBlocks ?? 0,
       carrierRejected: this.carrierRejected,
       erasureBytes: this.erasureBytes,
-      decodeLatencyMs: {
-        count: sorted.length,
-        average: sorted.length === 0 ? 0 : latencyTotal / sorted.length,
-        min: sorted[0] ?? 0,
-        max: sorted.at(-1) ?? 0,
-        p50,
-      },
+      decodeLatencyMs,
+      vision: this.visionSnapshot(),
       containerBitrateBps:
         input.payloadBytes === undefined || elapsedMs === 0
           ? undefined
@@ -187,6 +352,50 @@ export class ExperimentMetrics {
       failureReason: input.failureReason,
     };
   }
+
+
+  private visionSnapshot(): VisionExperimentSummary | undefined {
+    if (!this.visionSeen) return undefined;
+    const timingsMs: Partial<Record<VisionTimingKey, TimingDistribution>> = {};
+    for (const [stage, samples] of this.visionTimings) timingsMs[stage] = distribution(samples);
+    const fiducials = Object.fromEntries(
+      (["TL", "TR", "BR", "BL"] as const).map((id) => {
+        const value = this.visionFiducials[id];
+        return [id, {
+          observations: value.observations,
+          found: value.found,
+          errorSamples: value.errorSamples,
+          averageErrors: value.errorSamples === 0 ? 0 : value.totalErrors / value.errorSamples,
+          maximumErrors: value.maximumErrors,
+        }];
+      }),
+    ) as VisionExperimentSummary["fiducials"];
+    return {
+      debugEnabled: this.visionDebugEnabled,
+      configuration: this.visionConfiguration,
+      conditions: this.visionConditions,
+      rejectReasons: Object.fromEntries(this.visionRejectReasons),
+      stageRejections: Object.fromEntries(this.visionStageRejections),
+      detection: { ...this.visionDetection },
+      fiducials,
+      timingsMs,
+    };
+  }
+}
+
+function distribution(values: readonly number[]): TimingDistribution {
+  const sorted = [...values].sort((a, b) => a - b);
+  const total = sorted.reduce((sum, value) => sum + value, 0);
+  const percentile = (position: number): number =>
+    sorted.length === 0 ? 0 : sorted[Math.floor((sorted.length - 1) * position)]!;
+  return {
+    count: sorted.length,
+    average: sorted.length === 0 ? 0 : total / sorted.length,
+    min: sorted[0] ?? 0,
+    max: sorted.at(-1) ?? 0,
+    p50: percentile(0.5),
+    p95: percentile(0.95),
+  };
 }
 
 function openDatabase(): Promise<IDBDatabase | null> {

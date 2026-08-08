@@ -2596,6 +2596,102 @@ body.transfer-active :is(.signal-node, .stage-state-dot, .idle-aperture, .captur
   }
 }
 
+/* COLOR_4 vision laboratory. The diagnostic overlay is a sibling canvas: the
+   camera video remains unfiltered and untransformed. */
+.vision-debug-settings {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--line));
+}
+
+.debug-toggle {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  gap: 10px;
+  margin: 12px 0;
+  color: var(--text);
+}
+
+.debug-toggle input {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--accent);
+}
+
+.debug-controls select,
+.experiment-conditions select,
+.experiment-conditions input {
+  min-height: 44px;
+}
+
+.experiment-conditions {
+  min-width: 0;
+  margin: 14px 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+}
+
+.experiment-conditions legend {
+  padding: 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.vision-overlay-wrap {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.vision-overlay-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.vision-debug-output {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--line));
+  background: #080a0d;
+}
+
+.vision-debug-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.vision-debug-heading .telemetry {
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+#vision-debug-canvas {
+  display: block;
+  width: 100%;
+  max-height: min(54vh, 620px);
+  object-fit: contain;
+  background: #fff;
+  image-rendering: pixelated;
+}
+
+@media (max-width: 720px) {
+  .vision-debug-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .vision-debug-heading .telemetry {
+    text-align: left;
+  }
+}
+
 @media (max-width: 980px) {
   .brand-name {
     display: none;

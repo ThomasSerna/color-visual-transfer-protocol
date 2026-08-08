@@ -65,3 +65,7 @@ negotiated camera settings.
 COLOR_4 uses one OpenCV vision worker and keeps only one image in flight. If it
 is busy, the next capture is deliberately discarded; this protects latency and
 memory, and the fountain layer absorbs the loss.
+
+For stage-by-stage overlays, a one-frame diagnostic ZIP and the reproducible
+60-second physical baseline, see [Debug Vision](debug-vision.md). Debug snapshots
+contain a real camera image and should be reviewed before sharing.

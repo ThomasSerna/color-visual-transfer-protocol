@@ -16,6 +16,7 @@ import {
   decodePhasePilot,
   fiducialModule,
   getColor4Palette,
+  type BootstrapFields,
   type CalibrationPlacement,
   type CalibrationSwatchName,
   type Dibit,
@@ -36,7 +37,7 @@ export interface LabColor {
   readonly b: number;
 }
 
-type FloatRgb = readonly [red: number, green: number, blue: number];
+export type FloatRgb = readonly [red: number, green: number, blue: number];
 
 export interface ClassifierThresholds {
   /** Minimum observed white/black luminance range on both calibration banks. */
@@ -111,7 +112,110 @@ export interface DecodeCanonicalRasterOptions {
   /** Defaults to the normative COLOR4_PROFILES registry. */
   readonly profiles?: readonly Color4Profile[];
   readonly thresholds?: Partial<ClassifierThresholds>;
+  /** Optional monotonic clock used only by diagnostic observations. */
+  readonly clock?: () => number;
+  /** Include calibration banks and the bounded cell trace (debug mode only). */
+  readonly observerDetail?: boolean;
+  /**
+   * Receives structured-clone-safe diagnostic observations. Observer failures
+   * are isolated and can never change a decode result.
+   */
+  readonly observer?: CanonicalRasterObserver;
 }
+
+export type CanonicalRasterStage =
+  | "canonicalGeometry"
+  | "bootstrapPhase"
+  | "calibration"
+  | "classification";
+
+export interface CanonicalRasterObservationBase {
+  readonly stage: CanonicalRasterStage;
+  readonly durationMs: number;
+  readonly outcome: "completed" | "rejected";
+  readonly reason?: CanonicalRasterRejectReason;
+  readonly diagnostics: CanonicalRasterDiagnostics;
+}
+
+export interface CanonicalGeometryObservation extends CanonicalRasterObservationBase {
+  readonly stage: "canonicalGeometry";
+  readonly image: Readonly<{ width: number; height: number }>;
+  readonly thresholds: ClassifierThresholds;
+  readonly binaryAnchors?: Readonly<{ black: number; white: number; contrast: number }>;
+}
+
+export interface BootstrapPhaseObservation extends CanonicalRasterObservationBase {
+  readonly stage: "bootstrapPhase";
+  readonly bootstrap?: BootstrapFields;
+  readonly topPhase?: 0 | 1 | 2 | 3 | null;
+  readonly bottomPhase?: 0 | 1 | 2 | 3 | null;
+}
+
+export interface CalibrationBankObservation {
+  readonly raw: Readonly<Record<CalibrationSwatchName, FloatRgb>>;
+  readonly normalized: Readonly<Record<CalibrationSwatchName, FloatRgb>>;
+  readonly mad: number;
+  readonly contrast: number;
+  /** Raw camera channels at or near 8-bit clipping (<=1 or >=254). */
+  readonly clippedChannels: number;
+  readonly samples: Readonly<
+    Record<CalibrationSwatchName, readonly CalibrationSampleObservation[]>
+  >;
+}
+
+export interface CalibrationSampleObservation {
+  readonly raw: FloatRgb;
+  readonly normalized: FloatRgb;
+}
+
+export interface CalibrationObservation extends CanonicalRasterObservationBase {
+  readonly stage: "calibration";
+  readonly detailIncluded: boolean;
+  readonly left?: CalibrationBankObservation;
+  readonly right?: CalibrationBankObservation;
+  readonly thresholds: Readonly<{
+    minimumContrast: number;
+    minimumPaletteDistance: number;
+  }>;
+}
+
+export interface CellClassificationObservation {
+  readonly cellIndex: number;
+  readonly byteIndex: number;
+  readonly dibitIndex: 0 | 1 | 2 | 3;
+  readonly column: number;
+  readonly row: number;
+  readonly raw: FloatRgb;
+  readonly normalized: FloatRgb;
+  readonly dibit: Dibit;
+  readonly erased: boolean;
+  readonly bestDeltaE: number;
+  readonly secondDeltaE: number;
+  readonly deltaEGap: number;
+  readonly clippedChannels: number;
+}
+
+export interface ClassificationObservation extends CanonicalRasterObservationBase {
+  readonly stage: "classification";
+  readonly detailIncluded: boolean;
+  readonly effectiveThresholds: Readonly<{
+    maximumDeltaE: number;
+    minimumDeltaEGap: number;
+  }>;
+  readonly clippedChannels: number;
+  /** The erased and least-confident cells, capped at 128 entries. */
+  readonly cells: readonly CellClassificationObservation[];
+}
+
+export type CanonicalRasterObservation =
+  | CanonicalGeometryObservation
+  | BootstrapPhaseObservation
+  | CalibrationObservation
+  | ClassificationObservation;
+
+export type CanonicalRasterObserver = (observation: CanonicalRasterObservation) => void;
+
+export const MAX_CLASSIFIER_CELL_OBSERVATIONS = 128;
 
 interface MutableDiagnostics {
   moduleScale: number;
@@ -141,6 +245,8 @@ interface BankSamples {
 interface CalibrationModel {
   readonly left: BankSamples;
   readonly right: BankSamples;
+  readonly leftMad: number;
+  readonly rightMad: number;
   readonly mad: number;
   readonly contrast: number;
   readonly minimumPaletteDistance: number;
@@ -175,6 +281,41 @@ function rejected(
   return Object.freeze({ status: "rejected", reason, diagnostics: freezeDiagnostics(value) });
 }
 
+function defaultClock(): number {
+  return typeof globalThis.performance?.now === "function"
+    ? globalThis.performance.now()
+    : Date.now();
+}
+
+function readClock(clock: (() => number) | undefined): number {
+  try {
+    const value = (clock ?? defaultClock)();
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function elapsedSince(clock: (() => number) | undefined, startedAt: number): {
+  readonly endedAt: number;
+  readonly durationMs: number;
+} {
+  const endedAt = readClock(clock);
+  return { endedAt, durationMs: Math.max(0, endedAt - startedAt) };
+}
+
+function notifyObserver(
+  observer: CanonicalRasterObserver | undefined,
+  observation: CanonicalRasterObservation,
+): void {
+  if (observer === undefined) return;
+  try {
+    observer(Object.freeze(observation));
+  } catch {
+    // Diagnostic consumers must never influence wire decoding.
+  }
+}
+
 function median(values: readonly number[]): number {
   if (values.length === 0) throw new RangeError("Cannot take the median of an empty sample.");
   const sorted = [...values].sort((a, b) => a - b);
@@ -198,6 +339,14 @@ function luminance(rgb: FloatRgb): number {
 
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
+}
+
+function rawClippedChannels(rgb: FloatRgb): number {
+  return (
+    (rgb[0] <= 1 || rgb[0] >= 254 ? 1 : 0) +
+    (rgb[1] <= 1 || rgb[1] >= 254 ? 1 : 0) +
+    (rgb[2] <= 1 || rgb[2] >= 254 ? 1 : 0)
+  );
 }
 
 function mix(left: number, right: number, position: number): number {
@@ -446,6 +595,8 @@ function minimumTargetDistance(
   const placeholder: CalibrationModel = {
     left,
     right,
+    leftMad: 0,
+    rightMad: 0,
     mad: 0,
     contrast: 0,
     minimumPaletteDistance: 0,
@@ -484,13 +635,100 @@ function buildCalibration(
 ): CalibrationModel {
   const left = sampleBank(sampler, layout.calibration.left);
   const right = sampleBank(sampler, layout.calibration.right);
+  const leftMad = bankMad(left);
+  const rightMad = bankMad(right);
   return {
     left,
     right,
-    mad: Math.max(bankMad(left), bankMad(right)),
+    leftMad,
+    rightMad,
+    mad: Math.max(leftMad, rightMad),
     contrast: Math.min(luminance(left.W) - luminance(left.K), luminance(right.W) - luminance(right.K)),
     minimumPaletteDistance: minimumTargetDistance(left, right, paletteId),
   };
+}
+
+function cloneRgb(rgb: FloatRgb): FloatRgb {
+  return Object.freeze([rgb[0], rgb[1], rgb[2]]) as FloatRgb;
+}
+
+function observeCalibrationBank(bank: BankSamples, mad: number): CalibrationBankObservation {
+  const names = ["K", "W", "C", "M", "Y", "G50"] as const;
+  const raw = {} as Record<CalibrationSwatchName, FloatRgb>;
+  const normalized = {} as Record<CalibrationSwatchName, FloatRgb>;
+  const samples = {} as Record<
+    CalibrationSwatchName,
+    readonly CalibrationSampleObservation[]
+  >;
+  for (const name of names) {
+    raw[name] = cloneRgb(bank[name]);
+    normalized[name] = cloneRgb(normalizedBankColor(bank, name));
+    samples[name] = Object.freeze(bank.modules[name].map((sample) => Object.freeze({
+      raw: cloneRgb(sample),
+      normalized: cloneRgb(normalizedWithAnchors(sample, bank.K, bank.W)),
+    })));
+  }
+  let clippedChannels = 0;
+  for (const samples of Object.values(bank.modules)) {
+    for (const sample of samples) {
+      clippedChannels += rawClippedChannels(sample);
+    }
+  }
+  return Object.freeze({
+    raw: Object.freeze(raw),
+    normalized: Object.freeze(normalized),
+    mad,
+    contrast: luminance(bank.W) - luminance(bank.K),
+    clippedChannels,
+    samples: Object.freeze(samples),
+  });
+}
+
+interface RankedCellObservation {
+  readonly score: number;
+  readonly observation: CellClassificationObservation;
+}
+
+interface RankedCellBuffer {
+  readonly entries: RankedCellObservation[];
+  leastIndex: number;
+  leastScore: number;
+}
+
+function cellObservationScore(
+  erased: boolean,
+  bestDeltaE: number,
+  deltaEGap: number,
+  minimumDeltaEGap: number,
+): number {
+  const gapPenalty = Math.max(0, minimumDeltaEGap - deltaEGap);
+  return (erased ? 1_000_000 : 0) + bestDeltaE + gapPenalty;
+}
+
+function retainWorstCell(
+  buffer: RankedCellBuffer,
+  score: number,
+  createObservation: () => CellClassificationObservation,
+): void {
+  if (buffer.entries.length < MAX_CLASSIFIER_CELL_OBSERVATIONS) {
+    const index = buffer.entries.length;
+    buffer.entries.push({ score, observation: createObservation() });
+    if (score < buffer.leastScore) {
+      buffer.leastIndex = index;
+      buffer.leastScore = score;
+    }
+    return;
+  }
+  if (score <= buffer.leastScore) return;
+  buffer.entries[buffer.leastIndex] = { score, observation: createObservation() };
+  buffer.leastIndex = 0;
+  buffer.leastScore = buffer.entries[0]!.score;
+  for (let index = 1; index < buffer.entries.length; index++) {
+    if (buffer.entries[index]!.score < buffer.leastScore) {
+      buffer.leastIndex = index;
+      buffer.leastScore = buffer.entries[index]!.score;
+    }
+  }
 }
 
 export interface LabClassification {
@@ -553,6 +791,62 @@ export function decodeCanonicalColor4Raster(
   options: DecodeCanonicalRasterOptions = {},
 ): CanonicalRasterResult {
   const values = diagnostics();
+  const observing = options.observer !== undefined;
+  const thresholds: ClassifierThresholds = {
+    ...DEFAULT_CLASSIFIER_THRESHOLDS,
+    ...options.thresholds,
+  };
+  const observedThresholds = observing ? Object.freeze({ ...thresholds }) : thresholds;
+  const observingDetail = observing && options.observerDetail === true;
+  let stageStartedAt = observing ? readClock(options.clock) : 0;
+  const finishGeometry = (
+    outcome: "completed" | "rejected",
+    reason?: CanonicalRasterRejectReason,
+    anchors?: Readonly<{ black: number; white: number }>,
+  ): void => {
+    if (!observing) return;
+    const timing = elapsedSince(options.clock, stageStartedAt);
+    notifyObserver(options.observer, {
+      stage: "canonicalGeometry",
+      durationMs: timing.durationMs,
+      outcome,
+      ...(reason === undefined ? {} : { reason }),
+      diagnostics: freezeDiagnostics(values),
+      image: Object.freeze({ width: image.width, height: image.height }),
+      thresholds: observedThresholds,
+      ...(anchors === undefined
+        ? {}
+        : {
+            binaryAnchors: Object.freeze({
+              black: anchors.black,
+              white: anchors.white,
+              contrast: anchors.white - anchors.black,
+            }),
+          }),
+    });
+    stageStartedAt = readClock(options.clock);
+  };
+  const finishBootstrap = (
+    outcome: "completed" | "rejected",
+    reason: CanonicalRasterRejectReason | undefined,
+    bootstrap: BootstrapFields | undefined,
+    topPhase?: 0 | 1 | 2 | 3 | null,
+    bottomPhase?: 0 | 1 | 2 | 3 | null,
+  ): void => {
+    if (!observing) return;
+    const timing = elapsedSince(options.clock, stageStartedAt);
+    notifyObserver(options.observer, {
+      stage: "bootstrapPhase",
+      durationMs: timing.durationMs,
+      outcome,
+      ...(reason === undefined ? {} : { reason }),
+      diagnostics: freezeDiagnostics(values),
+      ...(bootstrap === undefined ? {} : { bootstrap }),
+      ...(topPhase === undefined ? {} : { topPhase }),
+      ...(bottomPhase === undefined ? {} : { bottomPhase }),
+    });
+    stageStartedAt = readClock(options.clock);
+  };
   if (
     !Number.isInteger(image.width) ||
     !Number.isInteger(image.height) ||
@@ -561,23 +855,24 @@ export function decodeCanonicalColor4Raster(
     image.width % TOTAL_MODULES !== 0 ||
     image.pixels.length < image.width * image.height * 4
   ) {
+    finishGeometry("rejected", "invalid_dimensions");
     return rejected("invalid_dimensions", values);
   }
   const scale = image.width / TOTAL_MODULES;
   values.moduleScale = scale;
   const sampler = createSampler(image, scale);
   const anchors = collectBinaryAnchors(sampler);
-  if (anchors.white - anchors.black < 40) return rejected("invalid_geometry", values);
-
-  const thresholds: ClassifierThresholds = {
-    ...DEFAULT_CLASSIFIER_THRESHOLDS,
-    ...options.thresholds,
-  };
+  if (anchors.white - anchors.black < 40) {
+    finishGeometry("rejected", "invalid_geometry", anchors);
+    return rejected("invalid_geometry", values);
+  }
   values.fiducialErrors = countFiducialErrors(sampler, anchors);
   values.quietZoneErrors = countQuietZoneErrors(sampler, anchors);
   if (values.fiducialErrors > thresholds.maximumFiducialErrors || values.quietZoneErrors > 2) {
+    finishGeometry("rejected", "invalid_geometry", anchors);
     return rejected("invalid_geometry", values);
   }
+  finishGeometry("completed", undefined, anchors);
 
   const bootstrapRect: ModuleRect = {
     x: (ACTIVE_MODULES - BOOTSTRAP_COLUMNS) / 2,
@@ -586,12 +881,24 @@ export function decodeCanonicalColor4Raster(
     height: BOOTSTRAP_ROWS,
   };
   const bootstrap = decodeBootstrap(sampleBinaryRect(sampler, bootstrapRect, anchors));
-  if (bootstrap === null) return rejected("invalid_bootstrap", values);
-  if (bootstrap.version !== PHY_VERSION) return rejected("unsupported_version", values);
+  if (bootstrap === null) {
+    finishBootstrap("rejected", "invalid_bootstrap", undefined);
+    return rejected("invalid_bootstrap", values);
+  }
+  if (bootstrap.version !== PHY_VERSION) {
+    finishBootstrap("rejected", "unsupported_version", bootstrap);
+    return rejected("unsupported_version", values);
+  }
   const profile = resolveProfile(bootstrap.profileId, options.profiles);
-  if (profile === undefined) return rejected("unsupported_profile", values);
+  if (profile === undefined) {
+    finishBootstrap("rejected", "unsupported_profile", bootstrap);
+    return rejected("unsupported_profile", values);
+  }
   const palette = getColor4Palette(bootstrap.paletteId);
-  if (palette === undefined) return rejected("unsupported_palette", values);
+  if (palette === undefined) {
+    finishBootstrap("rejected", "unsupported_palette", bootstrap);
+    return rejected("unsupported_palette", values);
+  }
   const paletteId = palette.id;
   const layout = createPhysicalLayout(profile);
 
@@ -599,6 +906,7 @@ export function decodeCanonicalColor4Raster(
   values.timingErrors = timing.errors;
   values.timingModules = timing.modules;
   if (timing.errors / timing.modules > thresholds.maximumTimingErrorRate) {
+    finishBootstrap("rejected", "invalid_geometry", bootstrap);
     return rejected("invalid_geometry", values);
   }
 
@@ -612,17 +920,41 @@ export function decodeCanonicalColor4Raster(
     topPhase !== bottomPhase ||
     topPhase !== bootstrap.sequencePhase
   ) {
+    finishBootstrap("rejected", "phase_mismatch", bootstrap, topPhase, bottomPhase);
     return rejected("phase_mismatch", values);
   }
+  finishBootstrap("completed", undefined, bootstrap, topPhase, bottomPhase);
 
   const model = buildCalibration(sampler, layout, paletteId);
   values.calibrationMad = model.mad;
   values.observedContrast = model.contrast;
   values.minimumPaletteDistance = model.minimumPaletteDistance;
-  if (
+  const calibrationRejected =
     model.contrast < thresholds.minimumContrast ||
-    model.minimumPaletteDistance < thresholds.minimumPaletteDistance
-  ) {
+    model.minimumPaletteDistance < thresholds.minimumPaletteDistance;
+  if (observing) {
+    const calibrationTiming = elapsedSince(options.clock, stageStartedAt);
+    notifyObserver(options.observer, {
+      stage: "calibration",
+      durationMs: calibrationTiming.durationMs,
+      outcome: calibrationRejected ? "rejected" : "completed",
+      ...(calibrationRejected ? { reason: "calibration_failed" as const } : {}),
+      diagnostics: freezeDiagnostics(values),
+      detailIncluded: observingDetail,
+      ...(observingDetail
+        ? {
+            left: observeCalibrationBank(model.left, model.leftMad),
+            right: observeCalibrationBank(model.right, model.rightMad),
+          }
+        : {}),
+      thresholds: Object.freeze({
+        minimumContrast: thresholds.minimumContrast,
+        minimumPaletteDistance: thresholds.minimumPaletteDistance,
+      }),
+    });
+    stageStartedAt = readClock(options.clock);
+  }
+  if (calibrationRejected) {
     return rejected("calibration_failed", values);
   }
 
@@ -633,6 +965,10 @@ export function decodeCanonicalColor4Raster(
   const dynamicMinimumGap = Math.max(thresholds.minimumDeltaEGap, model.mad * 2 + 4);
   const codedBytes = new Uint8Array(profile.codedBytes);
   const erasures: number[] = [];
+  const observedCells: RankedCellBuffer | undefined = !observingDetail
+    ? undefined
+    : { entries: [], leastIndex: 0, leastScore: Number.POSITIVE_INFINITY };
+  let clippedChannels = 0;
   let cell = 0;
   let totalBestDeltaE = 0;
 
@@ -660,6 +996,34 @@ export function decodeCanonicalColor4Raster(
         byteErased = true;
         values.uncertainCells++;
       }
+      if (observing) {
+        const clipped = rawClippedChannels(raw);
+        clippedChannels += clipped;
+        if (observedCells !== undefined) {
+          const deltaEGap = classified.secondDeltaE - classified.bestDeltaE;
+          const score = cellObservationScore(
+            classified.erased,
+            classified.bestDeltaE,
+            deltaEGap,
+            dynamicMinimumGap,
+          );
+          retainWorstCell(observedCells, score, () => Object.freeze({
+            cellIndex: cell,
+            byteIndex,
+            dibitIndex: dibitIndex as 0 | 1 | 2 | 3,
+            column,
+            row,
+            raw: cloneRgb(raw),
+            normalized: cloneRgb(normalized),
+            dibit: classified.dibit,
+            erased: classified.erased,
+            bestDeltaE: classified.bestDeltaE,
+            secondDeltaE: classified.secondDeltaE,
+            deltaEGap,
+            clippedChannels: clipped,
+          }));
+        }
+      }
       totalBestDeltaE += classified.bestDeltaE;
       values.maximumBestDeltaE = Math.max(values.maximumBestDeltaE, classified.bestDeltaE);
       cell++;
@@ -670,6 +1034,27 @@ export function decodeCanonicalColor4Raster(
 
   values.erasureBytes = erasures.length;
   values.meanBestDeltaE = totalBestDeltaE / (profile.columns * profile.rows);
+  const classificationTiming = observing
+    ? elapsedSince(options.clock, stageStartedAt)
+    : { endedAt: 0, durationMs: 0 };
+  const cells = Object.freeze(
+    (observedCells?.entries ?? [])
+      .sort((left, right) => right.score - left.score)
+      .map(({ observation }) => observation),
+  );
+  notifyObserver(options.observer, {
+    stage: "classification",
+    durationMs: classificationTiming.durationMs,
+    outcome: "completed",
+    diagnostics: freezeDiagnostics(values),
+    detailIncluded: observingDetail,
+    effectiveThresholds: Object.freeze({
+      maximumDeltaE: dynamicMaximumDeltaE,
+      minimumDeltaEGap: dynamicMinimumGap,
+    }),
+    clippedChannels,
+    cells,
+  });
   return Object.freeze({
     status: "valid",
     profile,

@@ -5,6 +5,7 @@
 - [Quick start](user/quick-start.md) — two devices, one minute.
 - [Transmitting](user/sending.md) — files, text snippets, transfer settings, fullscreen, sharing.
 - [Capturing](user/receiving.md) — camera, settings, what happens when a transfer lands.
+- [Debug Vision](user/debug-vision.md) — stage views, private snapshot ZIPs and the frozen physical baseline.
 - [Troubleshooting](user/troubleshooting.md) — when nothing decodes.
 - [Install & offline](user/install-and-offline.md) — PWA install, offline use, standalone files, demo mode.
 - [Privacy](user/privacy.md) — what leaves the device (nothing), what persists (almost nothing).

@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
-import { LTEncoder } from "../shared/fountain";
+import { LTDecoder, LTEncoder } from "../shared/fountain";
 import { fnv1a, packFile, packFrame } from "../shared/protocol";
 import {
   ROBUST_PROFILE,
@@ -9,7 +9,36 @@ import {
   wrapColor4Frame,
 } from "../shared/color4";
 
-export const COLOR4_CAMERA_FIXTURE = join(tmpdir(), "decimen-color4-playwright.y4m");
+export const COLOR4_CAMERA_FIXTURE = join(tmpdir(), "cvtp-color4-playwright.y4m");
+
+/**
+ * The fake camera must exercise the fountain receiver, not just the optical
+ * carrier. For k=2, sequences 1/2/3 are redundant degree-two equations and
+ * sequence 0 is the final degree-one equation that starts the peeling cascade.
+ * Holds make every optical sequence visible long enough for the single vision
+ * worker, and the second appearance of sequence 1 exercises duplicate handling.
+ */
+export const COLOR4_CAMERA_SCHEDULE = [
+  { sequence: 1, hold: 4 },
+  { sequence: 2, hold: 2 },
+  { sequence: 1, hold: 2 },
+  { sequence: 3, hold: 2 },
+  { sequence: 0, hold: 4 },
+] as const;
+
+export const COLOR4_CAMERA_PAYLOAD = (() => {
+  const bytes = new Uint8Array(2_048);
+  let state = 0x6d2b79f5;
+  for (let index = 0; index < bytes.length; index++) {
+    // Deterministic xorshift32 output is deliberately incompressible enough to
+    // keep packFile() on the uncompressed path and the fixture at k > 1.
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    bytes[index] = state >>> 24;
+  }
+  return bytes;
+})();
 
 const WIDTH = 1280;
 const HEIGHT = 960;
@@ -144,39 +173,75 @@ function cameraRgba(frame: ReturnType<typeof rasterizeColor4>): Uint8ClampedArra
 }
 
 export default async function globalSetup(): Promise<void> {
-  const original = Uint8Array.from({ length: 96 }, (_, index) => (index * 61 + 17) & 0xff);
-  const packed = await packFile("camera-e2e.bin", "application/octet-stream", original);
-  const sessionId = 0x4242;
-  const sequence = 0;
-  const fountain = new LTEncoder(packed.container, ROBUST_PROFILE.blockBytes, sessionId);
-  const inner = packFrame(
-    {
-      sessionId,
-      seq: sequence,
-      k: fountain.k,
-      blockLen: ROBUST_PROFILE.blockBytes,
-      totalLen: packed.container.length,
-      payloadFnv: fnv1a(packed.container),
-    },
-    fountain.encode(sequence),
+  const packed = await packFile(
+    "camera-e2e.bin",
+    "application/octet-stream",
+    COLOR4_CAMERA_PAYLOAD,
   );
-  const encoded = wrapColor4Frame(inner, { profileId: ROBUST_PROFILE.id, paletteId: 0 });
-  const raster = rasterizeColor4(encoded.codedBytes, {
-    profile: ROBUST_PROFILE,
-    paletteId: 0,
-    sequence,
-    moduleScale: 4,
-  });
-  const i420 = rgbaToI420(cameraRgba(raster));
+  const sessionId = 0x4242;
+  const fountain = new LTEncoder(packed.container, ROBUST_PROFILE.blockBytes, sessionId);
+  if (fountain.k <= 1) throw new Error("The camera E2E fixture must span multiple LT blocks.");
+
+  const frameForSequence = new Map<number, Uint8Array>();
+  const probe = new LTDecoder(
+    fountain.k,
+    ROBUST_PROFILE.blockBytes,
+    sessionId,
+    packed.container.length,
+  );
+  const expandedSchedule: number[] = [];
+  for (const entry of COLOR4_CAMERA_SCHEDULE) {
+    const block = fountain.encode(entry.sequence);
+    for (let held = 0; held < entry.hold; held++) {
+      expandedSchedule.push(entry.sequence);
+      probe.addFrame(entry.sequence, block);
+    }
+    if (frameForSequence.has(entry.sequence)) continue;
+    const inner = packFrame(
+      {
+        sessionId,
+        seq: entry.sequence,
+        k: fountain.k,
+        blockLen: ROBUST_PROFILE.blockBytes,
+        totalLen: packed.container.length,
+        payloadFnv: fnv1a(packed.container),
+      },
+      block,
+    );
+    const encoded = wrapColor4Frame(inner, {
+      profileId: ROBUST_PROFILE.id,
+      paletteId: 0,
+    });
+    const raster = rasterizeColor4(encoded.codedBytes, {
+      profile: ROBUST_PROFILE,
+      paletteId: 0,
+      sequence: entry.sequence,
+      moduleScale: 4,
+    });
+    frameForSequence.set(entry.sequence, rgbaToI420(cameraRgba(raster)));
+  }
+  if (!probe.isComplete || probe.framesNew < 2 || probe.framesDup < 1) {
+    throw new Error("The camera E2E schedule must reconstruct with new and duplicate LT frames.");
+  }
+  const assembled = probe.assemble();
+  if (!assembled || !assembled.every((byte, index) => byte === packed.container[index])) {
+    throw new Error("The camera E2E schedule did not reconstruct its DCF2 container exactly.");
+  }
+
   const header = new TextEncoder().encode(
-    `YUV4MPEG2 W${WIDTH} H${HEIGHT} F30:1 Ip A1:1 C420jpeg\n`,
+    `YUV4MPEG2 W${WIDTH} H${HEIGHT} F5:1 Ip A1:1 C420jpeg\n`,
   );
   const frameHeader = new TextEncoder().encode("FRAME\n");
-  const fixture = new Uint8Array(header.length + 3 * (frameHeader.length + i420.length));
+  const frameBytes = WIDTH * HEIGHT * 3 / 2;
+  const fixture = new Uint8Array(
+    header.length + expandedSchedule.length * (frameHeader.length + frameBytes),
+  );
   let offset = 0;
   fixture.set(header, offset);
   offset += header.length;
-  for (let frame = 0; frame < 3; frame++) {
+  for (const sequence of expandedSchedule) {
+    const i420 = frameForSequence.get(sequence);
+    if (!i420) throw new Error(`Missing fake-camera raster for sequence ${sequence}.`);
     fixture.set(frameHeader, offset);
     offset += frameHeader.length;
     fixture.set(i420, offset);
