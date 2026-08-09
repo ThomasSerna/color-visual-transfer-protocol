@@ -7,6 +7,7 @@ import {
   ACTIVE_MODULES,
   BOOTSTRAP_COLUMNS,
   BOOTSTRAP_ROWS,
+  COLOR4_MAX_FIDUCIAL_ERRORS,
   FIDUCIALS,
   PHY_VERSION,
   QUIET_MODULES,
@@ -20,6 +21,7 @@ import {
   type CalibrationPlacement,
   type CalibrationSwatchName,
   type Dibit,
+  type FiducialId,
   type ModuleRect,
   type PhysicalLayout,
 } from "./physical";
@@ -48,7 +50,7 @@ export interface ClassifierThresholds {
   readonly maximumDeltaE: number;
   /** Baseline gap between the closest and second-closest centroids. */
   readonly minimumDeltaEGap: number;
-  /** Marker mismatches tolerated after canonical normalization. */
+  /** Mismatches tolerated in each marker after canonical normalization. */
   readonly maximumFiducialErrors: number;
   /** Maximum fraction of timing-rail modules that may be wrong or uncertain. */
   readonly maximumTimingErrorRate: number;
@@ -59,7 +61,7 @@ export const DEFAULT_CLASSIFIER_THRESHOLDS: ClassifierThresholds = Object.freeze
   minimumPaletteDistance: 12,
   maximumDeltaE: 24,
   minimumDeltaEGap: 6,
-  maximumFiducialErrors: 8,
+  maximumFiducialErrors: COLOR4_MAX_FIDUCIAL_ERRORS,
   maximumTimingErrorRate: 0.08,
 });
 
@@ -75,7 +77,10 @@ export type CanonicalRasterRejectReason =
 
 export interface CanonicalRasterDiagnostics {
   readonly moduleScale: number;
+  /** Sum across all four fiducials, retained for schema compatibility. */
   readonly fiducialErrors: number;
+  readonly fiducialErrorsById: Readonly<Record<FiducialId, number>>;
+  readonly fiducialErrorMax: number;
   readonly quietZoneErrors: number;
   readonly timingErrors: number;
   readonly timingModules: number;
@@ -220,6 +225,8 @@ export const MAX_CLASSIFIER_CELL_OBSERVATIONS = 128;
 interface MutableDiagnostics {
   moduleScale: number;
   fiducialErrors: number;
+  fiducialErrorsById: Readonly<Record<FiducialId, number>>;
+  fiducialErrorMax: number;
   quietZoneErrors: number;
   timingErrors: number;
   timingModules: number;
@@ -256,6 +263,8 @@ function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics 
   return {
     moduleScale: 0,
     fiducialErrors: 0,
+    fiducialErrorsById: Object.freeze({ TL: 0, TR: 0, BR: 0, BL: 0 }),
+    fiducialErrorMax: 0,
     quietZoneErrors: 0,
     timingErrors: 0,
     timingModules: 0,
@@ -271,7 +280,10 @@ function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics 
 }
 
 function freezeDiagnostics(value: MutableDiagnostics): CanonicalRasterDiagnostics {
-  return Object.freeze({ ...value });
+  return Object.freeze({
+    ...value,
+    fiducialErrorsById: Object.freeze({ ...value.fiducialErrorsById }),
+  });
 }
 
 function rejected(
@@ -458,20 +470,33 @@ function sampleBinaryRect(
   return out;
 }
 
+interface FiducialErrorSummary {
+  readonly byId: Readonly<Record<FiducialId, number>>;
+  readonly total: number;
+  readonly maximum: number;
+}
+
 function countFiducialErrors(
   sampler: ModuleSampler,
   anchors: { black: number; white: number },
-): number {
-  let errors = 0;
+): FiducialErrorSummary {
+  const byId: Record<FiducialId, number> = { TL: 0, TR: 0, BR: 0, BL: 0 };
   for (const marker of FIDUCIALS) {
+    let errors = 0;
     for (let y = 0; y < 9; y++) {
       for (let x = 0; x < 9; x++) {
         const sampled = binaryModule(sampler.sampleActive(marker.x + x, marker.y + y), anchors);
         if (sampled !== fiducialModule(marker.id, x, y)) errors++;
       }
     }
+    byId[marker.id] = errors;
   }
-  return errors;
+  const counts = Object.values(byId);
+  return Object.freeze({
+    byId: Object.freeze(byId),
+    total: counts.reduce((sum, errors) => sum + errors, 0),
+    maximum: Math.max(...counts),
+  });
 }
 
 function countQuietZoneErrors(
@@ -781,6 +806,21 @@ function resolveProfile(
   return profiles.find((profile) => profile.id === id);
 }
 
+function resolveThresholds(
+  overrides: Partial<ClassifierThresholds> | undefined,
+): ClassifierThresholds {
+  const requestedFiducialErrors =
+    overrides?.maximumFiducialErrors ?? DEFAULT_CLASSIFIER_THRESHOLDS.maximumFiducialErrors;
+  const maximumFiducialErrors = Number.isNaN(requestedFiducialErrors)
+    ? DEFAULT_CLASSIFIER_THRESHOLDS.maximumFiducialErrors
+    : Math.max(0, Math.min(COLOR4_MAX_FIDUCIAL_ERRORS, requestedFiducialErrors));
+  return {
+    ...DEFAULT_CLASSIFIER_THRESHOLDS,
+    ...overrides,
+    maximumFiducialErrors,
+  };
+}
+
 /**
  * Decode a square, orientation-correct, homography-normalized COLOR_4 raster.
  * Camera location and perspective recovery intentionally live outside this
@@ -792,10 +832,7 @@ export function decodeCanonicalColor4Raster(
 ): CanonicalRasterResult {
   const values = diagnostics();
   const observing = options.observer !== undefined;
-  const thresholds: ClassifierThresholds = {
-    ...DEFAULT_CLASSIFIER_THRESHOLDS,
-    ...options.thresholds,
-  };
+  const thresholds = resolveThresholds(options.thresholds);
   const observedThresholds = observing ? Object.freeze({ ...thresholds }) : thresholds;
   const observingDetail = observing && options.observerDetail === true;
   let stageStartedAt = observing ? readClock(options.clock) : 0;
@@ -866,9 +903,12 @@ export function decodeCanonicalColor4Raster(
     finishGeometry("rejected", "invalid_geometry", anchors);
     return rejected("invalid_geometry", values);
   }
-  values.fiducialErrors = countFiducialErrors(sampler, anchors);
+  const fiducialErrors = countFiducialErrors(sampler, anchors);
+  values.fiducialErrors = fiducialErrors.total;
+  values.fiducialErrorsById = fiducialErrors.byId;
+  values.fiducialErrorMax = fiducialErrors.maximum;
   values.quietZoneErrors = countQuietZoneErrors(sampler, anchors);
-  if (values.fiducialErrors > thresholds.maximumFiducialErrors || values.quietZoneErrors > 2) {
+  if (values.fiducialErrorMax > thresholds.maximumFiducialErrors || values.quietZoneErrors > 2) {
     finishGeometry("rejected", "invalid_geometry", anchors);
     return rejected("invalid_geometry", values);
   }

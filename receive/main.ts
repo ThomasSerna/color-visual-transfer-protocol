@@ -1,15 +1,16 @@
 // Receiver: camera → WASM QR decode in workers → fountain decoder → file.
 //
 // Field lessons baked in:
-// - iOS treats `frameRate: {ideal: 60}` as a suggestion and delivers 30.
-//   Demand `exact` first (it works at 1280-wide), fall back to `ideal`.
+// - iOS may treat an ideal frame rate as a suggestion. Demand the selected
+//   rate as `exact` first, then fall back to `ideal`.
 // - requestVideoFrameCallback chains survive a stopped stream and resume on
 //   the next one — a generation counter prevents zombie capture loops.
 // - Progress must track frames COLLECTED: LT peeling back-loads its solve
 //   cascade, so blocks-solved looks stalled and then teleports to done.
-// - Android Chrome exposes torch / focusMode / frameRate.max through
-//   getCapabilities; iOS Safari exposes none of them. shared/platform.ts owns
-//   the probing, so everything here is capability-gated rather than UA-gated.
+// - Android Chrome exposes torch / camera modes / frameRate.max through
+//   getCapabilities; iOS Safari may expose none of them. shared/platform.ts
+//   owns the probing, so everything here is capability-gated rather than
+//   UA-gated.
 
 import { LTDecoder } from "../shared/fountain";
 import {
@@ -30,7 +31,12 @@ import {
 import { NO_SIGNAL_HINT_FRAME_BYTES, NO_SIGNAL_HINT_TX_FPS } from "../shared/send-settings";
 import { statusLine } from "../shared/status-line";
 import { releaseScreenWakeLock, requestScreenWakeLock } from "../shared/wake-lock";
-import { applyAdvancedConstraint, probeCameraCapabilities } from "../shared/platform";
+import { applyContinuousCameraModes, probeCameraCapabilities } from "../shared/platform";
+import {
+  DEFAULT_COLOR4_CANONICAL_SCALE,
+  DEFAULT_COLOR4_DETECTION_DIMENSION,
+  defaultCaptureFps,
+} from "../shared/receiver-defaults";
 import { closeOnBackdropClick } from "../shared/dialog";
 import { loadColor4Receiver } from "../shared/color-loader";
 import {
@@ -113,6 +119,7 @@ let startTs = 0;
 let captureGen = 0;
 let done = false;
 let settingsWired = false;
+let captureFpsManuallySelected = false;
 let statsTimer: ReturnType<typeof setInterval> | undefined;
 let activeCarrier: CarrierChoice | null = null;
 let colorDecoder: Color4CameraDecoder | null = null;
@@ -151,9 +158,16 @@ function applyCarrierControls(): void {
     return;
   }
   const carrier = currentCarrier();
+  if (!captureFpsManuallySelected) cfgCapFps.value = String(defaultCaptureFps(carrier));
   qrSettings.forEach((element) => { element.hidden = carrier !== "qr"; });
   colorSettings.forEach((element) => { element.hidden = carrier !== "color4"; });
 }
+
+cfgCapFps.addEventListener("change", () => {
+  // Carrier-specific defaults follow the picker until the user makes an
+  // explicit choice. That choice then wins for the rest of this page session.
+  captureFpsManuallySelected = true;
+});
 
 async function ensureVisionDebugController(): Promise<VisionDebugController> {
   if (!__COLOR4_ENABLED__) throw new Error("Debug Vision is unavailable in this build.");
@@ -509,8 +523,9 @@ async function start() {
     visionDebugController?.setTransferActive(true);
     experiment.setVisionContext({
       debugEnabled: visionDebugController?.enabled ?? false,
-      canonicalScale: visionDebugController?.canonicalScale ?? 4,
-      detectionDimension: visionDebugController?.maxDetectionDimension ?? 960,
+      canonicalScale: visionDebugController?.canonicalScale ?? DEFAULT_COLOR4_CANONICAL_SCALE,
+      detectionDimension:
+        visionDebugController?.maxDetectionDimension ?? DEFAULT_COLOR4_DETECTION_DIMENSION,
       conditions: visionDebugController?.conditions(),
     });
   }
@@ -555,16 +570,14 @@ function reportCameraSettings() {
 }
 
 /** Use what this camera can actually do, probed rather than UA-sniffed.
- *  Continuous autofocus is applied silently — a lens hunting between frames is
- *  the top decode killer, and a camera that refuses is left as it was. Frame
- *  rates the current mode can't reach are grayed out. */
+ *  Continuous camera modes are applied individually and silently; unsupported
+ *  or refused modes leave that camera setting unchanged. Frame rates the
+ *  current mode can't reach are grayed out. */
 async function applyCameraExtras() {
   const track = stream?.getVideoTracks()[0];
   if (!track) return;
   const caps = probeCameraCapabilities(track);
-  if (caps.continuousFocus) {
-    await applyAdvancedConstraint(track, { focusMode: "continuous" });
-  }
+  await applyContinuousCameraModes(track, caps);
   if (caps.maxFrameRate) {
     for (const option of Array.from(cfgCapFps.options)) {
       option.disabled = Number(option.value) > caps.maxFrameRate;

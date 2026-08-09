@@ -10,6 +10,10 @@ import {
 } from "../shared/color4";
 
 export const COLOR4_CAMERA_FIXTURE = join(tmpdir(), "cvtp-color4-playwright.y4m");
+export const COLOR4_CAMERA_DEGRADED_FIXTURE = join(
+  tmpdir(),
+  "cvtp-color4-playwright-degraded.y4m",
+);
 
 /**
  * The fake camera must exercise the fountain receiver, not just the optical
@@ -42,6 +46,24 @@ export const COLOR4_CAMERA_PAYLOAD = (() => {
 
 const WIDTH = 1280;
 const HEIGHT = 960;
+type CameraQuad = readonly [
+  Readonly<{ x: number; y: number }>,
+  Readonly<{ x: number; y: number }>,
+  Readonly<{ x: number; y: number }>,
+  Readonly<{ x: number; y: number }>,
+];
+const BASELINE_CAMERA_QUAD: CameraQuad = [
+  { x: 285, y: 110 },
+  { x: 1015, y: 170 },
+  { x: 975, y: 845 },
+  { x: 235, y: 790 },
+];
+const DEGRADED_CAMERA_QUAD: CameraQuad = [
+  { x: 210, y: 75 },
+  { x: 1090, y: 140 },
+  { x: 1050, y: 885 },
+  { x: 165, y: 820 },
+];
 
 function clampByte(value: number): number {
   return Math.max(0, Math.min(255, Math.round(value)));
@@ -89,7 +111,37 @@ function rgbaToI420(rgba: Uint8ClampedArray): Uint8Array {
   return out;
 }
 
-function cameraRgba(frame: ReturnType<typeof rasterizeColor4>): Uint8ClampedArray {
+function addDataGlare(rgba: Uint8ClampedArray): void {
+  // Small clipped highlight over data cells: FEC must correct or reject it;
+  // the E2E only passes when the recovered file remains byte-exact.
+  for (let y = 455; y < 478; y++) {
+    for (let x = 630; x < 642; x++) {
+      const destination = (y * WIDTH + x) * 4;
+      rgba[destination] = 0xff;
+      rgba[destination + 1] = 0xff;
+      rgba[destination + 2] = 0xff;
+    }
+  }
+}
+
+function addDegradedDataGlare(rgba: Uint8ClampedArray): void {
+  // Keep the combined fixture's highlight within one projected data module;
+  // the baseline above retains the larger multi-module glare case.
+  for (let y = 464; y < 468; y++) {
+    for (let x = 634; x < 638; x++) {
+      const destination = (y * WIDTH + x) * 4;
+      rgba[destination] = 0xff;
+      rgba[destination + 1] = 0xff;
+      rgba[destination + 2] = 0xff;
+    }
+  }
+}
+
+function cameraRgba(
+  frame: ReturnType<typeof rasterizeColor4>,
+  includeGlare = true,
+  quad: CameraQuad = BASELINE_CAMERA_QUAD,
+): Uint8ClampedArray {
   const rgba = new Uint8ClampedArray(WIDTH * HEIGHT * 4);
   for (let offset = 0; offset < rgba.length; offset += 4) {
     rgba[offset] = 0xf4;
@@ -99,12 +151,6 @@ function cameraRgba(frame: ReturnType<typeof rasterizeColor4>): Uint8ClampedArra
   }
   // A projective camera view, not a canonical fast-path fixture. The corner
   // displacement exercises contour detection, orientation and homography.
-  const quad = [
-    { x: 285, y: 110 },
-    { x: 1015, y: 170 },
-    { x: 975, y: 845 },
-    { x: 235, y: 790 },
-  ] as const;
   const [topLeft, topRight, bottomRight, bottomLeft] = quad;
   const dx1 = topRight.x - bottomRight.x;
   const dx2 = bottomLeft.x - bottomRight.x;
@@ -159,17 +205,90 @@ function cameraRgba(frame: ReturnType<typeof rasterizeColor4>): Uint8ClampedArra
       rgba[destination + 2] = frame.pixels[source + 2]!;
     }
   }
-  // Small clipped highlight over data cells: FEC must correct or reject it;
-  // this fixture only passes when the recovered file remains byte-exact.
-  for (let y = 455; y < 478; y++) {
-    for (let x = 630; x < 642; x++) {
-      const destination = (y * WIDTH + x) * 4;
-      rgba[destination] = 0xff;
-      rgba[destination + 1] = 0xff;
-      rgba[destination + 2] = 0xff;
+  if (includeGlare) addDataGlare(rgba);
+  return rgba;
+}
+
+/**
+ * Apply the deterministic degraded-camera scenario after projective rendering.
+ * The separable [1 2 1] kernel is OpenCV's 3x3 Gaussian blur, followed by the
+ * requested 0.9 exposure and integer noise in [-2, 2]. The YUV420 conversion
+ * remains the final step when the fake-camera frame is serialized.
+ */
+function degradedCameraRgba(
+  frame: ReturnType<typeof rasterizeColor4>,
+  sequence: number,
+): Uint8ClampedArray {
+  const source = cameraRgba(frame, false, DEGRADED_CAMERA_QUAD);
+  const horizontal = new Uint16Array(WIDTH * HEIGHT * 3);
+  for (let y = 0; y < HEIGHT; y++) {
+    for (let x = 0; x < WIDTH; x++) {
+      const left = (y * WIDTH + Math.max(0, x - 1)) * 4;
+      const center = (y * WIDTH + x) * 4;
+      const right = (y * WIDTH + Math.min(WIDTH - 1, x + 1)) * 4;
+      const destination = (y * WIDTH + x) * 3;
+      for (let channel = 0; channel < 3; channel++) {
+        horizontal[destination + channel] =
+          source[left + channel]! + 2 * source[center + channel]! + source[right + channel]!;
+      }
     }
   }
-  return rgba;
+
+  const degraded = new Uint8ClampedArray(source.length);
+  let noiseState = (0x9e3779b9 ^ sequence) >>> 0;
+  const noise = (): number => {
+    noiseState ^= noiseState << 13;
+    noiseState ^= noiseState >>> 17;
+    noiseState ^= noiseState << 5;
+    return (noiseState >>> 0) % 5 - 2;
+  };
+  for (let y = 0; y < HEIGHT; y++) {
+    const aboveY = Math.max(0, y - 1);
+    const belowY = Math.min(HEIGHT - 1, y + 1);
+    for (let x = 0; x < WIDTH; x++) {
+      const above = (aboveY * WIDTH + x) * 3;
+      const center = (y * WIDTH + x) * 3;
+      const below = (belowY * WIDTH + x) * 3;
+      const destination = (y * WIDTH + x) * 4;
+      for (let channel = 0; channel < 3; channel++) {
+        const blurred =
+          (horizontal[above + channel]! +
+            2 * horizontal[center + channel]! +
+            horizontal[below + channel]!) /
+          16;
+        degraded[destination + channel] = clampByte(blurred * 0.9 + noise());
+      }
+      degraded[destination + 3] = 0xff;
+    }
+  }
+  addDegradedDataGlare(degraded);
+  return degraded;
+}
+
+function y4mFixture(
+  frames: ReadonlyMap<number, Uint8Array>,
+  schedule: readonly number[],
+): Uint8Array {
+  const header = new TextEncoder().encode(
+    `YUV4MPEG2 W${WIDTH} H${HEIGHT} F5:1 Ip A1:1 C420jpeg\n`,
+  );
+  const frameHeader = new TextEncoder().encode("FRAME\n");
+  const frameBytes = WIDTH * HEIGHT * 3 / 2;
+  const fixture = new Uint8Array(
+    header.length + schedule.length * (frameHeader.length + frameBytes),
+  );
+  let offset = 0;
+  fixture.set(header, offset);
+  offset += header.length;
+  for (const sequence of schedule) {
+    const i420 = frames.get(sequence);
+    if (!i420) throw new Error(`Missing fake-camera raster for sequence ${sequence}.`);
+    fixture.set(frameHeader, offset);
+    offset += frameHeader.length;
+    fixture.set(i420, offset);
+    offset += i420.length;
+  }
+  return fixture;
 }
 
 export default async function globalSetup(): Promise<void> {
@@ -182,7 +301,8 @@ export default async function globalSetup(): Promise<void> {
   const fountain = new LTEncoder(packed.container, ROBUST_PROFILE.blockBytes, sessionId);
   if (fountain.k <= 1) throw new Error("The camera E2E fixture must span multiple LT blocks.");
 
-  const frameForSequence = new Map<number, Uint8Array>();
+  const baselineFrameForSequence = new Map<number, Uint8Array>();
+  const degradedFrameForSequence = new Map<number, Uint8Array>();
   const probe = new LTDecoder(
     fountain.k,
     ROBUST_PROFILE.blockBytes,
@@ -196,7 +316,7 @@ export default async function globalSetup(): Promise<void> {
       expandedSchedule.push(entry.sequence);
       probe.addFrame(entry.sequence, block);
     }
-    if (frameForSequence.has(entry.sequence)) continue;
+    if (baselineFrameForSequence.has(entry.sequence)) continue;
     const inner = packFrame(
       {
         sessionId,
@@ -218,7 +338,11 @@ export default async function globalSetup(): Promise<void> {
       sequence: entry.sequence,
       moduleScale: 4,
     });
-    frameForSequence.set(entry.sequence, rgbaToI420(cameraRgba(raster)));
+    baselineFrameForSequence.set(entry.sequence, rgbaToI420(cameraRgba(raster)));
+    degradedFrameForSequence.set(
+      entry.sequence,
+      rgbaToI420(degradedCameraRgba(raster, entry.sequence)),
+    );
   }
   if (!probe.isComplete || probe.framesNew < 2 || probe.framesDup < 1) {
     throw new Error("The camera E2E schedule must reconstruct with new and duplicate LT frames.");
@@ -228,24 +352,12 @@ export default async function globalSetup(): Promise<void> {
     throw new Error("The camera E2E schedule did not reconstruct its DCF2 container exactly.");
   }
 
-  const header = new TextEncoder().encode(
-    `YUV4MPEG2 W${WIDTH} H${HEIGHT} F5:1 Ip A1:1 C420jpeg\n`,
+  await writeFile(
+    COLOR4_CAMERA_FIXTURE,
+    y4mFixture(baselineFrameForSequence, expandedSchedule),
   );
-  const frameHeader = new TextEncoder().encode("FRAME\n");
-  const frameBytes = WIDTH * HEIGHT * 3 / 2;
-  const fixture = new Uint8Array(
-    header.length + expandedSchedule.length * (frameHeader.length + frameBytes),
+  await writeFile(
+    COLOR4_CAMERA_DEGRADED_FIXTURE,
+    y4mFixture(degradedFrameForSequence, expandedSchedule),
   );
-  let offset = 0;
-  fixture.set(header, offset);
-  offset += header.length;
-  for (const sequence of expandedSchedule) {
-    const i420 = frameForSequence.get(sequence);
-    if (!i420) throw new Error(`Missing fake-camera raster for sequence ${sequence}.`);
-    fixture.set(frameHeader, offset);
-    offset += frameHeader.length;
-    fixture.set(i420, offset);
-    offset += i420.length;
-  }
-  await writeFile(COLOR4_CAMERA_FIXTURE, fixture);
 }

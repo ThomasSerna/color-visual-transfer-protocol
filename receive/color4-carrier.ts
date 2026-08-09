@@ -6,6 +6,10 @@ import type {
   VisualDecoder,
 } from "../shared/color4";
 import type { BrowserCarrierDiagnostics } from "../shared/carrier";
+import {
+  DEFAULT_COLOR4_CANONICAL_SCALE,
+  DEFAULT_COLOR4_DETECTION_DIMENSION,
+} from "../shared/receiver-defaults";
 import type {
   Color4WorkerDebugFrame,
   Color4WorkerDebugOptions,
@@ -43,8 +47,8 @@ const defaultDebug: Color4WorkerDebugOptions = Object.freeze({
   enabled: false,
   view: "fiducials",
   generation: 0,
-  canonicalScale: 4,
-  maxDetectionDimension: 960,
+  canonicalScale: DEFAULT_COLOR4_CANONICAL_SCALE,
+  maxDetectionDimension: DEFAULT_COLOR4_DETECTION_DIMENSION,
   emitPlane: false,
   snapshot: false,
 });

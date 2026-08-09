@@ -7,6 +7,7 @@ import {
 import {
   ACTIVE_MODULES,
   BOOTSTRAP_COLUMNS,
+  COLOR4_MAX_FIDUCIAL_ERRORS,
   FIDUCIALS,
   FIDUCIAL_PAYLOADS,
   PHY_VERSION,
@@ -94,6 +95,58 @@ function paintActiveModule(
   }
 }
 
+function paintActiveModuleOutsideInset(
+  raster: Color4Raster,
+  activeX: number,
+  activeY: number,
+  inset: number,
+  rgb: readonly [number, number, number],
+): void {
+  const originX = (activeX + QUIET_MODULES) * raster.moduleScale;
+  const originY = (activeY + QUIET_MODULES) * raster.moduleScale;
+  for (let y = 0; y < raster.moduleScale; y++) {
+    for (let x = 0; x < raster.moduleScale; x++) {
+      if (
+        x >= inset &&
+        x < raster.moduleScale - inset &&
+        y >= inset &&
+        y < raster.moduleScale - inset
+      ) {
+        continue;
+      }
+      const offset = ((originY + y) * raster.width + originX + x) * 4;
+      raster.pixels[offset] = rgb[0];
+      raster.pixels[offset + 1] = rgb[1];
+      raster.pixels[offset + 2] = rgb[2];
+      raster.pixels[offset + 3] = 0xff;
+    }
+  }
+}
+
+const FIDUCIAL_FLIP_COORDINATES = Object.freeze([
+  [2, 2],
+  [3, 2],
+  [4, 2],
+  [5, 2],
+  [6, 2],
+] as const);
+
+function flipFiducialModules(
+  raster: Color4Raster,
+  marker: (typeof FIDUCIALS)[number],
+  count: number,
+): void {
+  for (const [x, y] of FIDUCIAL_FLIP_COORDINATES.slice(0, count)) {
+    const expected = fiducialModule(marker.id, x, y);
+    paintActiveModule(
+      raster,
+      marker.x + x,
+      marker.y + y,
+      expected === 1 ? [255, 255, 255] : [0, 0, 0],
+    );
+  }
+}
+
 interface RgbaImage {
   readonly width: number;
   readonly height: number;
@@ -158,6 +211,11 @@ test("COLOR_4 geometry pins the active square, quiet zone and both profile grids
   assert.equal(ACTIVE_MODULES, 160);
   assert.equal(QUIET_MODULES, 6);
   assert.equal(TOTAL_MODULES, 172);
+  assert.equal(COLOR4_MAX_FIDUCIAL_ERRORS, 4);
+  assert.equal(
+    DEFAULT_CLASSIFIER_THRESHOLDS.maximumFiducialErrors,
+    COLOR4_MAX_FIDUCIAL_ERRORS,
+  );
   assert.ok(Math.abs(QUIET_ZONE_FRACTION - 0.035) < 0.0002);
 
   const robust = createPhysicalLayout(ROBUST_PROFILE);
@@ -339,6 +397,92 @@ test("canonical KCMY raster decodes every coded byte with no erasures", () => {
   assert.deepEqual([...decoded.byteErasures], []);
   assert.equal(decoded.diagnostics.uncertainCells, 0);
   assert.equal(decoded.diagnostics.moduleScale, 3);
+});
+
+test("canonical sampling uses the inset center and per-channel medians at scales 4, 6 and 8", () => {
+  const coded = deterministicBytes(ROBUST_PROFILE.codedBytes);
+  const sampleCases = [
+    { scale: 4, inset: 1, span: 2 },
+    { scale: 6, inset: 1, span: 4 },
+    { scale: 8, inset: 2, span: 4 },
+  ] as const;
+
+  for (const { scale, inset, span } of sampleCases) {
+    const raster = rasterizeColor4(coded, {
+      profile: ROBUST_PROFILE,
+      paletteId: 0,
+      sequence: 0,
+      moduleScale: scale,
+    });
+    const { x, y } = raster.layout.data;
+
+    // The first data module is black. Corrupt every pixel outside the expected
+    // central sample without allowing module-edge interpolation to affect it.
+    paintActiveModuleOutsideInset(raster, x, y, inset, [255, 255, 255]);
+    assert.equal(scale - 2 * inset, span);
+    const decoded = decodeCanonicalColor4Raster(raster);
+    assert.equal(decoded.status, "valid", `scale ${scale}`);
+    if (decoded.status === "valid") {
+      assert.deepEqual(decoded.codedBytes, coded, `scale ${scale}`);
+      assert.deepEqual([...decoded.byteErasures], [], `scale ${scale}`);
+    }
+  }
+});
+
+test("fiducial error tolerance is applied independently to each marker", () => {
+  const coded = deterministicBytes(ROBUST_PROFILE.codedBytes);
+  for (const errorsPerMarker of [3, 4] as const) {
+    const raster = rasterizeColor4(coded, {
+      profile: ROBUST_PROFILE,
+      paletteId: 0,
+      sequence: 0,
+      moduleScale: 4,
+    });
+    for (const marker of FIDUCIALS) {
+      flipFiducialModules(raster, marker, errorsPerMarker);
+    }
+
+    const decoded = decodeCanonicalColor4Raster(raster);
+    assert.equal(decoded.status, "valid", `${errorsPerMarker} errors per marker`);
+    if (decoded.status !== "valid") continue;
+    assert.deepEqual(decoded.codedBytes, coded);
+    assert.deepEqual(decoded.diagnostics.fiducialErrorsById, {
+      TL: errorsPerMarker,
+      TR: errorsPerMarker,
+      BR: errorsPerMarker,
+      BL: errorsPerMarker,
+    });
+    assert.equal(decoded.diagnostics.fiducialErrors, errorsPerMarker * FIDUCIALS.length);
+    assert.equal(decoded.diagnostics.fiducialErrorMax, errorsPerMarker);
+  }
+});
+
+test("five errors in one fiducial reject even when an override requests a higher limit", () => {
+  const raster = rasterizeColor4(deterministicBytes(ROBUST_PROFILE.codedBytes), {
+    profile: ROBUST_PROFILE,
+    paletteId: 0,
+    sequence: 0,
+    moduleScale: 4,
+  });
+  flipFiducialModules(raster, FIDUCIALS[0]!, 5);
+
+  let observedMaximum: number | undefined;
+  const decoded = decodeCanonicalColor4Raster(raster, {
+    thresholds: { maximumFiducialErrors: 100 },
+    observer: (observation) => {
+      if (observation.stage === "canonicalGeometry") {
+        observedMaximum = observation.thresholds.maximumFiducialErrors;
+      }
+    },
+  });
+
+  assert.equal(decoded.status, "rejected");
+  if (decoded.status !== "rejected") return;
+  assert.equal(decoded.reason, "invalid_geometry");
+  assert.equal(observedMaximum, COLOR4_MAX_FIDUCIAL_ERRORS);
+  assert.deepEqual(decoded.diagnostics.fiducialErrorsById, { TL: 5, TR: 0, BR: 0, BL: 0 });
+  assert.equal(decoded.diagnostics.fiducialErrors, 5);
+  assert.equal(decoded.diagnostics.fiducialErrorMax, 5);
 });
 
 test("canonical experimental KRGB raster uses the same decoder path", () => {

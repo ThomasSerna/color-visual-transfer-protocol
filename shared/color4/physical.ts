@@ -95,6 +95,9 @@ export interface ModuleRect {
 
 export type FiducialId = "TL" | "TR" | "BR" | "BL";
 
+/** Maximum canonical Hamming mismatches accepted in any single fiducial. */
+export const COLOR4_MAX_FIDUCIAL_ERRORS = 4;
+
 export interface FiducialPlacement extends ModuleRect {
   readonly id: FiducialId;
   readonly payload: readonly string[];

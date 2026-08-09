@@ -4,9 +4,9 @@ The hard-won details baked into the code, so nobody has to rediscover them.
 
 ## Camera
 
-- **iOS lies about frame rate.** `frameRate: {ideal: 60}` silently delivers 30; demand `{exact: 60}` (works at 1280-wide) and fall back to `ideal`. Always read back `getSettings()`.
+- **iOS may lie about frame rate.** An ideal request can silently negotiate a different rate; demand the selected rate as `exact` first and fall back to `ideal`. Always read back `getSettings()`.
 - **iOS may refuse a live `applyConstraints`.** The receiver keeps the running stream and says so rather than tearing down a transfer.
-- **Capabilities are probed, not UA-sniffed** (`shared/platform.ts`). Android Chrome exposes `torch`, `focusMode`, `frameRate.max` via `getCapabilities()`; iOS exposes none of them. Continuous autofocus is applied when available; unreachable fps options are disabled. `torch` is reported but deliberately unused — the sender is an emissive screen, a flashlight only adds glare.
+- **Capabilities are probed, not UA-sniffed** (`shared/platform.ts`). Where exposed, `focusMode`, `exposureMode` and `whiteBalanceMode` are each set to `continuous` independently; an unsupported or refused mode is left unchanged. Unreachable fps options are disabled. `torch` is reported but deliberately unused — the sender is an emissive screen, a flashlight only adds glare.
 - **`requestVideoFrameCallback` chains outlive their stream** and resume on the next one; a generation counter prevents zombie capture loops.
 
 ## QR decoding

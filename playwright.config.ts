@@ -1,5 +1,14 @@
 import { defineConfig, devices } from "@playwright/test";
-import { COLOR4_CAMERA_FIXTURE } from "./e2e/global-setup";
+import {
+  COLOR4_CAMERA_DEGRADED_FIXTURE,
+  COLOR4_CAMERA_FIXTURE,
+} from "./e2e/global-setup";
+
+const fakeCameraArgs = (fixture: string): string[] => [
+  "--use-fake-device-for-media-stream",
+  "--use-fake-ui-for-media-stream",
+  `--use-file-for-fake-video-capture=${fixture}`,
+];
 
 export default defineConfig({
   testDir: "./e2e",
@@ -18,19 +27,31 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
+      testIgnore: /color4-degraded\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         permissions: ["camera"],
         launchOptions: {
-          args: [
-            "--use-fake-device-for-media-stream",
-            "--use-fake-ui-for-media-stream",
-            `--use-file-for-fake-video-capture=${COLOR4_CAMERA_FIXTURE}`,
-          ],
+          args: fakeCameraArgs(COLOR4_CAMERA_FIXTURE),
         },
       },
     },
-    { name: "webkit", use: { ...devices["Desktop Safari"] } },
+    {
+      name: "chromium-color4-degraded",
+      testMatch: /color4-degraded\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        permissions: ["camera"],
+        launchOptions: {
+          args: fakeCameraArgs(COLOR4_CAMERA_DEGRADED_FIXTURE),
+        },
+      },
+    },
+    {
+      name: "webkit",
+      testIgnore: /color4-degraded\.spec\.ts/,
+      use: { ...devices["Desktop Safari"] },
+    },
   ],
   webServer: {
     command: "npm run build:all && npm run preview -- --mode e2e --host 127.0.0.1 --port 4173",

@@ -1,5 +1,4 @@
 import {
-  TOTAL_MODULES,
   decodeCanonicalColor4Raster,
   unwrapColor4Frame,
   type CanonicalRasterObservation,
@@ -94,6 +93,7 @@ function stageTimings(
     timings.contours = observed.contoursMs;
     timings.fiducialDecode = observed.fiducialDecodeMs;
     timings.homography = observed.homographyMs;
+    timings.refinement = observed.refinementMs;
   }
   for (const observation of classifier) {
     timings[observation.stage] = (timings[observation.stage] ?? 0) + observation.durationMs;
@@ -132,9 +132,12 @@ function visionDiagnostics(
             resizeScale: geometry.config.detectionScale,
             adaptiveBlockSize: geometry.config.adaptiveBlockSize,
             adaptiveConstant: geometry.config.adaptiveConstant,
+            thresholdPasses: geometry.config.thresholdPasses,
             minimumAreaFraction: geometry.config.minimumAreaFraction,
             maximumAreaFraction: geometry.config.maximumAreaFraction,
             polygonEpsilonFraction: geometry.config.polygonEpsilonFraction,
+            maximumContoursPerPass: geometry.config.maximumContoursPerPass,
+            maximumQuadProposals: geometry.config.maximumQuadProposals,
             maximumFiducialErrors: geometry.config.maximumFiducialErrors,
             contours: geometry.counters.contoursTotal,
             areaTooSmall: geometry.counters.areaTooSmall,
@@ -142,6 +145,7 @@ function visionDiagnostics(
             nonQuads: geometry.counters.nonQuad,
             nonConvex: geometry.counters.nonConvex,
             quads: geometry.counters.quads,
+            mergedCandidates: geometry.counters.mergedCandidates,
             decodedMarkers: geometry.counters.decoded,
             uniqueFiducials: Object.keys(geometry.fiducials).length,
             duplicateIds: geometry.counters.duplicateIds,
@@ -155,12 +159,15 @@ function visionDiagnostics(
             BR: { found: fiducials?.BR !== undefined, errors: fiducials?.BR?.errors },
             BL: { found: fiducials?.BL !== undefined, errors: fiducials?.BL?.errors },
           },
+          homography: geometry.homography,
         }),
     ...(raster === undefined
       ? {}
       : {
           canonical: {
             fiducialErrors: raster.diagnostics.fiducialErrors,
+            fiducialErrorsById: raster.diagnostics.fiducialErrorsById,
+            fiducialErrorMax: raster.diagnostics.fiducialErrorMax,
             quietZoneErrors: raster.diagnostics.quietZoneErrors,
             timingErrors: raster.diagnostics.timingErrors,
             timingModules: raster.diagnostics.timingModules,
@@ -289,54 +296,40 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
   const observerDetail = request.debug.snapshot ||
     (request.debug.emitPlane && request.debug.view === "calibration");
   try {
-    // The fast path remains deterministic for canonical test fixtures. Debug
-    // requests still traverse vision so their planes and overlay are honest.
-    if (
-      !request.debug.enabled &&
-      !request.debug.snapshot &&
-      request.width === request.height &&
-      request.width % TOTAL_MODULES === 0
-    ) {
-      raster = decodeCanonicalColor4Raster(
-        { width: request.width, height: request.height, pixels },
-        {
-          observer: (observation) => classifierObservations.push(observation),
-          observerDetail,
-        },
+    // Camera input always traverses geometry. Inferring a canonical fixture
+    // from square dimensions could bypass homography on a legitimate square
+    // camera mode whose width happened to be a multiple of 172.
+    const cv = await loadOpenCv();
+    normalized = normalizeColor4WithOpenCv(cv, request.width, request.height, pixels, {
+      canonicalScale: request.debug.canonicalScale,
+      maxDetectionDimension: request.debug.maxDetectionDimension,
+      debug: request.debug.enabled,
+      snapshot: request.debug.snapshot,
+      ...(request.debug.emitPlane ? { debugView: request.debug.view } : {}),
+    });
+    if (normalized.status === "rejected") {
+      const diagnostics = baseDiagnostics(
+        request,
+        undefined,
+        normalized,
+        classifierObservations,
+        unwrapObservations,
+        started,
+        normalized.reason,
       );
-    } else {
-      const cv = await loadOpenCv();
-      normalized = normalizeColor4WithOpenCv(cv, request.width, request.height, pixels, {
-        canonicalScale: request.debug.canonicalScale,
-        maxDetectionDimension: request.debug.maxDetectionDimension,
-        debug: request.debug.enabled,
-        snapshot: request.debug.snapshot,
-        ...(request.debug.emitPlane ? { debugView: request.debug.view } : {}),
-      });
-      if (normalized.status === "rejected") {
-        const diagnostics = baseDiagnostics(
-          request,
-          undefined,
-          normalized,
-          classifierObservations,
-          unwrapObservations,
-          started,
-          normalized.reason,
-        );
-        updateReject(diagnostics, "geometry", normalized.reason);
-        postRejected(
-          request,
-          "invalid-inner-frame",
-          diagnostics,
-          debugFrame(request, normalized, undefined, classifierObservations, unwrapObservations),
-        );
-        return;
-      }
-      raster = decodeCanonicalColor4Raster(normalized.image, {
-        observer: (observation) => classifierObservations.push(observation),
-        observerDetail,
-      });
+      updateReject(diagnostics, "geometry", normalized.reason);
+      postRejected(
+        request,
+        "invalid-inner-frame",
+        diagnostics,
+        debugFrame(request, normalized, undefined, classifierObservations, unwrapObservations),
+      );
+      return;
     }
+    raster = decodeCanonicalColor4Raster(normalized.image, {
+      observer: (observation) => classifierObservations.push(observation),
+      observerDetail,
+    });
     if (raster.status === "rejected") {
       const diagnostics = baseDiagnostics(
         request,

@@ -13,9 +13,9 @@ verified inner container. Switching carrier or COLOR_4 palette cancels the
 current in-memory session and requires **Start camera** again.
 
 Fill most of the camera view with the frame and steady both devices. Continuous
-autofocus is requested where the camera supports it. The MVP physical-acceptance
-target for COLOR_4 is ROBUST/KCMY at 0.5–1 m and up to 15°; KRGB and
-EXPERIMENTAL are laboratory modes.
+focus, exposure and white balance are requested independently where the camera
+supports each mode. The MVP physical-acceptance target for COLOR_4 is
+ROBUST/KCMY at 0.5–1 m and up to 15°; KRGB and EXPERIMENTAL are laboratory modes.
 
 Progress counts collected fountain frames, not only solved blocks. Peeling can
 resolve many blocks late in the run, so only SHA-256-verified completion reaches
@@ -50,15 +50,18 @@ preferences. Use this export for paired QR/COLOR_4 benchmark runs.
 
 ## Receive settings
 
-Width and capture fps are applied live where the camera permits it. If a device
-refuses reconfiguration, the current stream continues and the UI reports that
-a restart is needed. The line below the controls reports the actually
-negotiated camera settings.
+Width and capture fps are applied live where the camera permits it. The fps
+picker follows the carrier default until you choose a rate manually; that
+manual choice then remains in force for the page session. If a device refuses
+reconfiguration, the current stream continues and the UI reports that a restart
+is needed. The line below the controls reports the actually negotiated camera
+settings.
 
 | Setting | Default | Notes |
 |---|---:|---|
 | capture width | 1280 | 1920 adds sampling cost; 960 can help weak CPUs |
-| capture fps | 60 | unsupported rates are disabled; some devices negotiate 30 |
+| QR capture fps | 60 | unsupported rates are disabled; some devices negotiate 30 |
+| COLOR_4 capture fps | 30 | lowers vision-worker pressure and camera motion artifacts |
 | QR decode workers | 2 | independent ZXing workers; busy workers discard captures |
 | COLOR_4 palette | KCMY | must match the sender; KRGB is Labs only |
 

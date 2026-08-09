@@ -13,6 +13,7 @@
 //   handles erasures, and a frame is either decoded whole or discarded.
 
 import { fitQrDisplaySize } from "../shared/display";
+import { TemporalFrameScheduler } from "../shared/frame-timing";
 import { formatBytes } from "../shared/format";
 import {
   MAX_SOURCE_BLOCKS,
@@ -725,6 +726,17 @@ async function startColorStream(input: ColorStreamInput): Promise<void> {
     );
   };
 
+  const scheduler = new TemporalFrameScheduler(txFps, profile.minHoldCycles);
+  const presentAvailableFrame = (now: number): boolean => {
+    const image = scheduler.take(now, () => queue.shift());
+    if (!image) return false;
+    staging.getContext("2d")!.putImageData(image, 0, 0);
+    const context = canvas.getContext("2d")!;
+    context.imageSmoothingEnabled = false;
+    context.drawImage(staging, 0, 0, canvas.width, canvas.height);
+    return true;
+  };
+
   let fountainSession;
   try {
     fountainSession = await fountain.ready;
@@ -741,8 +753,12 @@ async function startColorStream(input: ColorStreamInput): Promise<void> {
   void requestScreenWakeLock();
   sizeCanvas();
   resizeDisplay = sizeCanvas;
+  // The first encoded frame is already available: paint it synchronously so
+  // starting a stream never adds an arbitrary display-refresh delay.
+  presentAvailableFrame(performance.now());
   if (input.revealStage) scrollStageIntoView();
-  spec("spec-fps").textContent = `${txFps} fps · ≥${profile.minHoldCycles} display cycles`;
+  spec("spec-fps").textContent =
+    `${txFps} fps · ≥${Math.ceil(scheduler.effectiveHoldMs)} ms/frame`;
   spec("spec-frame").textContent = `${frameBytes} bytes`;
   spec("spec-carrier-kind").textContent = "carrier";
   spec("spec-qr").textContent =
@@ -779,26 +795,10 @@ async function startColorStream(input: ColorStreamInput): Promise<void> {
     }
   };
   void pump();
-  const interval = 1000 / txFps;
-  let nextAt = performance.now();
-  let displayCycles = profile.minHoldCycles;
   const tick = (now: number) => {
     if (input.gen !== generation || generatorFailed) return;
     requestAnimationFrame(tick);
-    displayCycles++;
-    if (now < nextAt || displayCycles < profile.minHoldCycles) return;
-    const image = queue.shift();
-    void pump(1);
-    if (!image) {
-      nextAt = now + interval;
-      return;
-    }
-    staging.getContext("2d")!.putImageData(image, 0, 0);
-    const context = canvas.getContext("2d")!;
-    context.imageSmoothingEnabled = false;
-    context.drawImage(staging, 0, 0, canvas.width, canvas.height);
-    displayCycles = 0;
-    nextAt = now + interval;
+    if (presentAvailableFrame(now)) void pump(1);
   };
   requestAnimationFrame(tick);
 }

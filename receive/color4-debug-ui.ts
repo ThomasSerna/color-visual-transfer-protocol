@@ -317,7 +317,7 @@ export class VisionDebugController {
     context.arc(center.x, center.y, 4, 0, Math.PI * 2);
     context.fill();
     const label = trace.best
-      ? `${trace.best.id} e=${trace.best.errors}`
+      ? `${trace.best.id} e=${trace.best.errors} ${trace.thresholdPass}`
       : trace.status.replaceAll("_", " ");
     context.font = "600 12px ui-monospace, monospace";
     context.fillStyle = "#0b0d10";
@@ -365,7 +365,8 @@ export class VisionDebugController {
     const plane = this.planeForView(frame);
     this.outputSummary.textContent =
       `${frame.artifacts.metadata.sourceWidth}×${frame.artifacts.metadata.sourceHeight} · ` +
-      `${frame.artifacts.traces.length} traced quads · scale ${frame.artifacts.metadata.canonicalScale}`;
+      `${frame.artifacts.traces.length} traced quads · scale ${frame.artifacts.metadata.canonicalScale} · ` +
+      `${frame.artifacts.metadata.homographyMethod}`;
     if (!plane) {
       const context = this.outputCanvas.getContext("2d")!;
       this.outputCanvas.width = 640;

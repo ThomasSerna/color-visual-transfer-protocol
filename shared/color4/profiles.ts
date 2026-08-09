@@ -13,6 +13,7 @@ export interface Color4Profile {
   readonly pduBytes: number;
   readonly innerFrameBytes: 1318 | 3326;
   readonly blockBytes: 1298 | 3306;
+  /** Legacy minimum at a 60 Hz baseline; the sender converts it to milliseconds. */
   readonly minHoldCycles: number;
 }
 
@@ -54,4 +55,3 @@ export const COLOR4_PROFILES: readonly Color4Profile[] = Object.freeze([
 export function getColor4Profile(id: number): Color4Profile | undefined {
   return COLOR4_PROFILES.find((profile) => profile.id === id);
 }
-

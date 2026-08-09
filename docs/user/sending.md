@@ -35,11 +35,14 @@ frame payload, compression and source-block count K.
 |---|---:|---|
 | display size | 900 px | capped by the screen; fullscreen uses the available integer scale |
 | QR tx fps | 60 | on a 60 Hz sender, try 24–30 if decoding stalls |
-| COLOR_4 ROBUST tx fps | 5 | holds every frame for at least six real display cycles |
-| COLOR_4 EXPERIMENTAL tx fps | 30 | Labs only; holds every frame for at least two cycles |
+| COLOR_4 ROBUST tx fps | 5 | effective hold is at least 200 ms per frame |
+| COLOR_4 EXPERIMENTAL tx fps | 30 | Labs only; effective hold is at least 33.3 ms per frame |
 
-The scheduler follows real display refreshes and does not emit catch-up bursts.
-Requested fps can therefore be higher than the rate physically shown.
+COLOR_4 converts each profile's legacy 60 Hz minimum into real time, then uses
+the larger of that duration and `1000 / tx fps`. The first ready frame appears
+immediately; later frames are never emitted as catch-up bursts, and the current
+frame stays visible while the generation queue is empty. Requested fps can
+therefore be higher than the rate physically shown.
 
 ## QR settings
 

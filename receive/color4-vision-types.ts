@@ -12,12 +12,17 @@ export type VisionDebugView =
 
 export type VisionCanonicalScale = 4 | 6 | 8;
 export type VisionDetectionLimit = 960 | 1280 | "source";
+export type VisionThresholdPass = "adaptive-31-7" | "adaptive-21-5" | "otsu";
+export type VisionWarpInterpolation = "nearest" | "linear" | "cubic";
+export type VisionHomographyMethod = "none" | "corners-16" | "centers-4";
 
 export interface VisionOptions {
-  /** Defaults to the normative sampling scale of four pixels per module. */
+  /** Defaults to the normative sampling scale of six pixels per module. */
   readonly canonicalScale?: VisionCanonicalScale;
-  /** Defaults to 960. `source` disables the detection downscale. */
+  /** Defaults to 1280. `source` disables the detection downscale. */
   readonly maxDetectionDimension?: VisionDetectionLimit;
+  /** Internal/benchmark override. Production defaults to cubic interpolation. */
+  readonly warpInterpolation?: VisionWarpInterpolation;
   /** Enables bounded geometric traces and the plane needed by `debugView`. */
   readonly debug?: boolean;
   /** Captures raw, threshold and (when available) warped planes. */
@@ -40,6 +45,14 @@ export interface VisionFiducialMatch {
   readonly rotation: 0 | 1 | 2 | 3;
 }
 
+export interface VisionCandidateScore {
+  readonly hammingErrors: number;
+  readonly passSupport: number;
+  /** Mean corner spread divided by the candidate's mean side length. */
+  readonly normalizedCornerSpread: number;
+  readonly area: number;
+}
+
 export type VisionCandidateStatus =
   | "DECODED"
   | "DUPLICATE_ID"
@@ -56,6 +69,9 @@ export interface VisionCandidateTrace {
   readonly center: VisionPoint;
   /** Coordinates in the threshold/detection plane. */
   readonly detectionQuad: VisionQuad;
+  readonly thresholdPass: VisionThresholdPass;
+  readonly thresholdPasses: readonly VisionThresholdPass[];
+  readonly candidateScore?: VisionCandidateScore;
   readonly best?: VisionFiducialMatch;
   readonly second?: VisionFiducialMatch;
   readonly status: VisionCandidateStatus;
@@ -68,6 +84,7 @@ export interface VisionStageTimings {
   readonly contoursMs: number;
   readonly fiducialDecodeMs: number;
   readonly homographyMs: number;
+  readonly refinementMs: number;
   readonly totalMs: number;
 }
 
@@ -78,6 +95,8 @@ export interface VisionContourCounters {
   readonly nonQuad: number;
   readonly nonConvex: number;
   readonly quads: number;
+  /** Geometric candidates remaining after cross-pass de-duplication. */
+  readonly mergedCandidates: number;
   readonly decoded: number;
   readonly duplicateIds: number;
   readonly ambiguous: number;
@@ -95,9 +114,13 @@ export interface VisionEffectiveConfig {
   readonly detectionScale: number;
   readonly adaptiveBlockSize: 31;
   readonly adaptiveConstant: 7;
+  readonly thresholdPasses: readonly VisionThresholdPass[];
+  readonly warpInterpolation: VisionWarpInterpolation;
   readonly minimumAreaFraction: 0.00008;
   readonly maximumAreaFraction: 0.08;
   readonly polygonEpsilonFraction: 0.045;
+  readonly maximumContoursPerPass: 50_000;
+  readonly maximumQuadProposals: 256;
   readonly maximumFiducialErrors: 4;
 }
 
@@ -107,6 +130,17 @@ export interface VisionDiagnostics {
   readonly counters: VisionContourCounters;
   /** IDs retained for homography after duplicate resolution. */
   readonly fiducials: Readonly<Partial<Record<FiducialId, VisionFiducialMatch>>>;
+  readonly homography: Readonly<{
+    method: VisionHomographyMethod;
+    residualRmsModules?: number;
+    residualMaxModules?: number;
+    refinementResidualBeforeRmsModules?: number;
+    refinementResidualBeforeMaxModules?: number;
+    refinementResidualAfterRmsModules?: number;
+    refinementResidualAfterMaxModules?: number;
+    refinementAttempted: boolean;
+    refinementApplied: boolean;
+  }>;
 }
 
 export type VisionPlaneId = "raw" | "grayscale" | "threshold" | "warped";
@@ -125,6 +159,8 @@ export interface VisionDebugMetadata {
   readonly detectionHeight: number;
   readonly detectionScale: number;
   readonly canonicalScale: VisionCanonicalScale;
+  readonly warpInterpolation: VisionWarpInterpolation;
+  readonly homographyMethod: VisionHomographyMethod;
   readonly warpedAvailable: boolean;
   readonly traceLimit: 64;
   readonly tracesTruncated: boolean;
@@ -138,6 +174,7 @@ export interface VisionDebugArtifacts {
 
 export type VisionRejectReason =
   | "NO_CONTOUR_CANDIDATES"
+  | "CANDIDATE_BUDGET_EXCEEDED"
   | "DUPLICATE_IDS"
   | "ONLY_1_FIDUCIAL"
   | "ONLY_2_FIDUCIALS"

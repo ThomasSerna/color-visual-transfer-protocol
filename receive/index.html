@@ -90,10 +90,10 @@
               <summary>Receive settings</summary>
               <div class="row">
                 <label>capture width
-                  <select id="cfg-width"><option>960</option><option selected>1280</option><option>1920</option></select>
+                  <select id="cfg-width">%CAPTURE_WIDTH_OPTIONS%</select>
                 </label>
                 <label>capture fps
-                  <select id="cfg-capfps"><option>30</option><option selected>60</option></select>
+                  <select id="cfg-capfps">%CAPTURE_FPS_OPTIONS%</select>
                 </label>
                 <label data-qr-setting>decode workers
                   <select id="cfg-workers"><option>1</option><option selected>2</option><option>3</option></select>
@@ -127,10 +127,10 @@
                   </select>
                 </label>
                 <label>canonical scale
-                  <select id="cfg-debug-scale"><option selected>4</option><option>6</option><option>8</option></select>
+                  <select id="cfg-debug-scale">%COLOR4_CANONICAL_SCALE_OPTIONS%</select>
                 </label>
                 <label>detection limit
-                  <select id="cfg-debug-detection"><option value="960" selected>960 px</option><option value="1280">1280 px</option><option value="source">source resolution</option></select>
+                  <select id="cfg-debug-detection">%COLOR4_DETECTION_DIMENSION_OPTIONS%</select>
                 </label>
               </div>
               <fieldset class="experiment-conditions">

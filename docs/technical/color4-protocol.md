@@ -155,7 +155,10 @@ top to bottom, black `1`, white `0`):
 
 Across all IDs and every 90-degree rotation, the minimum payload Hamming
 distance is 10. The ID and its placement jointly determine orientation; a
-receiver MUST NOT silently substitute or rotate these fixtures.
+receiver MUST NOT silently substitute or rotate these fixtures. A receiver
+MAY correct at most four payload mismatches in each individual fiducial. The
+limit is per marker, not a sum across the four markers; five or more mismatches
+in any one marker require rejection even if the other three are exact.
 
 ### Bootstrap and calibration
 
@@ -174,12 +177,22 @@ interpolation when presenting the canonical frame.
 
 ## Vision pipeline
 
-The reference receiver performs corner detection, orientation, homography,
-bootstrap validation, calibration, Lab conversion, central-50% cell median,
+The reference receiver performs three deterministic threshold passes, merges
+geometrically equivalent quads, decodes orientation, estimates a homography
+from all 16 oriented outer fiducial corners, and falls back to four fiducial
+centres only when the 16-point primitive is unavailable. It then performs
+the canonical warp with cubic interpolation, bootstrap validation,
+calibration, Lab conversion, inset cell medians,
 confidence classification, dewhitening, deinterleaving, RS correction and PDU
-validation in that order. Confidence thresholds derive from calibration-swatch
-MAD and are corpus-tuned, not wire constants. All temporary `cv.Mat` and
-`ImageBitmap` objects must be released.
+validation in that order. A single bounded refinement pass is permitted only
+for a measurable, moderate initial residual and is retained only when it
+materially reduces that residual. Confidence thresholds derive from
+calibration-swatch MAD and are corpus-tuned, not wire constants. All temporary
+`cv.Mat` and `ImageBitmap` objects must be released.
+
+The reference implementation fails closed when one threshold pass exceeds
+50,000 contours or the merged search would require more than 256 raw quad
+proposals. These are receiver resource budgets, not PHY wire constants.
 
 ## Security and resource limits
 

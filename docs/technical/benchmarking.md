@@ -27,9 +27,16 @@ aborted run remains in the report.
 
 Export the application metrics JSON plus device/browser/build identifiers and
 physical conditions. At minimum report captures, frames skipped while busy,
-candidates, rejection stage, uncertain cells/bytes, RS corrections, CRC
-failures, valid/new/duplicate LT frames, resolved blocks, decode latency,
-elapsed time and negotiated camera settings.
+raw and merged candidates, the configured threshold passes, rejection stage, uncertain
+cells/bytes, the per-attempt erasure-byte distribution (including p50/p95), RS
+corrections, CRC failures, fiducial errors by marker and maximum, homography
+method and residual, refinement attempts/applied, valid/new/duplicate LT
+frames, resolved blocks, decode latency, elapsed time and negotiated camera
+settings.
+
+The base homography-fit residual and the optional refinement residuals before
+and after correction are separate distributions; do not combine them into one
+percentile series.
 
 Report both:
 
@@ -54,6 +61,33 @@ or rejection, never an accepted corrupt LT frame.
 Run a sustained camera/worker soak and verify that heap use, WASM handles and
 object URLs do not grow without bound. The EXPERIMENTAL profile remains Labs
 until it independently passes the same gates.
+
+The reproducible local gates are:
+
+```text
+npm run test:color4
+npm run test:color4:corpus
+npm run test:e2e:color4
+```
+
+The required synthetic corpus must be byte-exact at 960, 1280 and 1920 input
+sizes; all four rotations; perspective through ±15°; a roughly 480 px frame;
+4:2:0 colour loss; mild blur, exposure, noise, radial distortion and glare;
+and their frozen combined degradation. Deliberately extreme inputs may either
+decode byte-exactly or reject, but may never produce accepted corrupt bytes.
+Blank, black, random and structurally invalid inputs must reject.
+
+## Frozen physical baseline
+
+Before claiming a physical fix, send a small deterministic file in fullscreen
+at maximum display brightness using COLOR_4 ROBUST, K/C/M/Y palette and 5 fps.
+Receive at 0.5 m, frontal (0°), under normal indoor light with 1280 capture and
+detection plus canonical scale 6. Run for 60 seconds three times. Preserve the
+metrics JSON for every run and compare the recovered SHA-256 with the source.
+All three runs must complete with the exact hash and zero accepted corrupt
+frames. Scale 8 is a documented fallback only if scale 6 produces no valid
+frames and scale 8 succeeds consistently in the same three-run protocol; it
+must not silently replace the default.
 
 ## Opt-in 64 MiB pipeline stress
 

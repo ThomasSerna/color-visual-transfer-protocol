@@ -1,12 +1,8 @@
 import { expect, test } from "@playwright/test";
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
-import {
-  COLOR4_CAMERA_PAYLOAD,
-  COLOR4_CAMERA_SCHEDULE,
-} from "./global-setup";
+import { expectColor4CameraReconstruction } from "./color4-camera-test";
 
 const retiredPrimaryBrand = ["Decimen", "COLOR_4"].join(" ");
 
@@ -183,11 +179,11 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
   const stages = [
     { value: "raw", title: "Raw camera", width: 1280 },
     { value: "grayscale", title: "Grayscale", width: 1280 },
-    { value: "threshold", title: "Threshold", width: 960 },
-    { value: "contours", title: "Contours / quads", width: 960 },
-    { value: "fiducials", title: "Detected fiducials", width: 960 },
-    { value: "warped", title: "Warped frame", width: 688 },
-    { value: "calibration", title: "Calibration swatches", width: 688 },
+    { value: "threshold", title: "Threshold", width: 1280 },
+    { value: "contours", title: "Contours / quads", width: 1280 },
+    { value: "fiducials", title: "Detected fiducials", width: 1280 },
+    { value: "warped", title: "Warped frame", width: 1032 },
+    { value: "calibration", title: "Calibration swatches", width: 1032 },
   ] as const;
   for (const stage of stages) {
     await page.locator("#cfg-debug-view").selectOption(stage.value);
@@ -197,7 +193,7 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
         width: canvas.width,
         // The view-change handler clears the existing bitmap without changing
         // its dimensions. Alpha therefore proves that a frame from the new
-        // debug generation rendered, even for adjacent 960 px stages.
+        // debug generation rendered, even for adjacent same-width stages.
         alpha: canvas.getContext("2d")?.getImageData(0, 0, 1, 1).data[3] ?? 0,
       })),
       { message: `${stage.title} must receive a plane from the current debug generation` },
@@ -258,8 +254,8 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
     schema: "cvtp-color4-vision-snapshot",
     version: 1,
     configuration: {
-      canonicalScale: 4,
-      maxDetectionDimension: 960,
+      canonicalScale: 6,
+      maxDetectionDimension: 1280,
       paletteId: 1,
       palette: "KRGB",
     },
@@ -297,70 +293,7 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
 test("the COLOR_4 camera worker reconstructs a complete file", async ({ page, browserName }) => {
   test.skip(browserName !== "chromium", "Chromium provides Playwright's deterministic fake camera.");
   test.setTimeout(120_000);
-  const errors: string[] = [];
-  page.on("pageerror", (error) => errors.push(error.message));
-  const openCvLoaded = page.waitForResponse(
-    (response) => /\/assets\/opencv-[^/]+\.js$/.test(response.url()) && response.status() === 200,
-  );
-  await page.goto("/receive/");
-  await page.locator("#carrier-color-option").click();
-  await page.locator("#start").click();
-  await openCvLoaded;
-
-  await expect(page.locator("#result .done")).toHaveText("Signal recovered", {
-    timeout: 90_000,
-  });
-  await expect(page.locator('#result a[download="camera-e2e.bin"]')).toHaveText(
-    "Save camera-e2e.bin",
-  );
-  await expect(page.locator("#result .hint")).toContainText("SHA-256 verified");
-  const recovered = await page.locator('#result a[download="camera-e2e.bin"]').evaluate(
-    async (anchor: HTMLAnchorElement) =>
-      Array.from(new Uint8Array(await (await fetch(anchor.href)).arrayBuffer())),
-  );
-  const recoveredBytes = Buffer.from(recovered);
-  expect(recoveredBytes).toEqual(Buffer.from(COLOR4_CAMERA_PAYLOAD));
-  expect(createHash("sha256").update(recoveredBytes).digest("hex")).toBe(
-    createHash("sha256").update(COLOR4_CAMERA_PAYLOAD).digest("hex"),
-  );
-  expect(COLOR4_CAMERA_SCHEDULE.filter((entry) => entry.sequence === 1)).toHaveLength(2);
-  await expect(page.locator("#m-carrier")).toContainText(/^\d+\/\d+$/);
-  await page.locator("#diagnostics > summary").click();
-  await expect(page.locator("#export-metrics")).toBeVisible();
-  const metricsDownload = page.waitForEvent("download");
-  await page.locator("#export-metrics").click();
-  const metricsArtifact = await metricsDownload;
-  expect(metricsArtifact.suggestedFilename()).toMatch(/^cvtp-experiments-.+\.json$/);
-  const metricsPath = await metricsArtifact.path();
-  expect(metricsPath).not.toBeNull();
-  const metrics = JSON.parse(await readFile(metricsPath!, "utf8")) as {
-    current?: unknown;
-    history: Array<{
-      carrier: string;
-      profile?: string;
-      success: boolean;
-      cameraWidth?: number;
-      cameraHeight?: number;
-      validFrames: number;
-      newFrames: number;
-      duplicateFrames: number;
-      resolvedBlocks: number;
-    }>;
-  };
-  expect(metrics.current).toBeUndefined();
-  expect(metrics.history).toHaveLength(1);
-  expect(metrics.history[0]).toMatchObject({
-    carrier: "COLOR_4",
-    profile: "ROBUST",
-    success: true,
-    cameraWidth: 1280,
-    cameraHeight: 960,
-  });
-  expect(metrics.history[0]!.validFrames).toBeGreaterThanOrEqual(2);
-  expect(metrics.history[0]!.newFrames).toBeGreaterThanOrEqual(2);
-  expect(metrics.history[0]!.duplicateFrames).toBeGreaterThan(0);
-  expect(metrics.history[0]!.resolvedBlocks).toBe(2);
-  expect(errors).toEqual([]);
+  await expectColor4CameraReconstruction(page);
 });
 
 test("the hosted PWA app shell is available offline", async ({ page, context, browserName }) => {

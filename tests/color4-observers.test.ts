@@ -94,6 +94,8 @@ test("canonical classifier observations separate stages without changing determi
   assert.equal(geometry?.stage, "canonicalGeometry");
   if (geometry?.stage === "canonicalGeometry") {
     assert.equal(geometry.diagnostics.fiducialErrors, 0);
+    assert.deepEqual(geometry.diagnostics.fiducialErrorsById, { TL: 0, TR: 0, BR: 0, BL: 0 });
+    assert.equal(geometry.diagnostics.fiducialErrorMax, 0);
     assert.equal(geometry.diagnostics.quietZoneErrors, 0);
     assert.ok(Math.abs((geometry.binaryAnchors?.contrast ?? 0) - 255) < 1e-9);
   }

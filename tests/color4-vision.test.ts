@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TOTAL_MODULES, fiducialModule, type FiducialId } from "../shared/color4/physical.ts";
+import {
+  FIDUCIALS,
+  QUIET_MODULES,
+  TOTAL_MODULES,
+  fiducialModule,
+  type FiducialId,
+} from "../shared/color4/physical.ts";
 import {
   analyzeFiducialModules,
   identifyFiducialModules,
   normalizeColor4WithOpenCv,
   projectiveQuadCenter,
+  refinementImprovesHomography,
   selectVisionRejectReason,
+  shouldRefineHomography,
   type OpenCvRuntime,
 } from "../receive/color4-vision.ts";
 import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
@@ -41,7 +49,24 @@ test("fiducial midpoint between two IDs is rejected as ambiguous", () => {
   assert.equal(analysis.best.errors, analysis.second.errors);
 });
 
-test("fiducial analysis exposes rotation and the second-best distinct ID", () => {
+test("fiducial midpoint between two orientations is rejected as ambiguous", () => {
+  const between = marker("TL");
+  const rotated = new Uint8Array(81);
+  for (let y = 0; y < 9; y++) {
+    for (let x = 0; x < 9; x++) rotated[y * 9 + x] = between[(8 - x) * 9 + y]!;
+  }
+  const differences = [...between.keys()].filter((index) => between[index] !== rotated[index]);
+  assert.equal(differences.length % 2, 0);
+  for (const index of differences.slice(0, differences.length / 2)) between[index] = rotated[index]!;
+
+  const analysis = analyzeFiducialModules(between);
+  assert.equal(analysis.status, "ambiguous");
+  assert.equal(analysis.best.id, analysis.second.id);
+  assert.notEqual(analysis.best.rotation, analysis.second.rotation);
+  assert.equal(analysis.best.errors, analysis.second.errors);
+});
+
+test("fiducial analysis exposes rotation and a distinct second hypothesis", () => {
   const source = marker("BR");
   const rotated = new Uint8Array(81);
   for (let y = 0; y < 9; y++) {
@@ -51,7 +76,10 @@ test("fiducial analysis exposes rotation and the second-best distinct ID", () =>
   assert.equal(analysis.status, "valid");
   assert.equal(analysis.best.id, "BR");
   assert.notEqual(analysis.best.rotation, 0);
-  assert.notEqual(analysis.second.id, analysis.best.id);
+  assert.notDeepEqual(
+    [analysis.second.id, analysis.second.rotation],
+    [analysis.best.id, analysis.best.rotation],
+  );
 });
 
 test("geometry rejection precedence is deterministic", () => {
@@ -91,13 +119,29 @@ test("fiducial center uses the perspective-invariant diagonal intersection", () 
   assert.ok(Math.hypot(center.x - arithmeticX, center.y - arithmeticY) > 2);
 });
 
+test("homography refinement is bounded to one recoverable residual", () => {
+  assert.equal(shouldRefineHomography(undefined), false);
+  assert.equal(shouldRefineHomography(0.25), false);
+  assert.equal(shouldRefineHomography(0.5), true);
+  assert.equal(shouldRefineHomography(1.25), true);
+  assert.equal(shouldRefineHomography(1.26), false);
+  assert.equal(refinementImprovesHomography(1, 0.5), true);
+  assert.equal(refinementImprovesHomography(1, 0.76), false);
+  assert.equal(refinementImprovesHomography(0.4, 0.3), true);
+  assert.equal(refinementImprovesHomography(0.4, 0.31), false);
+});
+
 interface FakeMatShape {
   rows: number;
   cols: number;
   data: Uint8Array;
   data32S: Int32Array;
+  data32F?: Float32Array;
   values?: number[];
+  projectedValues?: number[];
+  residualPixels?: number;
   markerId?: FiducialId;
+  passIndex?: number;
   delete(): void;
 }
 
@@ -120,7 +164,22 @@ function installImageDataForNode(): void {
   });
 }
 
-function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
+function fakeOpenCv(
+  failCanonicalWarp = false,
+  splitPasses = false,
+  excessiveContours = false,
+  refinement: "none" | "apply" | "reject" = "none",
+  invalidCenterHomography = false,
+): OpenCvRuntime & {
+  fakeStats: {
+    homographyCalls: number;
+    canonicalWarps: number;
+    findContoursCalls: number;
+    candidateWarps: number;
+    liveMats: number;
+    peakMats: number;
+  };
+} {
   const quads = [10, 30, 50, 70].map((left) => new Int32Array([
     left, 10,
     left + 9, 10,
@@ -128,26 +187,55 @@ function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
     left, 19,
   ]));
   const ids: FiducialId[] = ["TL", "TR", "BR", "BL"];
+  const refinementQuads = FIDUCIALS.map((marker) => {
+    const left = (QUIET_MODULES + marker.x) * 6 + 3;
+    const top = (QUIET_MODULES + marker.y) * 6;
+    const right = (QUIET_MODULES + marker.x + marker.width) * 6 - 1 + 3;
+    const bottom = (QUIET_MODULES + marker.y + marker.height) * 6 - 1;
+    return new Int32Array([left, top, right, top, right, bottom, left, bottom]);
+  });
+  const fakeStats = {
+    homographyCalls: 0,
+    canonicalWarps: 0,
+    findContoursCalls: 0,
+    candidateWarps: 0,
+    liveMats: 0,
+    peakMats: 0,
+  };
+  let refinementActive = false;
 
   class Mat implements FakeMatShape {
     rows = 0;
     cols = 0;
     data = new Uint8Array();
     data32S = new Int32Array();
+    data32F?: Float32Array;
     values?: number[];
+    projectedValues?: number[];
+    residualPixels?: number;
+    private deleted = false;
+    constructor() {
+      fakeStats.liveMats++;
+      fakeStats.peakMats = Math.max(fakeStats.peakMats, fakeStats.liveMats);
+    }
     markerId?: FiducialId;
-    delete(): void {}
+    delete(): void {
+      if (this.deleted) return;
+      this.deleted = true;
+      fakeStats.liveMats--;
+    }
   }
 
   class MatVector {
+    selected = quads.map((_, index) => index);
     size(): number {
-      return quads.length;
+      return excessiveContours ? 50_001 : this.selected.length;
     }
     get(index: number): Mat {
       const contour = new Mat();
       contour.rows = 4;
       contour.cols = 1;
-      contour.data32S = quads[index]!;
+      contour.data32S = (refinementActive ? refinementQuads : quads)[this.selected[index]!]!;
       return contour;
     }
     delete(): void {}
@@ -161,7 +249,8 @@ function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
     constructor(..._values: number[]) {}
   }
 
-  return {
+  let thresholdPass = 0;
+  const runtime: OpenCvRuntime = {
     Mat,
     MatVector,
     Size,
@@ -192,6 +281,8 @@ function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
       return mat;
     },
     cvtColor(source, destination) {
+      refinementActive = refinement !== "none" &&
+        source.rows === TOTAL_MODULES * 6 && source.cols === TOTAL_MODULES * 6;
       destination.rows = source.rows;
       destination.cols = source.cols;
       destination.data = new Uint8Array(source.rows * source.cols).fill(255);
@@ -206,13 +297,21 @@ function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
       destination.rows = source.rows;
       destination.cols = source.cols;
       destination.data = new Uint8Array(source.rows * source.cols);
+      (destination as FakeMatShape).passIndex = thresholdPass++;
     },
     threshold(source, destination) {
       destination.rows = source.rows;
       destination.cols = source.cols;
       destination.data = Uint8Array.from(source.data);
+      (destination as FakeMatShape).passIndex = thresholdPass++;
     },
-    findContours() {},
+    findContours(image, contours) {
+      fakeStats.findContoursCalls++;
+      if (!splitPasses) return;
+      const vector = contours as unknown as MatVector;
+      const pass = (image as FakeMatShape).passIndex;
+      vector.selected = pass === 0 ? [0, 1] : pass === 1 ? [2] : [3];
+    },
     contourArea() {
       return 100;
     },
@@ -229,14 +328,23 @@ function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
     },
     getPerspectiveTransform(source) {
       const transform = new Mat();
+      transform.rows = 3;
+      transform.cols = 3;
       const left = (source as FakeMatShape).values?.[0];
-      const markerIndex = left === undefined ? -1 : quads.findIndex((quad) => quad[0] === left);
+      const top = (source as FakeMatShape).values?.[1];
+      const markerIndex = left === undefined || top === undefined
+        ? -1
+        : (refinementActive ? refinementQuads : quads).findIndex(
+          (quad) => quad[0] === left && quad[1] === top,
+        );
       if (markerIndex >= 0) transform.markerId = ids[markerIndex];
+      else if (invalidCenterHomography) transform.data32F = new Float32Array(9).fill(Number.NaN);
       return transform;
     },
     warpPerspective(_source, destination, transform, size) {
       const dimensions = size as Size;
       if (dimensions.width !== 90) {
+        fakeStats.canonicalWarps++;
         if (failCanonicalWarp) throw new Error("synthetic homography failure");
         destination.rows = dimensions.height;
         destination.cols = dimensions.width;
@@ -244,6 +352,7 @@ function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
         return;
       }
       destination.rows = 90;
+      fakeStats.candidateWarps++;
       destination.cols = 90;
       destination.data = new Uint8Array(90 * 90).fill(255);
       const id = (transform as FakeMatShape).markerId!;
@@ -256,29 +365,163 @@ function fakeOpenCv(failCanonicalWarp = false): OpenCvRuntime {
         }
       }
     },
-  } as OpenCvRuntime;
+  };
+  const instrumented = runtime as OpenCvRuntime & {
+    fakeStats: {
+      homographyCalls: number;
+      canonicalWarps: number;
+      findContoursCalls: number;
+      candidateWarps: number;
+      liveMats: number;
+      peakMats: number;
+    };
+  };
+  instrumented.fakeStats = fakeStats;
+  if (refinement !== "none") {
+    runtime.findHomography = (_source, destination) => {
+      fakeStats.homographyCalls++;
+      const transform = new Mat();
+      transform.rows = 3;
+      transform.cols = 3;
+      transform.projectedValues = [...((destination as FakeMatShape).values ?? [])];
+      transform.residualPixels = fakeStats.homographyCalls === 1
+        ? 3
+        : refinement === "apply"
+          ? 0.6
+          : 2.4;
+      return transform;
+    };
+    runtime.perspectiveTransform = (_source, destination, transform) => {
+      const fakeTransform = transform as FakeMatShape;
+      const values = fakeTransform.projectedValues ?? [];
+      destination.rows = values.length / 2;
+      destination.cols = 1;
+      destination.data32F = Float32Array.from(
+        values,
+        (value, index) => value + (index % 2 === 0 ? fakeTransform.residualPixels ?? 0 : 0),
+      );
+    };
+  }
+  return instrumented;
 }
 
-test("vision defaults to 960 detection and canonical scale four", () => {
+test("vision defaults to 1280 detection and canonical scale six", () => {
   installImageDataForNode();
   let tick = 0;
   const result = normalizeColor4WithOpenCv(
     fakeOpenCv(),
-    1000,
-    500,
-    new Uint8ClampedArray(1000 * 500 * 4),
+    1600,
+    800,
+    new Uint8ClampedArray(1600 * 800 * 4),
     { now: () => ++tick },
   );
   assert.equal(result.status, "valid");
   assert.equal(result.candidates, 4);
-  assert.equal(result.diagnostics.config.maxDetectionDimension, 960);
-  assert.equal(result.diagnostics.config.detectionWidth, 960);
-  assert.equal(result.diagnostics.config.detectionHeight, 480);
-  assert.equal(result.diagnostics.config.canonicalScale, 4);
+  assert.equal(result.diagnostics.config.maxDetectionDimension, 1280);
+  assert.equal(result.diagnostics.config.detectionWidth, 1280);
+  assert.equal(result.diagnostics.config.detectionHeight, 640);
+  assert.equal(result.diagnostics.config.canonicalScale, 6);
+  assert.equal(result.diagnostics.config.warpInterpolation, "cubic");
+  assert.equal(result.diagnostics.config.maximumContoursPerPass, 50_000);
+  assert.equal(result.diagnostics.config.maximumQuadProposals, 256);
+  assert.equal(result.diagnostics.counters.quads, 12);
+  assert.equal(result.diagnostics.counters.mergedCandidates, 4);
+  assert.equal(result.diagnostics.homography.method, "centers-4");
   assert.equal(result.debug, undefined);
-  if (result.status === "valid") assert.equal(result.image.width, TOTAL_MODULES * 4);
+  if (result.status === "valid") assert.equal(result.image.width, TOTAL_MODULES * 6);
   for (const duration of Object.values(result.diagnostics.timings)) assert.ok(duration >= 0);
 });
+
+test("multi-pass detection can assemble four fiducials found by different thresholds", () => {
+  installImageDataForNode();
+  const result = normalizeColor4WithOpenCv(
+    fakeOpenCv(false, true),
+    100,
+    100,
+    new Uint8ClampedArray(100 * 100 * 4),
+    { maxDetectionDimension: "source" },
+  );
+  assert.equal(result.status, "valid");
+  assert.equal(result.candidates, 4);
+  assert.equal(result.diagnostics.counters.quads, 4);
+  assert.equal(result.diagnostics.counters.mergedCandidates, 4);
+  assert.equal(Object.keys(result.diagnostics.fiducials).length, 4);
+});
+
+test("vision rejects an adversarial contour flood before decoding candidates", () => {
+  installImageDataForNode();
+  const result = normalizeColor4WithOpenCv(
+    fakeOpenCv(false, false, true),
+    1280,
+    960,
+    new Uint8ClampedArray(1280 * 960 * 4),
+  );
+  assert.equal(result.status, "rejected");
+  if (result.status === "rejected") assert.equal(result.reason, "CANDIDATE_BUDGET_EXCEEDED");
+  assert.equal(result.candidates, 0);
+  assert.equal(result.diagnostics.counters.contoursTotal, 50_001);
+  assert.equal(result.diagnostics.counters.decoded, 0);
+});
+
+test("invalid fallback homographies reject and release every allocated Mat", () => {
+  installImageDataForNode();
+  const cv = fakeOpenCv(false, false, false, "none", true);
+  const result = normalizeColor4WithOpenCv(
+    cv,
+    100,
+    100,
+    new Uint8ClampedArray(100 * 100 * 4),
+  );
+  assert.equal(result.status, "rejected");
+  if (result.status === "rejected") assert.equal(result.reason, "HOMOGRAPHY_FAILED");
+  assert.equal(cv.fakeStats.liveMats, 0);
+});
+
+for (const [mode, applied, expectedWarps] of [
+  ["apply", true, 2],
+  ["reject", false, 1],
+] as const) {
+  test(
+    `bounded homography refinement ${mode === "apply" ? "applies" : "rejects"} ` +
+      "one measured correction",
+    () => {
+      installImageDataForNode();
+      const cv = fakeOpenCv(false, false, false, mode);
+      const result = normalizeColor4WithOpenCv(
+        cv,
+        100,
+        100,
+        new Uint8ClampedArray(100 * 100 * 4),
+      );
+      assert.equal(result.status, "valid");
+      assert.equal(result.diagnostics.homography.method, "corners-16");
+      assert.equal(result.diagnostics.homography.refinementAttempted, true);
+      assert.equal(
+        result.diagnostics.homography.refinementApplied,
+        applied,
+        JSON.stringify({ homography: result.diagnostics.homography, stats: cv.fakeStats }),
+      );
+      assert.ok(
+        Math.abs((result.diagnostics.homography.residualRmsModules ?? 0) - 0.5) < 1e-6,
+      );
+      assert.ok(
+        Math.abs(
+          (result.diagnostics.homography.refinementResidualBeforeRmsModules ?? 0) - 0.5,
+        ) < 1e-6,
+      );
+      assert.ok(
+        Math.abs(
+          (result.diagnostics.homography.refinementResidualAfterRmsModules ?? 0) -
+            (mode === "apply" ? 0.1 : 0.4),
+        ) < 1e-5,
+      );
+      assert.equal(cv.fakeStats.homographyCalls, 2);
+      assert.equal(cv.fakeStats.canonicalWarps, expectedWarps);
+      assert.equal(cv.fakeStats.liveMats, 0);
+      assert.ok(cv.fakeStats.peakMats > 0);
+    },
+  );
+}
 
 test("vision preserves candidates and bounded debug planes when homography fails", () => {
   installImageDataForNode();
@@ -298,10 +541,13 @@ test("vision preserves candidates and bounded debug planes when homography fails
   assert.equal(result.status, "rejected");
   if (result.status === "rejected") assert.equal(result.reason, "HOMOGRAPHY_FAILED");
   assert.equal(result.candidates, 4);
-  assert.equal(result.diagnostics.counters.quads, 4);
+  assert.equal(result.diagnostics.counters.quads, 12);
+  assert.equal(result.diagnostics.counters.mergedCandidates, 4);
   assert.equal(result.diagnostics.config.canonicalScale, 8);
   assert.equal(result.diagnostics.config.maxDetectionDimension, "source");
   assert.equal(result.debug?.traces.length, 4);
+  assert.ok(result.debug?.traces.every((trace) => trace.thresholdPasses.length === 3));
+  assert.ok(result.debug?.traces.every((trace) => trace.candidateScore?.passSupport === 3));
   assert.equal(result.debug?.planes.raw?.channels, 4);
   assert.equal(result.debug?.planes.threshold?.channels, 1);
   assert.equal(result.debug?.planes.warped, undefined);

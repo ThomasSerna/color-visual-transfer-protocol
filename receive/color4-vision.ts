@@ -1,11 +1,17 @@
 import {
+  COLOR4_MAX_FIDUCIAL_ERRORS,
   FIDUCIALS,
   QUIET_MODULES,
   TOTAL_MODULES,
   fiducialModule,
   type FiducialId,
 } from "../shared/color4/physical";
+import {
+  DEFAULT_COLOR4_CANONICAL_SCALE,
+  DEFAULT_COLOR4_DETECTION_DIMENSION,
+} from "../shared/receiver-defaults";
 import type {
+  VisionCandidateScore,
   VisionCandidateStatus,
   VisionCandidateTrace,
   VisionCanonicalScale,
@@ -16,6 +22,7 @@ import type {
   VisionDiagnostics,
   VisionEffectiveConfig,
   VisionFiducialMatch,
+  VisionHomographyMethod,
   VisionOptions,
   VisionPlane,
   VisionPlaneId,
@@ -24,10 +31,13 @@ import type {
   VisionRejectReason,
   VisionResult,
   VisionStageTimings,
+  VisionThresholdPass,
+  VisionWarpInterpolation,
 } from "./color4-vision-types";
 
 export type {
   VisionCandidateStatus,
+  VisionCandidateScore,
   VisionCandidateTrace,
   VisionCanonicalScale,
   VisionContourCounters,
@@ -38,6 +48,7 @@ export type {
   VisionDiagnostics,
   VisionEffectiveConfig,
   VisionFiducialMatch,
+  VisionHomographyMethod,
   VisionOptions,
   VisionPlane,
   VisionPlaneId,
@@ -46,6 +57,8 @@ export type {
   VisionRejectReason,
   VisionResult,
   VisionStageTimings,
+  VisionThresholdPass,
+  VisionWarpInterpolation,
 } from "./color4-vision-types";
 
 interface CvMat {
@@ -53,6 +66,8 @@ interface CvMat {
   cols: number;
   data: Uint8Array;
   data32S: Int32Array;
+  data32F?: Float32Array;
+  data64F?: Float64Array;
   delete(): void;
 }
 
@@ -71,6 +86,8 @@ export interface OpenCvRuntime {
   COLOR_RGBA2GRAY: number;
   INTER_AREA: number;
   INTER_LINEAR: number;
+  INTER_NEAREST?: number;
+  INTER_CUBIC?: number;
   ADAPTIVE_THRESH_GAUSSIAN_C: number;
   THRESH_BINARY_INV: number;
   THRESH_BINARY: number;
@@ -104,6 +121,13 @@ export interface OpenCvRuntime {
   approxPolyDP(curve: CvMat, output: CvMat, epsilon: number, closed: boolean): void;
   isContourConvex(contour: CvMat): boolean;
   getPerspectiveTransform(source: CvMat, destination: CvMat): CvMat;
+  findHomography?(
+    source: CvMat,
+    destination: CvMat,
+    method?: number,
+    ransacReprojectionThreshold?: number,
+  ): CvMat;
+  perspectiveTransform?(source: CvMat, destination: CvMat, transform: CvMat): void;
   warpPerspective(
     source: CvMat,
     destination: CvMat,
@@ -120,9 +144,24 @@ type Point = VisionPoint;
 interface MarkerCandidate {
   id: FiducialId;
   center: Point;
+  quad: VisionQuad;
+  detectionQuad: VisionQuad;
   errors: number;
   rotation: 0 | 1 | 2 | 3;
+  score: VisionCandidateScore;
   traceIndex?: number;
+}
+
+interface QuadProposal {
+  readonly contourIndex: number;
+  readonly area: number;
+  readonly detectionQuad: VisionQuad;
+  readonly thresholdPass: VisionThresholdPass;
+}
+
+interface MergedQuadProposal extends QuadProposal {
+  readonly thresholdPasses: readonly VisionThresholdPass[];
+  readonly normalizedCornerSpread: number;
 }
 
 interface MutableTimings {
@@ -132,6 +171,7 @@ interface MutableTimings {
   contoursMs: number;
   fiducialDecodeMs: number;
   homographyMs: number;
+  refinementMs: number;
   totalMs: number;
 }
 
@@ -142,6 +182,7 @@ interface MutableCounters {
   nonQuad: number;
   nonConvex: number;
   quads: number;
+  mergedCandidates: number;
   decoded: number;
   duplicateIds: number;
   ambiguous: number;
@@ -167,16 +208,57 @@ interface DetectionResult {
   thresholdPlane?: VisionPlane;
 }
 
+interface MutableHomographyDiagnostics {
+  method: VisionHomographyMethod;
+  residualRmsModules?: number;
+  residualMaxModules?: number;
+  refinementResidualBeforeRmsModules?: number;
+  refinementResidualBeforeMaxModules?: number;
+  refinementResidualAfterRmsModules?: number;
+  refinementResidualAfterMaxModules?: number;
+  refinementAttempted: boolean;
+  refinementApplied: boolean;
+}
+
 const MARKER_SAMPLE = 90;
-const DEFAULT_CANONICAL_SCALE: VisionCanonicalScale = 4;
-const DEFAULT_DETECTION_LIMIT: VisionDetectionLimit = 960;
 const TRACE_LIMIT = 64;
 const MINIMUM_AREA_FRACTION = 0.00008;
 const MAXIMUM_AREA_FRACTION = 0.08;
 const POLYGON_EPSILON_FRACTION = 0.045;
+const MAXIMUM_CONTOURS_PER_PASS = 50_000;
+const MAXIMUM_QUAD_PROPOSALS = 256;
 const ADAPTIVE_BLOCK_SIZE = 31;
 const ADAPTIVE_CONSTANT = 7;
-const MAXIMUM_FIDUCIAL_ERRORS = 4;
+const THRESHOLD_PASSES: readonly Readonly<{
+  id: VisionThresholdPass;
+  kind: "adaptive" | "otsu";
+  blockSize?: number;
+  constant?: number;
+}>[] = Object.freeze([
+  Object.freeze({ id: "adaptive-31-7", kind: "adaptive", blockSize: 31, constant: 7 }),
+  Object.freeze({ id: "adaptive-21-5", kind: "adaptive", blockSize: 21, constant: 5 }),
+  Object.freeze({ id: "otsu", kind: "otsu" }),
+]);
+const REFINEMENT_MINIMUM_RMS_MODULES = 0.25;
+const REFINEMENT_MAXIMUM_RMS_MODULES = 1.25;
+const REFINEMENT_ACCEPTED_RMS_MODULES = 0.5;
+
+export function shouldRefineHomography(residualRmsModules: number | undefined): boolean {
+  return residualRmsModules !== undefined &&
+    Number.isFinite(residualRmsModules) &&
+    residualRmsModules > REFINEMENT_MINIMUM_RMS_MODULES &&
+    residualRmsModules <= REFINEMENT_MAXIMUM_RMS_MODULES;
+}
+
+export function refinementImprovesHomography(
+  initialRmsModules: number,
+  correctedRmsModules: number | undefined,
+): boolean {
+  return correctedRmsModules !== undefined &&
+    Number.isFinite(correctedRmsModules) &&
+    correctedRmsModules <= REFINEMENT_ACCEPTED_RMS_MODULES &&
+    correctedRmsModules <= initialRmsModules * 0.75;
+}
 
 function deleteMat(value: CvMat | undefined): void {
   value?.delete();
@@ -242,24 +324,50 @@ export function projectiveQuadCenter(quad: readonly Point[]): Point {
   };
 }
 
-function sampleMarker(warped: CvMat): Uint8Array {
-  const modules = new Uint8Array(81);
+const MARKER_SAMPLE_OFFSETS = Object.freeze([
+  Object.freeze([0, 0] as const),
+  Object.freeze([-1, 0] as const),
+  Object.freeze([1, 0] as const),
+  Object.freeze([0, -1] as const),
+  Object.freeze([0, 1] as const),
+]);
+
+function medianNumber(values: readonly number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return (sorted.length & 1) === 1
+    ? sorted[middle]!
+    : (sorted[middle - 1]! + sorted[middle]!) / 2;
+}
+
+/** Sample one 9x9 marker using local black/white anchors, never a fixed threshold. */
+function sampleMarker(warped: CvMat, offsetX: number, offsetY: number): Uint8Array | null {
+  const luminances = new Array<number>(81);
+  const darkAnchors: number[] = [];
+  const lightAnchors: number[] = [];
   for (let moduleY = 0; moduleY < 9; moduleY++) {
     for (let moduleX = 0; moduleX < 9; moduleX++) {
-      let dark = 0;
-      let count = 0;
-      const startX = moduleX * 10 + 3;
-      const startY = moduleY * 10 + 3;
-      for (let y = startY; y < startY + 4; y++) {
-        for (let x = startX; x < startX + 4; x++) {
-          if (warped.data[y * warped.cols + x]! < 128) dark++;
-          count++;
-        }
+      const samples: number[] = [];
+      const startX = moduleX * 10 + 2 + offsetX;
+      const startY = moduleY * 10 + 2 + offsetY;
+      for (let y = startY; y < startY + 6; y++) {
+        for (let x = startX; x < startX + 6; x++) samples.push(warped.data[y * warped.cols + x]!);
       }
-      modules[moduleY * 9 + moduleX] = dark * 2 >= count ? 1 : 0;
+      const value = medianNumber(samples);
+      luminances[moduleY * 9 + moduleX] = value;
+      const isBorder = moduleX === 0 || moduleY === 0 || moduleX === 8 || moduleY === 8;
+      const isRing = !isBorder &&
+        (moduleX === 1 || moduleY === 1 || moduleX === 7 || moduleY === 7);
+      if (isBorder) darkAnchors.push(value);
+      else if (isRing) lightAnchors.push(value);
     }
   }
-  return modules;
+  const black = medianNumber(darkAnchors);
+  const white = medianNumber(lightAnchors);
+  if (!(white > black)) return null;
+  const threshold = (black + white) / 2;
+  return Uint8Array.from(luminances, (value) => value <= threshold ? 1 : 0);
 }
 
 function rotatedModule(modules: Uint8Array, x: number, y: number, rotation: number): number {
@@ -278,12 +386,14 @@ export function identifyFiducialModules(
     : null;
 }
 
-/** Returns the two best distinct marker IDs for bounded debug instrumentation. */
+/**
+ * Rank every frozen ID/orientation hypothesis. Orientation is part of the
+ * codeword: an equal-distance rotation is just as ambiguous as an equal ID.
+ */
 export function analyzeFiducialModules(modules: Uint8Array): FiducialAnalysis {
   if (modules.length !== 81) throw new RangeError("A fiducial sample must contain 81 modules.");
   const ranked: VisionFiducialMatch[] = [];
   for (const marker of FIDUCIALS) {
-    let bestForId: VisionFiducialMatch | undefined;
     for (let rotation = 0; rotation < 4; rotation++) {
       let errors = 0;
       for (let y = 0; y < 9; y++) {
@@ -293,22 +403,49 @@ export function analyzeFiducialModules(modules: Uint8Array): FiducialAnalysis {
           }
         }
       }
-      if (bestForId === undefined || errors < bestForId.errors) {
-        bestForId = {
-          id: marker.id,
-          errors,
-          rotation: rotation as 0 | 1 | 2 | 3,
-        };
-      }
+      ranked.push({
+        id: marker.id,
+        errors,
+        rotation: rotation as 0 | 1 | 2 | 3,
+      });
     }
-    ranked.push(bestForId!);
   }
-  ranked.sort((left, right) => left.errors - right.errors || left.id.localeCompare(right.id));
+  ranked.sort((left, right) => left.errors - right.errors ||
+    left.id.localeCompare(right.id) || left.rotation - right.rotation);
   const best = ranked[0]!;
   const second = ranked[1]!;
   // dmin=10 across the frozen marker family: floor((dmin-1)/2)=4.
   if (best.errors === second.errors) return { status: "ambiguous", best, second };
-  if (best.errors > MAXIMUM_FIDUCIAL_ERRORS) return { status: "too-many-errors", best, second };
+  if (best.errors > COLOR4_MAX_FIDUCIAL_ERRORS) return { status: "too-many-errors", best, second };
+  return { status: "valid", best, second };
+}
+
+function analyzeFiducialWarp(warped: CvMat): FiducialAnalysis | null {
+  const ranked = new Map<string, VisionFiducialMatch>();
+  for (const [offsetX, offsetY] of MARKER_SAMPLE_OFFSETS) {
+    const modules = sampleMarker(warped, offsetX, offsetY);
+    if (modules === null) continue;
+    const analysis = analyzeFiducialModules(modules);
+    // The pure analysis exposes the two globally closest ID/orientation
+    // hypotheses, which is sufficient to preserve any minimum or tie across
+    // the five bounded sampling offsets.
+    for (const match of [analysis.best, analysis.second]) {
+      const key = `${match.id}:${match.rotation}`;
+      const existing = ranked.get(key);
+      if (existing === undefined || match.errors < existing.errors) ranked.set(key, match);
+    }
+  }
+  const values = [...ranked.values()].sort(
+    (left, right) => left.errors - right.errors ||
+      left.id.localeCompare(right.id) || left.rotation - right.rotation,
+  );
+  const best = values[0];
+  const second = values[1];
+  if (best === undefined || second === undefined) return null;
+  if (best.errors === second.errors) return { status: "ambiguous", best, second };
+  if (best.errors > COLOR4_MAX_FIDUCIAL_ERRORS) {
+    return { status: "too-many-errors", best, second };
+  }
   return { status: "valid", best, second };
 }
 
@@ -321,7 +458,6 @@ function decodeCandidate(
   let destination: CvMat | undefined;
   let transform: CvMat | undefined;
   let warped: CvMat | undefined;
-  let binary: CvMat | undefined;
   try {
     source = cv.matFromArray(4, 1, cv.CV_32FC2, quad.flatMap((point) => [point.x, point.y]));
     destination = cv.matFromArray(4, 1, cv.CV_32FC2, [
@@ -341,13 +477,10 @@ function decodeCandidate(
       cv.BORDER_CONSTANT,
       new cv.Scalar(255),
     );
-    binary = new cv.Mat();
-    cv.threshold(warped, binary, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
-    return analyzeFiducialModules(sampleMarker(binary));
+    return analyzeFiducialWarp(warped);
   } catch {
     return null;
   } finally {
-    deleteMat(binary);
     deleteMat(warped);
     deleteMat(transform);
     deleteMat(destination);
@@ -437,6 +570,109 @@ function retainCandidateTrace(
   return replacement;
 }
 
+function pointDistance(left: Point, right: Point): number {
+  return Math.hypot(left.x - right.x, left.y - right.y);
+}
+
+function meanQuadSide(quad: VisionQuad): number {
+  return quad.reduce(
+    (total, point, index) => total + pointDistance(point, quad[(index + 1) % 4]!) / 4,
+    0,
+  );
+}
+
+function meanCornerDistance(left: VisionQuad, right: VisionQuad): number {
+  return left.reduce((total, point, index) => total + pointDistance(point, right[index]!) / 4, 0);
+}
+
+function medianQuad(proposals: readonly QuadProposal[]): VisionQuad {
+  return [0, 1, 2, 3].map((corner) => ({
+    x: medianNumber(proposals.map((proposal) => proposal.detectionQuad[corner]!.x)),
+    y: medianNumber(proposals.map((proposal) => proposal.detectionQuad[corner]!.y)),
+  })) as unknown as VisionQuad;
+}
+
+function sameQuadCluster(proposal: QuadProposal, cluster: readonly QuadProposal[]): boolean {
+  const representative = medianQuad(cluster);
+  const side = Math.min(meanQuadSide(proposal.detectionQuad), meanQuadSide(representative));
+  if (side <= 0) return false;
+  const centerDistance = pointDistance(
+    projectiveQuadCenter(proposal.detectionQuad),
+    projectiveQuadCenter(representative),
+  );
+  const representativeArea = medianNumber(cluster.map((value) => value.area));
+  const areaRatio = Math.max(proposal.area, representativeArea) /
+    Math.max(1, Math.min(proposal.area, representativeArea));
+  return centerDistance <= side * 0.15 &&
+    areaRatio <= 1.35 &&
+    meanCornerDistance(proposal.detectionQuad, representative) <= side * 0.12;
+}
+
+function mergeQuadProposals(proposals: readonly QuadProposal[]): MergedQuadProposal[] {
+  const clusters: QuadProposal[][] = [];
+  for (const proposal of proposals) {
+    const cluster = clusters.find((candidate) => sameQuadCluster(proposal, candidate));
+    if (cluster) cluster.push(proposal);
+    else clusters.push([proposal]);
+  }
+  return clusters.map((cluster) => {
+    const detectionQuad = medianQuad(cluster);
+    const side = Math.max(1, meanQuadSide(detectionQuad));
+    const ranked = [...cluster].sort((left, right) =>
+      meanCornerDistance(left.detectionQuad, detectionQuad) -
+        meanCornerDistance(right.detectionQuad, detectionQuad) ||
+      THRESHOLD_PASSES.findIndex((pass) => pass.id === left.thresholdPass) -
+        THRESHOLD_PASSES.findIndex((pass) => pass.id === right.thresholdPass) ||
+      left.contourIndex - right.contourIndex);
+    const primary = ranked[0]!;
+    const thresholdPasses = THRESHOLD_PASSES
+      .map(({ id }) => id)
+      .filter((id) => cluster.some((proposal) => proposal.thresholdPass === id));
+    const spread = cluster.reduce(
+      (total, proposal) => total + meanCornerDistance(proposal.detectionQuad, detectionQuad),
+      0,
+    ) / cluster.length / side;
+    return {
+      ...primary,
+      area: medianNumber(cluster.map((proposal) => proposal.area)),
+      detectionQuad,
+      thresholdPasses,
+      normalizedCornerSpread: spread,
+    };
+  });
+}
+
+function candidateIsBetter(incoming: VisionCandidateScore, existing: VisionCandidateScore): boolean {
+  return incoming.hammingErrors < existing.hammingErrors ||
+    (incoming.hammingErrors === existing.hammingErrors &&
+      (incoming.passSupport > existing.passSupport ||
+        (incoming.passSupport === existing.passSupport &&
+          (incoming.normalizedCornerSpread < existing.normalizedCornerSpread ||
+            (incoming.normalizedCornerSpread === existing.normalizedCornerSpread &&
+              incoming.area > existing.area)))));
+}
+
+function thresholdForPass(
+  cv: OpenCvRuntime,
+  source: CvMat,
+  destination: CvMat,
+  pass: (typeof THRESHOLD_PASSES)[number],
+): void {
+  if (pass.kind === "otsu") {
+    cv.threshold(source, destination, 0, 255, cv.THRESH_BINARY_INV | cv.THRESH_OTSU);
+    return;
+  }
+  cv.adaptiveThreshold(
+    source,
+    destination,
+    255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+    cv.THRESH_BINARY_INV,
+    pass.blockSize!,
+    pass.constant!,
+  );
+}
+
 function findMarkers(
   cv: OpenCvRuntime,
   gray: CvMat,
@@ -449,13 +685,13 @@ function findMarkers(
 ): DetectionResult {
   let detection = gray;
   let resized: CvMat | undefined;
-  let binary: CvMat | undefined;
-  let contours: CvMatVector | undefined;
-  let hierarchy: CvMat | undefined;
   const limit = maxDetectionDimension === "source" ? Number.POSITIVE_INFINITY : maxDetectionDimension;
   const scale = Math.min(1, limit / Math.max(gray.cols, gray.rows));
   const traces: VisionCandidateTrace[] = [];
   let tracesTruncated = false;
+  let thresholdPlane: VisionPlane | undefined;
+  const proposals: QuadProposal[] = [];
+  let candidateBudgetExceeded = false;
   try {
     if (scale < 1) {
       const started = now();
@@ -471,111 +707,163 @@ function findMarkers(
       detection = resized;
       timings.resizeMs += elapsed(now, started);
     }
-    let started = now();
-    binary = new cv.Mat();
-    cv.adaptiveThreshold(
-      detection,
-      binary,
-      255,
-      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-      cv.THRESH_BINARY_INV,
-      ADAPTIVE_BLOCK_SIZE,
-      ADAPTIVE_CONSTANT,
-    );
-    timings.thresholdMs += elapsed(now, started);
-    contours = new cv.MatVector();
-    hierarchy = new cv.Mat();
-    started = now();
-    cv.findContours(binary, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-    const contourStarted = started;
-    counters.contoursTotal = contours.size();
     const imageArea = detection.rows * detection.cols;
-    const markers = new Map<FiducialId, MarkerCandidate>();
-    for (let index = 0; index < contours.size(); index++) {
-      const contour = contours.get(index);
-      let approximation: CvMat | undefined;
+    let globalContourIndex = 0;
+    for (const pass of THRESHOLD_PASSES) {
+      let binary: CvMat | undefined;
+      let contours: CvMatVector | undefined;
+      let hierarchy: CvMat | undefined;
       try {
-        const area = Math.abs(cv.contourArea(contour));
-        if (area < imageArea * MINIMUM_AREA_FRACTION) {
-          counters.areaTooSmall++;
-          continue;
+        let started = now();
+        binary = new cv.Mat();
+        thresholdForPass(cv, detection, binary, pass);
+        timings.thresholdMs += elapsed(now, started);
+        if (captureThreshold && pass === THRESHOLD_PASSES[0]) {
+          thresholdPlane = planeFromMat(binary, 1);
         }
-        if (area > imageArea * MAXIMUM_AREA_FRACTION) {
-          counters.areaTooLarge++;
-          continue;
-        }
-        const perimeter = cv.arcLength(contour, true);
-        approximation = new cv.Mat();
-        cv.approxPolyDP(contour, approximation, perimeter * POLYGON_EPSILON_FRACTION, true);
-        if (approximation.rows !== 4) {
-          counters.nonQuad++;
-          continue;
-        }
-        if (!cv.isContourConvex(approximation)) {
-          counters.nonConvex++;
-          continue;
-        }
-        counters.quads++;
-        const detectionQuad = pointsFromContour(approximation);
-        const quad = sourceQuad(detectionQuad, scale);
-        const center = projectiveQuadCenter(quad);
-        const decodeStarted = now();
-        const identity = decodeCandidate(cv, detection, detectionQuad);
-        timings.fiducialDecodeMs += elapsed(now, decodeStarted);
-
-        let status: VisionCandidateStatus = "FIDUCIAL_DECODE_FAILED";
-        if (identity === null) {
-          counters.decodeFailures++;
-        } else if (identity.status === "ambiguous") {
-          counters.ambiguous++;
-          status = "FIDUCIAL_AMBIGUOUS";
-        } else if (identity.status === "too-many-errors") {
-          counters.tooManyErrors++;
-          status = "FIDUCIAL_TOO_MANY_ERRORS";
+        contours = new cv.MatVector();
+        hierarchy = new cv.Mat();
+        started = now();
+        cv.findContours(binary, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+        const contourCount = contours.size();
+        counters.contoursTotal += contourCount;
+        if (contourCount > MAXIMUM_CONTOURS_PER_PASS) {
+          candidateBudgetExceeded = true;
         } else {
-          counters.decoded++;
-          status = "DECODED";
-          const existing = markers.get(identity.best.id);
-          if (existing) {
-            counters.duplicateIds++;
-            status = "DUPLICATE_ID";
-            if (identity.best.errors < existing.errors) {
-              if (existing.traceIndex !== undefined && traces[existing.traceIndex]) {
-                traces[existing.traceIndex] = {
-                  ...traces[existing.traceIndex]!,
-                  status: "DUPLICATE_ID",
-                };
+          for (let index = 0; index < contourCount; index++, globalContourIndex++) {
+            const contour = contours.get(index);
+            let approximation: CvMat | undefined;
+            try {
+              const area = Math.abs(cv.contourArea(contour));
+              if (area < imageArea * MINIMUM_AREA_FRACTION) {
+                counters.areaTooSmall++;
+                continue;
               }
-              status = "DECODED";
+              if (area > imageArea * MAXIMUM_AREA_FRACTION) {
+                counters.areaTooLarge++;
+                continue;
+              }
+              const perimeter = cv.arcLength(contour, true);
+              approximation = new cv.Mat();
+              cv.approxPolyDP(contour, approximation, perimeter * POLYGON_EPSILON_FRACTION, true);
+              if (approximation.rows !== 4) {
+                counters.nonQuad++;
+                continue;
+              }
+              if (!cv.isContourConvex(approximation)) {
+                counters.nonConvex++;
+                continue;
+              }
+              counters.quads++;
+              proposals.push({
+                contourIndex: globalContourIndex,
+                area,
+                detectionQuad: pointsFromContour(approximation),
+                thresholdPass: pass.id,
+              });
+              if (proposals.length > MAXIMUM_QUAD_PROPOSALS) {
+                candidateBudgetExceeded = true;
+                break;
+              }
+            } finally {
+              deleteMat(approximation);
+              contour.delete();
             }
           }
         }
-        let traceIndex: number | undefined;
-        if (collectDebug) {
-          if (traces.length >= TRACE_LIMIT) tracesTruncated = true;
-          traceIndex = retainCandidateTrace(traces, {
-            contourIndex: index,
-            area,
-            quad,
-            center,
-            detectionQuad,
-            status,
-            ...(identity === null ? {} : { best: identity.best, second: identity.second }),
-          });
-        }
-        if (identity?.status === "valid" && status === "DECODED") {
-          markers.set(identity.best.id, {
-            ...identity.best,
-            center,
-            ...(traceIndex === undefined ? {} : { traceIndex }),
-          });
-        }
+        timings.contoursMs += elapsed(now, started);
       } finally {
-        deleteMat(approximation);
-        contour.delete();
+        hierarchy?.delete();
+        contours?.delete();
+        binary?.delete();
+      }
+      if (candidateBudgetExceeded) break;
+    }
+
+    if (candidateBudgetExceeded) {
+      return {
+        markers: new Map(),
+        candidates: Math.min(proposals.length, MAXIMUM_QUAD_PROPOSALS),
+        reason: "CANDIDATE_BUDGET_EXCEEDED",
+        detectionWidth: detection.cols,
+        detectionHeight: detection.rows,
+        detectionScale: scale,
+        traces,
+        tracesTruncated,
+        ...(thresholdPlane === undefined ? {} : { thresholdPlane }),
+      };
+    }
+
+    const merged = mergeQuadProposals(proposals);
+    counters.mergedCandidates = merged.length;
+    const markers = new Map<FiducialId, MarkerCandidate>();
+    for (const proposal of merged) {
+      const detectionQuad = proposal.detectionQuad;
+      const quad = sourceQuad(detectionQuad, scale);
+      const center = projectiveQuadCenter(quad);
+      const decodeStarted = now();
+      const identity = decodeCandidate(cv, detection, detectionQuad);
+      timings.fiducialDecodeMs += elapsed(now, decodeStarted);
+      const score: VisionCandidateScore | undefined = identity === null ? undefined : {
+        hammingErrors: identity.best.errors,
+        passSupport: proposal.thresholdPasses.length,
+        normalizedCornerSpread: proposal.normalizedCornerSpread,
+        area: proposal.area,
+      };
+
+      let status: VisionCandidateStatus = "FIDUCIAL_DECODE_FAILED";
+      let replaceExisting = false;
+      if (identity === null) {
+        counters.decodeFailures++;
+      } else if (identity.status === "ambiguous") {
+        counters.ambiguous++;
+        status = "FIDUCIAL_AMBIGUOUS";
+      } else if (identity.status === "too-many-errors") {
+        counters.tooManyErrors++;
+        status = "FIDUCIAL_TOO_MANY_ERRORS";
+      } else {
+        counters.decoded++;
+        status = "DECODED";
+        const existing = markers.get(identity.best.id);
+        if (existing) {
+          counters.duplicateIds++;
+          status = "DUPLICATE_ID";
+          replaceExisting = candidateIsBetter(score!, existing.score);
+          if (replaceExisting) {
+            if (existing.traceIndex !== undefined && traces[existing.traceIndex]) {
+              traces[existing.traceIndex] = { ...traces[existing.traceIndex]!, status: "DUPLICATE_ID" };
+            }
+            status = "DECODED";
+          }
+        }
+      }
+      let traceIndex: number | undefined;
+      if (collectDebug) {
+        if (traces.length >= TRACE_LIMIT) tracesTruncated = true;
+        traceIndex = retainCandidateTrace(traces, {
+          contourIndex: proposal.contourIndex,
+          area: proposal.area,
+          quad,
+          center,
+          detectionQuad,
+          thresholdPass: proposal.thresholdPass,
+          thresholdPasses: proposal.thresholdPasses,
+          ...(score === undefined ? {} : { candidateScore: score }),
+          status,
+          ...(identity === null ? {} : { best: identity.best, second: identity.second }),
+        });
+      }
+      if (identity?.status === "valid" && (status === "DECODED" || replaceExisting)) {
+        markers.set(identity.best.id, {
+          ...identity.best,
+          center,
+          quad,
+          detectionQuad,
+          score: score!,
+          ...(traceIndex === undefined ? {} : { traceIndex }),
+        });
       }
     }
-    timings.contoursMs += Math.max(0, elapsed(now, contourStarted) - timings.fiducialDecodeMs);
     const reason = selectVisionRejectReason({
       quads: counters.quads,
       uniqueIds: markers.size,
@@ -585,19 +873,16 @@ function findMarkers(
     });
     return {
       markers,
-      candidates: counters.quads,
+      candidates: merged.length,
       ...(reason === undefined ? {} : { reason }),
       detectionWidth: detection.cols,
       detectionHeight: detection.rows,
       detectionScale: scale,
       traces,
       tracesTruncated,
-      ...(captureThreshold ? { thresholdPlane: planeFromMat(binary, 1) } : {}),
+      ...(thresholdPlane === undefined ? {} : { thresholdPlane }),
     };
   } finally {
-    hierarchy?.delete();
-    contours?.delete();
-    binary?.delete();
     resized?.delete();
   }
 }
@@ -610,6 +895,7 @@ function emptyTimings(): MutableTimings {
     contoursMs: 0,
     fiducialDecodeMs: 0,
     homographyMs: 0,
+    refinementMs: 0,
     totalMs: 0,
   };
 }
@@ -622,6 +908,7 @@ function emptyCounters(): MutableCounters {
     nonQuad: 0,
     nonConvex: 0,
     quads: 0,
+    mergedCandidates: 0,
     decoded: 0,
     duplicateIds: 0,
     ambiguous: 0,
@@ -635,6 +922,7 @@ function effectiveConfig(
   height: number,
   canonicalScale: VisionCanonicalScale,
   maxDetectionDimension: VisionDetectionLimit,
+  warpInterpolation: VisionWarpInterpolation,
   found: DetectionResult,
 ): VisionEffectiveConfig {
   return {
@@ -647,10 +935,14 @@ function effectiveConfig(
     detectionScale: found.detectionScale,
     adaptiveBlockSize: ADAPTIVE_BLOCK_SIZE,
     adaptiveConstant: ADAPTIVE_CONSTANT,
+    thresholdPasses: THRESHOLD_PASSES.map(({ id }) => id),
+    warpInterpolation,
     minimumAreaFraction: MINIMUM_AREA_FRACTION,
     maximumAreaFraction: MAXIMUM_AREA_FRACTION,
     polygonEpsilonFraction: POLYGON_EPSILON_FRACTION,
-    maximumFiducialErrors: MAXIMUM_FIDUCIAL_ERRORS,
+    maximumContoursPerPass: MAXIMUM_CONTOURS_PER_PASS,
+    maximumQuadProposals: MAXIMUM_QUAD_PROPOSALS,
+    maximumFiducialErrors: COLOR4_MAX_FIDUCIAL_ERRORS,
   };
 }
 
@@ -659,6 +951,7 @@ function diagnosticsFor(
   timings: MutableTimings,
   counters: MutableCounters,
   markers: ReadonlyMap<FiducialId, MarkerCandidate>,
+  homography: MutableHomographyDiagnostics,
 ): VisionDiagnostics {
   const fiducials: Partial<Record<FiducialId, VisionFiducialMatch>> = {};
   for (const [id, marker] of markers) {
@@ -669,6 +962,7 @@ function diagnosticsFor(
     timings: { ...timings } satisfies VisionStageTimings,
     counters: { ...counters } satisfies VisionContourCounters,
     fiducials,
+    homography: { ...homography },
   };
 }
 
@@ -676,6 +970,7 @@ function debugArtifacts(
   enabled: boolean,
   config: VisionEffectiveConfig,
   found: DetectionResult,
+  homography: MutableHomographyDiagnostics,
   planes: Partial<Record<VisionPlaneId, VisionPlane>>,
   warpedAvailable: boolean,
 ): VisionDebugArtifacts | undefined {
@@ -688,6 +983,8 @@ function debugArtifacts(
       detectionHeight: config.detectionHeight,
       detectionScale: config.detectionScale,
       canonicalScale: config.canonicalScale,
+      warpInterpolation: config.warpInterpolation,
+      homographyMethod: homography.method,
       warpedAvailable,
       traceLimit: TRACE_LIMIT,
       tracesTruncated: found.tracesTruncated,
@@ -697,6 +994,206 @@ function debugArtifacts(
   };
 }
 
+const ORDERED_FIDUCIAL_IDS: readonly FiducialId[] = Object.freeze(["TL", "TR", "BR", "BL"]);
+
+interface HomographySolution {
+  readonly method: Exclude<VisionHomographyMethod, "none">;
+  readonly sourcePoints: CvMat;
+  readonly destinationPoints: CvMat;
+  readonly destinationValues: readonly number[];
+  readonly transform: CvMat;
+  readonly residual?: Readonly<{ rmsModules: number; maxModules: number }>;
+}
+
+function interpolationFlag(cv: OpenCvRuntime, interpolation: VisionWarpInterpolation): number {
+  if (interpolation === "nearest" && cv.INTER_NEAREST !== undefined) return cv.INTER_NEAREST;
+  if (interpolation === "cubic" && cv.INTER_CUBIC !== undefined) return cv.INTER_CUBIC;
+  return cv.INTER_LINEAR;
+}
+
+function orientedMarkerQuad(marker: MarkerCandidate): VisionQuad {
+  return [0, 1, 2, 3].map(
+    (corner) => marker.quad[(corner - marker.rotation + 4) % 4]!,
+  ) as unknown as VisionQuad;
+}
+
+function canonicalMarkerQuad(id: FiducialId, scale: VisionCanonicalScale): VisionQuad {
+  const marker = FIDUCIALS.find((candidate) => candidate.id === id)!;
+  const left = (QUIET_MODULES + marker.x) * scale;
+  const top = (QUIET_MODULES + marker.y) * scale;
+  const right = (QUIET_MODULES + marker.x + marker.width) * scale - 1;
+  const bottom = (QUIET_MODULES + marker.y + marker.height) * scale - 1;
+  return [
+    { x: left, y: top },
+    { x: right, y: top },
+    { x: right, y: bottom },
+    { x: left, y: bottom },
+  ];
+}
+
+function pointValues(points: readonly Point[]): number[] {
+  return points.flatMap((point) => [point.x, point.y]);
+}
+
+function correspondenceResidual(
+  markers: ReadonlyMap<FiducialId, MarkerCandidate>,
+  scale: VisionCanonicalScale,
+): Readonly<{ rmsModules: number; maxModules: number }> {
+  let squared = 0;
+  let maximum = 0;
+  let count = 0;
+  for (const id of ORDERED_FIDUCIAL_IDS) {
+    const observed = orientedMarkerQuad(markers.get(id)!);
+    const expected = canonicalMarkerQuad(id, scale);
+    for (let corner = 0; corner < 4; corner++) {
+      const distance = pointDistance(observed[corner]!, expected[corner]!) / scale;
+      squared += distance * distance;
+      maximum = Math.max(maximum, distance);
+      count++;
+    }
+  }
+  return { rmsModules: Math.sqrt(squared / count), maxModules: maximum };
+}
+
+function residualFor(
+  cv: OpenCvRuntime,
+  sourcePoints: CvMat,
+  destinationValues: readonly number[],
+  transform: CvMat,
+  scale: VisionCanonicalScale,
+): Readonly<{ rmsModules: number; maxModules: number }> | undefined {
+  if (cv.perspectiveTransform === undefined) return undefined;
+  const projected = new cv.Mat();
+  try {
+    cv.perspectiveTransform(sourcePoints, projected, transform);
+    const values = (projected.data32F?.length ?? 0) >= destinationValues.length
+      ? projected.data32F
+      : (projected.data64F?.length ?? 0) >= destinationValues.length
+        ? projected.data64F
+        : undefined;
+    if (values === undefined || values.length < destinationValues.length) return undefined;
+    let squared = 0;
+    let maximum = 0;
+    const points = destinationValues.length / 2;
+    for (let index = 0; index < points; index++) {
+      const dx = values[index * 2]! - destinationValues[index * 2]!;
+      const dy = values[index * 2 + 1]! - destinationValues[index * 2 + 1]!;
+      const distance = Math.hypot(dx, dy) / scale;
+      squared += distance * distance;
+      maximum = Math.max(maximum, distance);
+    }
+    return { rmsModules: Math.sqrt(squared / points), maxModules: maximum };
+  } finally {
+    projected.delete();
+  }
+}
+
+function homographyIsUsable(transform: CvMat): boolean {
+  if (transform.rows !== 3 || transform.cols !== 3) return false;
+  const coefficients = (transform.data64F?.length ?? 0) >= 9
+    ? transform.data64F
+    : (transform.data32F?.length ?? 0) >= 9
+      ? transform.data32F
+      : undefined;
+  // Some small test/runtime adapters do not expose the typed coefficient view.
+  // In that case OpenCV's 3x3 shape is the strongest available validation.
+  if (coefficients === undefined) return true;
+  const values = Array.from(coefficients.slice(0, 9));
+  if (values.some((value) => !Number.isFinite(value))) return false;
+  const magnitude = Math.max(...values.map(Math.abs));
+  if (!(magnitude > 0)) return false;
+  const [a, b, c, d, e, f, g, h, i] = values.map((value) => value / magnitude);
+  const determinant = a! * (e! * i! - f! * h!) -
+    b! * (d! * i! - f! * g!) +
+    c! * (d! * h! - e! * g!);
+  return Number.isFinite(determinant) && Math.abs(determinant) > 1e-12;
+}
+
+function residualIsUsable(
+  residual: Readonly<{ rmsModules: number; maxModules: number }> | undefined,
+): boolean {
+  return residual === undefined ||
+    (Number.isFinite(residual.rmsModules) && Number.isFinite(residual.maxModules));
+}
+
+function homographyFor(
+  cv: OpenCvRuntime,
+  markers: ReadonlyMap<FiducialId, MarkerCandidate>,
+  scale: VisionCanonicalScale,
+  allowCenterFallback: boolean,
+): HomographySolution {
+  if (cv.findHomography !== undefined) {
+    let sourcePoints: CvMat | undefined;
+    let destinationPoints: CvMat | undefined;
+    let transform: CvMat | undefined;
+    try {
+      const sourceValues = ORDERED_FIDUCIAL_IDS.flatMap((id) =>
+        pointValues(orientedMarkerQuad(markers.get(id)!)));
+      const destinationValues = ORDERED_FIDUCIAL_IDS.flatMap((id) =>
+        pointValues(canonicalMarkerQuad(id, scale)));
+      sourcePoints = cv.matFromArray(16, 1, cv.CV_32FC2, sourceValues);
+      destinationPoints = cv.matFromArray(16, 1, cv.CV_32FC2, destinationValues);
+      transform = cv.findHomography(sourcePoints, destinationPoints, 0);
+      if (!homographyIsUsable(transform)) throw new Error("Invalid 16-point homography.");
+      const residual = residualFor(cv, sourcePoints, destinationValues, transform, scale);
+      if (!residualIsUsable(residual)) throw new Error("Non-finite homography residual.");
+      return {
+        method: "corners-16",
+        sourcePoints,
+        destinationPoints,
+        destinationValues,
+        transform,
+        residual,
+      };
+    } catch (error) {
+      transform?.delete();
+      destinationPoints?.delete();
+      sourcePoints?.delete();
+      if (!allowCenterFallback) throw error;
+    }
+  }
+  if (!allowCenterFallback) throw new Error("16-point homography is unavailable.");
+  const sourceValues = ORDERED_FIDUCIAL_IDS.flatMap((id) => {
+    const center = markers.get(id)!.center;
+    return [center.x, center.y];
+  });
+  const destinationValues = ORDERED_FIDUCIAL_IDS.flatMap((id) => {
+    const quad = canonicalMarkerQuad(id, scale);
+    const center = projectiveQuadCenter(quad);
+    return [center.x, center.y];
+  });
+  let sourcePoints: CvMat | undefined;
+  let destinationPoints: CvMat | undefined;
+  let transform: CvMat | undefined;
+  try {
+    sourcePoints = cv.matFromArray(4, 1, cv.CV_32FC2, sourceValues);
+    destinationPoints = cv.matFromArray(4, 1, cv.CV_32FC2, destinationValues);
+    transform = cv.getPerspectiveTransform(sourcePoints, destinationPoints);
+    if (!homographyIsUsable(transform)) throw new Error("Invalid four-centre homography.");
+    const residual = residualFor(cv, sourcePoints, destinationValues, transform, scale);
+    if (!residualIsUsable(residual)) throw new Error("Non-finite homography residual.");
+    return {
+      method: "centers-4",
+      sourcePoints,
+      destinationPoints,
+      destinationValues,
+      transform,
+      residual,
+    };
+  } catch (error) {
+    transform?.delete();
+    destinationPoints?.delete();
+    sourcePoints?.delete();
+    throw error;
+  }
+}
+
+function deleteHomography(solution: HomographySolution | undefined): void {
+  solution?.transform.delete();
+  solution?.destinationPoints.delete();
+  solution?.sourcePoints.delete();
+}
+
 export function normalizeColor4WithOpenCv(
   cv: OpenCvRuntime,
   width: number,
@@ -704,19 +1201,25 @@ export function normalizeColor4WithOpenCv(
   pixels: Uint8ClampedArray,
   options: VisionOptions = {},
 ): VisionResult {
-  const canonicalScale = options.canonicalScale ?? DEFAULT_CANONICAL_SCALE;
-  const maxDetectionDimension = options.maxDetectionDimension ?? DEFAULT_DETECTION_LIMIT;
+  const canonicalScale: VisionCanonicalScale =
+    options.canonicalScale ?? DEFAULT_COLOR4_CANONICAL_SCALE;
+  const maxDetectionDimension: VisionDetectionLimit =
+    options.maxDetectionDimension ?? DEFAULT_COLOR4_DETECTION_DIMENSION;
+  const warpInterpolation: VisionWarpInterpolation = options.warpInterpolation ?? "cubic";
   const collectDebug = options.debug === true || options.snapshot === true;
   const now = options.now ?? (() => performance.now());
   const totalStarted = now();
   const timings = emptyTimings();
   const counters = emptyCounters();
+  const homography: MutableHomographyDiagnostics = {
+    method: "none",
+    refinementAttempted: false,
+    refinementApplied: false,
+  };
   const planes: Partial<Record<VisionPlaneId, VisionPlane>> = {};
   let source: CvMat | undefined;
   let gray: CvMat | undefined;
-  let sourcePoints: CvMat | undefined;
-  let destinationPoints: CvMat | undefined;
-  let transform: CvMat | undefined;
+  let solution: HomographySolution | undefined;
   let warped: CvMat | undefined;
   let homographyStarted: number | undefined;
   let activeStage: "grayscale" | "detection" | "homography" = "grayscale";
@@ -740,10 +1243,18 @@ export function normalizeColor4WithOpenCv(
       height,
       canonicalScale,
       maxDetectionDimension,
+      warpInterpolation,
       found,
     );
-    const diagnostics = diagnosticsFor(config, timings, counters, found.markers);
-    const debug = debugArtifacts(collectDebug, config, found, planes, warpedAvailable);
+    const diagnostics = diagnosticsFor(config, timings, counters, found.markers, homography);
+    const debug = debugArtifacts(
+      collectDebug,
+      config,
+      found,
+      homography,
+      planes,
+      warpedAvailable,
+    );
     return { diagnostics, ...(debug === undefined ? {} : { debug }) };
   };
   try {
@@ -771,8 +1282,7 @@ export function normalizeColor4WithOpenCv(
       now,
     );
     if (found.thresholdPlane) planes.threshold = found.thresholdPlane;
-    const orderedIds: FiducialId[] = ["TL", "TR", "BR", "BL"];
-    if (found.reason !== undefined || orderedIds.some((id) => !found.markers.has(id))) {
+    if (found.reason !== undefined || ORDERED_FIDUCIAL_IDS.some((id) => !found.markers.has(id))) {
       return {
         status: "rejected",
         reason: found.reason ?? "QUADS_FOUND_NO_MARKERS",
@@ -780,49 +1290,94 @@ export function normalizeColor4WithOpenCv(
         ...finish(false),
       };
     }
+
     activeStage = "homography";
     homographyStarted = now();
-    const sourceValues = orderedIds.flatMap((id) => {
-      const point = found.markers.get(id)!.center;
-      return [point.x, point.y];
-    });
-    const destinationValues = orderedIds.flatMap((id) => {
-      const marker = FIDUCIALS.find((candidate) => candidate.id === id)!;
-      return [
-        // OpenCV's point coordinates address pixel centres. The geometric
-        // midpoint of an even-sized raster spans two pixel centres, so it is
-        // half a pixel before the continuous module boundary coordinate.
-        // Keeping that convention here prevents a systematic half-pixel
-        // shift that otherwise mixes adjacent 4 px COLOR_4 cells.
-        (QUIET_MODULES + marker.x + marker.width / 2) * canonicalScale - 0.5,
-        (QUIET_MODULES + marker.y + marker.height / 2) * canonicalScale - 0.5,
-      ];
-    });
-    sourcePoints = cv.matFromArray(4, 1, cv.CV_32FC2, sourceValues);
-    destinationPoints = cv.matFromArray(4, 1, cv.CV_32FC2, destinationValues);
-    transform = cv.getPerspectiveTransform(sourcePoints, destinationPoints);
-    warped = new cv.Mat();
+    solution = homographyFor(cv, found.markers, canonicalScale, true);
+    homography.method = solution.method;
+    if (solution.residual !== undefined) {
+      homography.residualRmsModules = solution.residual.rmsModules;
+      homography.residualMaxModules = solution.residual.maxModules;
+    }
     const canonicalSize = TOTAL_MODULES * canonicalScale;
+    const interpolation = interpolationFlag(cv, warpInterpolation);
+    warped = new cv.Mat();
     cv.warpPerspective(
       source,
       warped,
-      transform,
+      solution.transform,
       new cv.Size(canonicalSize, canonicalSize),
-      cv.INTER_LINEAR,
+      interpolation,
       cv.BORDER_CONSTANT,
       new cv.Scalar(255, 255, 255, 255),
     );
     timings.homographyMs = elapsed(now, homographyStarted);
+
+    const initialResidual = solution.residual?.rmsModules;
+    if (solution.method === "corners-16" && shouldRefineHomography(initialResidual)) {
+      homography.refinementAttempted = true;
+      const refinementStarted = now();
+      let warpedGray: CvMat | undefined;
+      let correction: HomographySolution | undefined;
+      let refined: CvMat | undefined;
+      try {
+        warpedGray = new cv.Mat();
+        cv.cvtColor(warped, warpedGray, cv.COLOR_RGBA2GRAY);
+        const refinementFound = findMarkers(
+          cv,
+          warpedGray,
+          "source",
+          false,
+          false,
+          emptyTimings(),
+          emptyCounters(),
+          now,
+        );
+        if (ORDERED_FIDUCIAL_IDS.every((id) => refinementFound.markers.has(id))) {
+          const before = correspondenceResidual(refinementFound.markers, canonicalScale);
+          homography.refinementResidualBeforeRmsModules = before.rmsModules;
+          homography.refinementResidualBeforeMaxModules = before.maxModules;
+          if (shouldRefineHomography(before.rmsModules)) {
+            correction = homographyFor(cv, refinementFound.markers, canonicalScale, false);
+          }
+          const after = correction?.residual;
+          if (after !== undefined) {
+            homography.refinementResidualAfterRmsModules = after.rmsModules;
+            homography.refinementResidualAfterMaxModules = after.maxModules;
+          }
+          if (correction && refinementImprovesHomography(before.rmsModules, after?.rmsModules)) {
+            refined = new cv.Mat();
+            cv.warpPerspective(
+              warped,
+              refined,
+              correction.transform,
+              new cv.Size(canonicalSize, canonicalSize),
+              interpolation,
+              cv.BORDER_CONSTANT,
+              new cv.Scalar(255, 255, 255, 255),
+            );
+            warped.delete();
+            warped = refined;
+            refined = undefined;
+            homography.refinementApplied = true;
+          }
+        }
+      } catch {
+        // Refinement is opportunistic; the already valid first warp remains authoritative.
+      } finally {
+        refined?.delete();
+        deleteHomography(correction);
+        warpedGray?.delete();
+        timings.refinementMs = elapsed(now, refinementStarted);
+      }
+    }
+
     if (shouldCapturePlane(options, "warped")) planes.warped = planeFromMat(warped, 4);
     const canonicalPixels = Uint8ClampedArray.from(warped.data);
     return {
       status: "valid",
       candidates: found.candidates,
-      image: {
-        width: canonicalSize,
-        height: canonicalSize,
-        pixels: canonicalPixels,
-      },
+      image: { width: canonicalSize, height: canonicalSize, pixels: canonicalPixels },
       ...finish(true),
     };
   } catch {
@@ -839,9 +1394,6 @@ export function normalizeColor4WithOpenCv(
     const reason: VisionRejectReason = activeStage === "homography"
       ? "HOMOGRAPHY_FAILED"
       : detectionReason;
-    if (activeStage !== "homography" && counters.quads !== found.candidates) {
-      found = { ...found, candidates: counters.quads, reason: detectionReason };
-    }
     return {
       status: "rejected",
       reason,
@@ -850,9 +1402,7 @@ export function normalizeColor4WithOpenCv(
     };
   } finally {
     warped?.delete();
-    transform?.delete();
-    destinationPoints?.delete();
-    sourcePoints?.delete();
+    deleteHomography(solution);
     gray?.delete();
     source?.delete();
   }

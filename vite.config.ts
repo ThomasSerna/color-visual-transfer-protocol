@@ -13,6 +13,12 @@ import {
   FRAME_BYTES_OPTIONS,
   TX_FPS_OPTIONS,
 } from "./shared/send-settings";
+import {
+  DEFAULT_CAPTURE_WIDTH,
+  DEFAULT_COLOR4_CANONICAL_SCALE,
+  DEFAULT_COLOR4_DETECTION_DIMENSION,
+  DEFAULT_QR_CAPTURE_FPS,
+} from "./shared/receiver-defaults";
 import { htmlTokens } from "./build/html-tokens";
 import { inlineZxingWasm } from "./build/inline-zxing-wasm";
 import { useInlineVariants } from "./build/use-inline-variants";
@@ -70,6 +76,17 @@ const selectOptions = (values: readonly number[], selected: number) =>
     .map((v) => (v === selected ? `<option selected>${v}</option>` : `<option>${v}</option>`))
     .join("");
 
+const labeledSelectOptions = (
+  values: readonly (number | string)[],
+  selected: number | string,
+  label: (value: number | string) => string = String,
+) =>
+  values
+    .map((value) =>
+      `<option value="${value}"${value === selected ? " selected" : ""}>${label(value)}</option>`,
+    )
+    .join("");
+
 // One token set for every mode — the standalone pages carry these tokens too.
 const TOKENS = {
   MAX_FILE_LABEL,
@@ -78,6 +95,17 @@ const TOKENS = {
   OG_IMAGE: new URL("og.png", SITE_URL).href,
   TX_FPS_OPTIONS: selectOptions(TX_FPS_OPTIONS, DEFAULT_TX_FPS),
   FRAME_BYTES_OPTIONS: selectOptions(FRAME_BYTES_OPTIONS, DEFAULT_FRAME_BYTES),
+  CAPTURE_WIDTH_OPTIONS: labeledSelectOptions([960, 1280, 1920], DEFAULT_CAPTURE_WIDTH),
+  CAPTURE_FPS_OPTIONS: labeledSelectOptions([30, 60], DEFAULT_QR_CAPTURE_FPS),
+  COLOR4_CANONICAL_SCALE_OPTIONS: labeledSelectOptions(
+    [4, 6, 8],
+    DEFAULT_COLOR4_CANONICAL_SCALE,
+  ),
+  COLOR4_DETECTION_DIMENSION_OPTIONS: labeledSelectOptions(
+    [960, 1280, "source"],
+    DEFAULT_COLOR4_DETECTION_DIMENSION,
+    (value) => value === "source" ? "source resolution" : `${value} px`,
+  ),
   APP_VERSION: pkg.version,
   BUILD_ID: buildId(),
 };

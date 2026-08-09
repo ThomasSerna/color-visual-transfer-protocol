@@ -22,10 +22,14 @@ export const isAndroid: boolean = !!nav && /Android/.test(nav.userAgent);
 type ExtendedCapabilities = MediaTrackCapabilities & {
   torch?: boolean;
   focusMode?: string[];
+  exposureMode?: string[];
+  whiteBalanceMode?: string[];
 };
 type ExtendedConstraintSet = MediaTrackConstraintSet & {
   torch?: boolean;
   focusMode?: string;
+  exposureMode?: string;
+  whiteBalanceMode?: string;
 };
 
 export interface CameraCapabilities {
@@ -33,6 +37,8 @@ export interface CameraCapabilities {
    *  flashlight adds glare, never light the camera was missing. */
   torch: boolean;
   continuousFocus: boolean;
+  continuousExposure: boolean;
+  continuousWhiteBalance: boolean;
   /** Highest frame rate the current camera mode reports, when it reports one. */
   maxFrameRate?: number;
 }
@@ -43,6 +49,10 @@ export function probeCameraCapabilities(track: MediaStreamTrack): CameraCapabili
   return {
     torch: caps.torch === true,
     continuousFocus: Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous"),
+    continuousExposure:
+      Array.isArray(caps.exposureMode) && caps.exposureMode.includes("continuous"),
+    continuousWhiteBalance:
+      Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes("continuous"),
     maxFrameRate: caps.frameRate?.max,
   };
 }
@@ -59,4 +69,49 @@ export async function applyAdvancedConstraint(
   } catch {
     return false;
   }
+}
+
+export interface AppliedContinuousCameraModes {
+  readonly focus: boolean;
+  readonly exposure: boolean;
+  readonly whiteBalance: boolean;
+}
+
+/**
+ * Apply every reported continuous camera mode without making one optional
+ * capability a prerequisite for another. Successful constraints are carried
+ * into later attempts because applyConstraints replaces the active set.
+ */
+export async function applyContinuousCameraModes(
+  track: MediaStreamTrack,
+  capabilities: CameraCapabilities = probeCameraCapabilities(track),
+): Promise<AppliedContinuousCameraModes> {
+  let accepted: ExtendedConstraintSet = {};
+  let focus = false;
+  let exposure = false;
+  let whiteBalance = false;
+
+  if (capabilities.continuousFocus) {
+    const next = { ...accepted, focusMode: "continuous" } as const;
+    if (await applyAdvancedConstraint(track, next)) {
+      accepted = next;
+      focus = true;
+    }
+  }
+  if (capabilities.continuousExposure) {
+    const next = { ...accepted, exposureMode: "continuous" } as const;
+    if (await applyAdvancedConstraint(track, next)) {
+      accepted = next;
+      exposure = true;
+    }
+  }
+  if (capabilities.continuousWhiteBalance) {
+    const next = { ...accepted, whiteBalanceMode: "continuous" } as const;
+    if (await applyAdvancedConstraint(track, next)) {
+      accepted = next;
+      whiteBalance = true;
+    }
+  }
+
+  return { focus, exposure, whiteBalance };
 }

@@ -28,6 +28,7 @@ export type VisionTimingKey =
   | "contours"
   | "fiducialDecode"
   | "homography"
+  | "refinement"
   | "canonicalGeometry"
   | "bootstrapPhase"
   | "calibration"
@@ -47,9 +48,12 @@ export interface VisionDetectionDiagnostics {
   readonly resizeScale?: number;
   readonly adaptiveBlockSize?: number;
   readonly adaptiveConstant?: number;
+  readonly thresholdPasses?: readonly string[];
   readonly minimumAreaFraction?: number;
   readonly maximumAreaFraction?: number;
   readonly polygonEpsilonFraction?: number;
+  readonly maximumContoursPerPass?: number;
+  readonly maximumQuadProposals?: number;
   readonly maximumFiducialErrors?: number;
   readonly contours?: number;
   readonly areaTooSmall?: number;
@@ -57,6 +61,7 @@ export interface VisionDetectionDiagnostics {
   readonly nonQuads?: number;
   readonly nonConvex?: number;
   readonly quads?: number;
+  readonly mergedCandidates?: number;
   readonly decodedMarkers?: number;
   readonly uniqueFiducials?: number;
   readonly duplicateIds?: number;
@@ -83,8 +88,21 @@ export interface BrowserVisionDiagnostics {
   readonly timings?: Readonly<Partial<Record<VisionTimingKey, number>>>;
   readonly detection?: VisionDetectionDiagnostics;
   readonly fiducials?: Readonly<Partial<Record<"TL" | "TR" | "BR" | "BL", VisionFiducialNumericDiagnostic>>>;
+  readonly homography?: Readonly<{
+    method: "none" | "corners-16" | "centers-4";
+    residualRmsModules?: number;
+    residualMaxModules?: number;
+    refinementResidualBeforeRmsModules?: number;
+    refinementResidualBeforeMaxModules?: number;
+    refinementResidualAfterRmsModules?: number;
+    refinementResidualAfterMaxModules?: number;
+    refinementAttempted: boolean;
+    refinementApplied: boolean;
+  }>;
   readonly canonical?: Readonly<{
     fiducialErrors?: number;
+    fiducialErrorsById?: Readonly<Record<"TL" | "TR" | "BR" | "BL", number>>;
+    fiducialErrorMax?: number;
     quietZoneErrors?: number;
     timingErrors?: number;
     timingModules?: number;

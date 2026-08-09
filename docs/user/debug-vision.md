@@ -24,11 +24,15 @@ canvas; the camera video itself is not filtered or transformed. The selected
 stage canvas is updated at no more than two frames per second so diagnostics do
 not become the main decoding workload.
 
-The advanced controls select canonical scale 4, 6 or 8 and a detection limit of
-960, 1280 or the source resolution. They, along with the declared run
-conditions, are locked once reception starts. Stop and begin a fresh session to
-change them; mixing configurations inside one experiment would make the result
-ambiguous.
+Each bounded candidate trace records its primary threshold pass, support across
+all three passes and deterministic candidate score. These per-frame details
+stay in the opt-in debug snapshot rather than the persisted experiment history.
+
+The advanced controls select canonical scale 4, 6 or 8 (default 6) and a
+detection limit of 960, 1280 (default) or the source resolution. They, along
+with the declared run conditions, are locked once reception starts. Stop and
+begin a fresh session to change them; mixing configurations inside one
+experiment would make the result ambiguous.
 
 Live metrics identify the last completed stage and rejection reason, detected
 fiducials, and worker p50/p95 timing. The exported experiment JSON keeps bounded
@@ -70,8 +74,8 @@ is to locate the dominant failure, not to prove throughput.
 
 1. On the transmitter select **COLOR_4**, **ROBUST**, **KCMY**, **5 fps** and
    fullscreen. Use high/max display brightness.
-2. On the receiver select capture width **1280**, enable Debug Vision, choose
-   canonical scale **4** and detection limit **960**, then enter TX FPS 5,
+2. On the receiver select capture width **1280**, enable Debug Vision, keep
+   canonical scale **6** and detection limit **1280**, then enter TX FPS 5,
    distance 0.5 m, angle 0 degrees,
    brightness and a unique run label.
 3. Fix the phone in place about **0.5 m** from the display, nearly square-on

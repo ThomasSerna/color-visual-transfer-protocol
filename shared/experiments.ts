@@ -47,6 +47,8 @@ export interface VisionExperimentSummary {
     nonQuads: number;
     nonConvex: number;
     quads: number;
+    /** Absent in schema-v1 records written before multi-pass detection. */
+    mergedCandidates?: number;
     decodedMarkers: number;
     uniqueFiducials: number;
     duplicateIds: number;
@@ -54,6 +56,7 @@ export interface VisionExperimentSummary {
     tooManyErrorCandidates: number;
     decodeFailures: number;
   }>;
+  /** Canonical errors when available; detector Hamming errors otherwise. */
   readonly fiducials: Readonly<Record<"TL" | "TR" | "BR" | "BL", Readonly<{
     observations: number;
     found: number;
@@ -62,6 +65,16 @@ export interface VisionExperimentSummary {
     maximumErrors: number;
   }>>>;
   readonly timingsMs: Readonly<Partial<Record<VisionTimingKey, TimingDistribution>>>;
+  /** Absent in schema-v1 records written before homography instrumentation. */
+  readonly homography?: Readonly<{
+    methods: Readonly<Record<string, number>>;
+    refinementAttempts: number;
+    refinementsApplied: number;
+    residualRmsModules: TimingDistribution;
+    residualMaxModules: TimingDistribution;
+    refinementResidualBeforeRmsModules: TimingDistribution;
+    refinementResidualAfterRmsModules: TimingDistribution;
+  }>;
 }
 
 export interface ExperimentSummary {
@@ -94,6 +107,8 @@ export interface ExperimentSummary {
   resolvedBlocks: number;
   carrierRejected: number;
   erasureBytes: number;
+  /** Distribution of erasure bytes per carrier attempt; absent in legacy records. */
+  erasureBytesPerAttempt?: TimingDistribution;
   decodeLatencyMs: TimingDistribution;
   vision?: VisionExperimentSummary;
   containerBitrateBps?: number;
@@ -127,6 +142,7 @@ export class ExperimentMetrics {
   carrierRejected = 0;
   erasureBytes = 0;
   private readonly latencySamples: number[] = [];
+  private readonly erasureSamples: number[] = [];
   private visionSeen = false;
   private visionDebugEnabled = false;
   private visionConfiguration: VisionExperimentSummary["configuration"];
@@ -141,6 +157,7 @@ export class ExperimentMetrics {
     | "nonQuads"
     | "nonConvex"
     | "quads"
+    | "mergedCandidates"
     | "decodedMarkers"
     | "uniqueFiducials"
     | "duplicateIds"
@@ -155,6 +172,7 @@ export class ExperimentMetrics {
     nonQuads: 0,
     nonConvex: 0,
     quads: 0,
+    mergedCandidates: 0,
     decodedMarkers: 0,
     uniqueFiducials: 0,
     duplicateIds: 0,
@@ -168,6 +186,13 @@ export class ExperimentMetrics {
     BR: { observations: 0, found: 0, errorSamples: 0, totalErrors: 0, maximumErrors: 0 },
     BL: { observations: 0, found: 0, errorSamples: 0, totalErrors: 0, maximumErrors: 0 },
   };
+  private readonly homographyMethods = new Map<string, number>();
+  private homographyRefinementAttempts = 0;
+  private homographyRefinementsApplied = 0;
+  private readonly homographyResidualRms: number[] = [];
+  private readonly homographyResidualMax: number[] = [];
+  private readonly refinementResidualBeforeRms: number[] = [];
+  private readonly refinementResidualAfterRms: number[] = [];
 
   constructor(
     readonly direction: ExperimentDirection,
@@ -213,6 +238,7 @@ export class ExperimentMetrics {
     this.rsFailures += diagnostics?.rsFailures ?? 0;
     this.crcFailures += diagnostics?.crcFailures ?? 0;
     this.erasureBytes += diagnostics?.erasureBytes ?? 0;
+    this.pushBounded(this.erasureSamples, Math.max(0, diagnostics?.erasureBytes ?? 0));
     if (status === "valid") this.validFrames++;
     else {
       this.carrierRejected++;
@@ -248,8 +274,38 @@ export class ExperimentMetrics {
       this.increment(this.visionStageRejections, diagnostics.stage ?? "unknown");
     }
     this.addDetection(vision.detection);
+    if (vision.homography) {
+      this.increment(this.homographyMethods, vision.homography.method);
+      if (vision.homography.refinementAttempted) this.homographyRefinementAttempts++;
+      if (vision.homography.refinementApplied) this.homographyRefinementsApplied++;
+      if (vision.homography.residualRmsModules !== undefined &&
+          Number.isFinite(vision.homography.residualRmsModules)) {
+        this.pushBounded(this.homographyResidualRms, Math.max(0, vision.homography.residualRmsModules));
+      }
+      if (vision.homography.residualMaxModules !== undefined &&
+          Number.isFinite(vision.homography.residualMaxModules)) {
+        this.pushBounded(this.homographyResidualMax, Math.max(0, vision.homography.residualMaxModules));
+      }
+      if (vision.homography.refinementResidualBeforeRmsModules !== undefined &&
+          Number.isFinite(vision.homography.refinementResidualBeforeRmsModules)) {
+        this.pushBounded(
+          this.refinementResidualBeforeRms,
+          Math.max(0, vision.homography.refinementResidualBeforeRmsModules),
+        );
+      }
+      if (vision.homography.refinementResidualAfterRmsModules !== undefined &&
+          Number.isFinite(vision.homography.refinementResidualAfterRmsModules)) {
+        this.pushBounded(
+          this.refinementResidualAfterRms,
+          Math.max(0, vision.homography.refinementResidualAfterRmsModules),
+        );
+      }
+    }
+    const canonicalFiducialErrors = vision.canonical?.fiducialErrorsById;
     for (const id of ["TL", "TR", "BR", "BL"] as const) {
-      const observed = vision.fiducials?.[id];
+      const observed = canonicalFiducialErrors === undefined
+        ? vision.fiducials?.[id]
+        : { found: true, errors: canonicalFiducialErrors[id] };
       if (observed === undefined) continue;
       const aggregate = this.visionFiducials[id];
       aggregate.observations++;
@@ -339,6 +395,7 @@ export class ExperimentMetrics {
       resolvedBlocks: input.resolvedBlocks ?? 0,
       carrierRejected: this.carrierRejected,
       erasureBytes: this.erasureBytes,
+      erasureBytesPerAttempt: distribution(this.erasureSamples),
       decodeLatencyMs,
       vision: this.visionSnapshot(),
       containerBitrateBps:
@@ -379,6 +436,15 @@ export class ExperimentMetrics {
       detection: { ...this.visionDetection },
       fiducials,
       timingsMs,
+      homography: {
+        methods: Object.fromEntries(this.homographyMethods),
+        refinementAttempts: this.homographyRefinementAttempts,
+        refinementsApplied: this.homographyRefinementsApplied,
+        residualRmsModules: distribution(this.homographyResidualRms),
+        residualMaxModules: distribution(this.homographyResidualMax),
+        refinementResidualBeforeRmsModules: distribution(this.refinementResidualBeforeRms),
+        refinementResidualAfterRmsModules: distribution(this.refinementResidualAfterRms),
+      },
     };
   }
 }

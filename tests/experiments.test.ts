@@ -21,6 +21,7 @@ test("experiment summaries contain measurements but no payload identity", () => 
     stage: "crc",
     rejectReason: "crc",
     crcFailures: 1,
+    erasureBytes: 1,
     decodeMs: 11,
     vision: {
       debugEnabled: true,
@@ -31,11 +32,25 @@ test("experiment summaries contain measurements but no payload identity", () => 
       detection: {
         contours: 12,
         quads: 4,
+        mergedCandidates: 4,
         decodedMarkers: 4,
         uniqueFiducials: 4,
         decodeFailures: 2,
       },
       fiducials: { TL: { found: true, errors: 1 }, TR: { found: false } },
+      canonical: {
+        fiducialErrorsById: { TL: 2, TR: 1, BR: 0, BL: 1 },
+        fiducialErrorMax: 2,
+      },
+      homography: {
+        method: "corners-16",
+        residualRmsModules: 0.4,
+        residualMaxModules: 0.7,
+        refinementResidualBeforeRmsModules: 0.6,
+        refinementResidualAfterRmsModules: 0.3,
+        refinementAttempted: true,
+        refinementApplied: false,
+      },
     },
   });
   const summary = metrics.snapshot({
@@ -51,7 +66,15 @@ test("experiment summaries contain measurements but no payload identity", () => 
   assert.equal(summary.validFrames, 1);
   assert.equal(summary.carrierRejected, 1);
   assert.equal(summary.rsCorrectedSymbols, 3);
-  assert.equal(summary.erasureBytes, 5);
+  assert.equal(summary.erasureBytes, 6);
+  assert.deepEqual(summary.erasureBytesPerAttempt, {
+    count: 2,
+    average: 3,
+    min: 1,
+    max: 5,
+    p50: 1,
+    p95: 1,
+  });
   assert.equal(summary.crcFailures, 1);
   assert.equal(summary.decodeLatencyMs.p50, 9);
   assert.equal(summary.decodeLatencyMs.p95, 9);
@@ -59,10 +82,20 @@ test("experiment summaries contain measurements but no payload identity", () => 
   assert.deepEqual(summary.vision?.rejectReasons, { CRC_MISMATCH: 1 });
   assert.deepEqual(summary.vision?.stageRejections, { crc: 1 });
   assert.equal(summary.vision?.detection.contours, 12);
+  assert.equal(summary.vision?.detection.mergedCandidates, 4);
   assert.equal(summary.vision?.detection.decodeFailures, 2);
-  assert.equal(summary.vision?.fiducials.TL.averageErrors, 1);
+  assert.equal(summary.vision?.fiducials.TL.averageErrors, 2);
+  assert.equal(summary.vision?.fiducials.TL.maximumErrors, 2);
+  assert.equal(summary.vision?.fiducials.TR.found, 1);
   assert.equal(summary.vision?.timingsMs.rs?.p95, 3);
   assert.equal(summary.vision?.conditions?.distanceM, 0.5);
+  assert.deepEqual(summary.vision?.homography?.methods, { "corners-16": 1 });
+  assert.equal(summary.vision?.homography?.refinementAttempts, 1);
+  assert.equal(summary.vision?.homography?.refinementsApplied, 0);
+  assert.equal(summary.vision?.homography?.residualRmsModules.p50, 0.4);
+  assert.equal(summary.vision?.homography?.residualMaxModules.p95, 0.7);
+  assert.equal(summary.vision?.homography?.refinementResidualBeforeRmsModules.p50, 0.6);
+  assert.equal(summary.vision?.homography?.refinementResidualAfterRmsModules.p50, 0.3);
   assert.equal("fileName" in summary, false);
   assert.equal("hash" in summary, false);
 });
@@ -83,6 +116,7 @@ test("vision timing reservoirs stay bounded and legacy summaries remain optional
   assert.equal(vision.timingsMs.contours?.min, 44);
   assert.equal(vision.timingsMs.contours?.max, 299);
   assert.equal(vision.rejectReasons.ONLY_3_FIDUCIALS, 300);
+  assert.equal(metrics.snapshot({ success: false, now: 1 }).erasureBytesPerAttempt?.count, 256);
 
   const legacy = new ExperimentMetrics("receive", "QR_LEGACY", undefined, 0)
     .snapshot({ success: false, now: 1 });
