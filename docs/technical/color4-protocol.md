@@ -190,6 +190,23 @@ materially reduces that residual. Confidence thresholds derive from
 calibration-swatch MAD and are corpus-tuned, not wire constants. All temporary
 `cv.Mat` and `ImageBitmap` objects must be released.
 
+Canonical monochrome validation estimates black from the border and white from
+the ring of each fiducial independently. Every local pair must be finite,
+ordered and provide at least 40 luminance levels of contrast. Fiducials use
+their own pair; bootstrap, timing rails and phase pilots use a bilinear field
+that interpolates black and white separately between the four marker centres
+and clamps outside that domain. The binary deadband remains 0.35/0.65 and the
+four-error maximum remains per fiducial.
+
+Quiet-zone validation samples eight positions per side halfway through the
+six-module white band, rather than relying on the extrapolated outer corners.
+Each channel is normalized against the spatially interpolated RGB border/ring
+response and must reach the unchanged 0.65 white threshold; brightness alone
+cannot make a saturated colour count as white. At most two of the 32
+distributed samples may be non-white or uncertain. This is a receiver
+fail-closed policy: a missing, dark or coloured side still rejects while
+isolated contamination at an extreme canonical corner cannot decide a frame.
+
 The reference implementation fails closed when one threshold pass exceeds
 50,000 contours or the merged search would require more than 256 raw quad
 proposals. These are receiver resource budgets, not PHY wire constants.

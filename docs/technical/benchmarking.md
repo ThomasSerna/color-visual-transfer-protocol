@@ -54,9 +54,10 @@ For the frozen first receiver run, diagnostic ZIP contents and the subsequent
 ## Synthetic and soak gates
 
 Before physical claims, run the frozen corpus over all four rotations,
-perspective to ±15°, blur, noise, gamma, exposure, white balance, JPEG/4:2:0,
-partial glare and mixed-transition frames. Uncertainty must result in correction
-or rejection, never an accepted corrupt LT frame.
+perspective to ±15°, blur, noise, gamma, exposure, white balance, spatially
+varying luminance/black level, JPEG/4:2:0, partial glare and mixed-transition
+frames. Uncertainty must result in correction or rejection, never an accepted
+corrupt LT frame.
 
 Run a sustained camera/worker soak and verify that heap use, WASM handles and
 object URLs do not grow without bound. The EXPERIMENTAL profile remains Labs
@@ -72,10 +73,11 @@ npm run test:e2e:color4
 
 The required synthetic corpus must be byte-exact at 960, 1280 and 1920 input
 sizes; all four rotations; perspective through ±15°; a roughly 480 px frame;
-4:2:0 colour loss; mild blur, exposure, noise, radial distortion and glare;
-and their frozen combined degradation. Deliberately extreme inputs may either
-decode byte-exactly or reject, but may never produce accepted corrupt bytes.
-Blank, black, random and structurally invalid inputs must reject.
+4:2:0 colour loss; mild blur, exposure, noise, radial distortion and glare; a
+required corner-dependent luminance/black-level field; and frozen combined
+degradations that pair that field with blur and 4:2:0. Deliberately extreme
+inputs may either decode byte-exactly or reject, but may never produce accepted
+corrupt bytes. Blank, black, random and structurally invalid inputs must reject.
 
 ## Frozen physical baseline
 

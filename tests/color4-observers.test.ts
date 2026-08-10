@@ -98,6 +98,12 @@ test("canonical classifier observations separate stages without changing determi
     assert.equal(geometry.diagnostics.fiducialErrorMax, 0);
     assert.equal(geometry.diagnostics.quietZoneErrors, 0);
     assert.ok(Math.abs((geometry.binaryAnchors?.contrast ?? 0) - 255) < 1e-9);
+    assert.deepEqual(Object.keys(geometry.binaryAnchorsByFiducial ?? {}), ["TL", "TR", "BR", "BL"]);
+    for (const anchors of Object.values(geometry.binaryAnchorsByFiducial ?? {})) {
+      assert.equal(anchors.black, 0);
+      assert.ok(Math.abs(anchors.white - 255) < 1e-9);
+      assert.ok(Math.abs(anchors.contrast - 255) < 1e-9);
+    }
   }
   const bootstrap = observations[1];
   assert.equal(bootstrap?.stage, "bootstrapPhase");

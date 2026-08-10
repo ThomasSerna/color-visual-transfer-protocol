@@ -4,6 +4,16 @@ import {
   type Color4Profile,
 } from "./profiles";
 import {
+  createSpatialBinaryAnchorModel,
+  createSpatialRgbBinaryAnchorModel,
+  type BinaryAnchors,
+  type BinaryAnchorsByFiducial,
+  type RgbBinaryAnchors,
+  type RgbBinaryAnchorsByFiducial,
+  type SpatialBinaryAnchorModel,
+  type SpatialRgbBinaryAnchorModel,
+} from "./binary-anchors";
+import {
   ACTIVE_MODULES,
   BOOTSTRAP_COLUMNS,
   BOOTSTRAP_ROWS,
@@ -142,11 +152,18 @@ export interface CanonicalRasterObservationBase {
   readonly diagnostics: CanonicalRasterDiagnostics;
 }
 
+export interface BinaryAnchorObservation {
+  readonly black: number;
+  readonly white: number;
+  readonly contrast: number;
+}
+
 export interface CanonicalGeometryObservation extends CanonicalRasterObservationBase {
   readonly stage: "canonicalGeometry";
   readonly image: Readonly<{ width: number; height: number }>;
   readonly thresholds: ClassifierThresholds;
-  readonly binaryAnchors?: Readonly<{ black: number; white: number; contrast: number }>;
+  readonly binaryAnchors?: BinaryAnchorObservation;
+  readonly binaryAnchorsByFiducial?: Readonly<Record<FiducialId, BinaryAnchorObservation>>;
 }
 
 export interface BootstrapPhaseObservation extends CanonicalRasterObservationBase {
@@ -221,6 +238,10 @@ export type CanonicalRasterObservation =
 export type CanonicalRasterObserver = (observation: CanonicalRasterObservation) => void;
 
 export const MAX_CLASSIFIER_CELL_OBSERVATIONS = 128;
+const BINARY_BLACK_MAXIMUM = 0.35;
+const BINARY_WHITE_MINIMUM = 0.65;
+const QUIET_ZONE_SAMPLES_PER_EDGE = 8;
+const MAXIMUM_QUIET_ZONE_ERRORS = 2;
 
 interface MutableDiagnostics {
   moduleScale: number;
@@ -427,43 +448,78 @@ function createSampler(image: CanonicalRasterImage, scale: number): ModuleSample
   };
 }
 
-function collectBinaryAnchors(sampler: ModuleSampler): { black: number; white: number } {
+interface CollectedBinaryAnchors {
+  readonly pooled: BinaryAnchors;
+  readonly byFiducial: BinaryAnchorsByFiducial;
+  readonly rgbByFiducial: RgbBinaryAnchorsByFiducial;
+}
+
+function collectBinaryAnchors(sampler: ModuleSampler): CollectedBinaryAnchors {
   const dark: number[] = [];
   const light: number[] = [];
+  const byFiducial = {} as Record<FiducialId, BinaryAnchors>;
+  const rgbByFiducial = {} as Record<FiducialId, RgbBinaryAnchors>;
   for (const marker of FIDUCIALS) {
+    const localDark: number[] = [];
+    const localLight: number[] = [];
+    const localDarkRgb: FloatRgb[] = [];
+    const localLightRgb: FloatRgb[] = [];
     for (let y = 0; y < 9; y++) {
       for (let x = 0; x < 9; x++) {
         const isBorder = x === 0 || y === 0 || x === 8 || y === 8;
         const isRing = !isBorder && (x === 1 || y === 1 || x === 7 || y === 7);
         if (!isBorder && !isRing) continue;
-        const value = luminance(sampler.sampleActive(marker.x + x, marker.y + y));
-        (isBorder ? dark : light).push(value);
+        const rgb = sampler.sampleActive(marker.x + x, marker.y + y);
+        const value = luminance(rgb);
+        if (isBorder) {
+          dark.push(value);
+          localDark.push(value);
+          localDarkRgb.push(rgb);
+        } else {
+          light.push(value);
+          localLight.push(value);
+          localLightRgb.push(rgb);
+        }
       }
     }
+    byFiducial[marker.id] = Object.freeze({
+      black: median(localDark),
+      white: median(localLight),
+    });
+    rgbByFiducial[marker.id] = Object.freeze({
+      black: Object.freeze(medianRgb(localDarkRgb)),
+      white: Object.freeze(medianRgb(localLightRgb)),
+    });
   }
-  return { black: median(dark), white: median(light) };
+  return Object.freeze({
+    pooled: Object.freeze({ black: median(dark), white: median(light) }),
+    byFiducial: Object.freeze(byFiducial),
+    rgbByFiducial: Object.freeze(rgbByFiducial),
+  });
 }
 
-function binaryModule(rgb: FloatRgb, anchors: { black: number; white: number }): 0 | 1 | -1 {
+function binaryModule(rgb: FloatRgb, anchors: BinaryAnchors): 0 | 1 | -1 {
   const range = anchors.white - anchors.black;
-  if (range <= 0) return -1;
+  if (!Number.isFinite(range) || range <= 0) return -1;
   const normalized = (luminance(rgb) - anchors.black) / range;
-  if (normalized <= 0.35) return 1;
-  if (normalized >= 0.65) return 0;
+  if (normalized <= BINARY_BLACK_MAXIMUM) return 1;
+  if (normalized >= BINARY_WHITE_MINIMUM) return 0;
   return -1;
 }
 
 function sampleBinaryRect(
   sampler: ModuleSampler,
   rect: ModuleRect,
-  anchors: { black: number; white: number },
+  anchors: SpatialBinaryAnchorModel,
 ): Int8Array {
   const out = new Int8Array(rect.width * rect.height);
   for (let y = 0; y < rect.height; y++) {
     for (let x = 0; x < rect.width; x++) {
+      const activeX = rect.x + x;
+      const activeY = rect.y + y;
       out[y * rect.width + x] = binaryModule(
-        sampler.sampleActive(rect.x + x, rect.y + y),
-        anchors,
+        sampler.sampleActive(activeX, activeY),
+        anchors.atActive(activeX, activeY),
       );
     }
   }
@@ -478,14 +534,18 @@ interface FiducialErrorSummary {
 
 function countFiducialErrors(
   sampler: ModuleSampler,
-  anchors: { black: number; white: number },
+  anchors: SpatialBinaryAnchorModel,
 ): FiducialErrorSummary {
   const byId: Record<FiducialId, number> = { TL: 0, TR: 0, BR: 0, BL: 0 };
   for (const marker of FIDUCIALS) {
     let errors = 0;
+    const markerAnchors = anchors.byFiducial[marker.id];
     for (let y = 0; y < 9; y++) {
       for (let x = 0; x < 9; x++) {
-        const sampled = binaryModule(sampler.sampleActive(marker.x + x, marker.y + y), anchors);
+        const sampled = binaryModule(
+          sampler.sampleActive(marker.x + x, marker.y + y),
+          markerAnchors,
+        );
         if (sampled !== fiducialModule(marker.id, x, y)) errors++;
       }
     }
@@ -501,35 +561,46 @@ function countFiducialErrors(
 
 function countQuietZoneErrors(
   sampler: ModuleSampler,
-  anchors: { black: number; white: number },
+  anchors: SpatialBinaryAnchorModel,
+  rgbAnchors: SpatialRgbBinaryAnchorModel,
 ): number {
-  const points = [
-    [0, 0],
-    [TOTAL_MODULES - 1, 0],
-    [TOTAL_MODULES - 1, TOTAL_MODULES - 1],
-    [0, TOTAL_MODULES - 1],
-    [Math.floor(TOTAL_MODULES / 2), 0],
-    [TOTAL_MODULES - 1, Math.floor(TOTAL_MODULES / 2)],
-    [Math.floor(TOTAL_MODULES / 2), TOTAL_MODULES - 1],
-    [0, Math.floor(TOTAL_MODULES / 2)],
-  ] as const;
-  return points.reduce(
-    (total, point) =>
-      total + (binaryModule(sampler.sampleLogical(point[0], point[1]), anchors) === 0 ? 0 : 1),
-    0,
-  );
+  const depth = Math.floor(QUIET_MODULES / 2);
+  const far = TOTAL_MODULES - 1 - depth;
+  let errors = 0;
+  const check = (x: number, y: number): void => {
+    const sample = sampler.sampleLogical(x, y);
+    const localRgb = rgbAnchors.atLogical(x, y);
+    const isWhite = binaryModule(sample, anchors.atLogical(x, y)) === 0 &&
+      sample.every((channel, index) => {
+        const black = localRgb.black[index]!;
+        const white = localRgb.white[index]!;
+        const normalized = (channel - black) / (white - black);
+        return Number.isFinite(normalized) && normalized >= BINARY_WHITE_MINIMUM;
+      });
+    if (!isWhite) errors++;
+  };
+  for (let index = 0; index < QUIET_ZONE_SAMPLES_PER_EDGE; index++) {
+    const position = QUIET_MODULES + Math.floor(
+      ((index + 0.5) * ACTIVE_MODULES) / QUIET_ZONE_SAMPLES_PER_EDGE,
+    );
+    check(position, depth);
+    check(position, far);
+    check(depth, position);
+    check(far, position);
+  }
+  return errors;
 }
 
 function countTimingErrors(
   sampler: ModuleSampler,
   layout: PhysicalLayout,
-  anchors: { black: number; white: number },
+  anchors: SpatialBinaryAnchorModel,
 ): { errors: number; modules: number } {
   let errors = 0;
   let modules = 0;
   const check = (x: number, y: number, expected: 0 | 1): void => {
     modules++;
-    if (binaryModule(sampler.sampleActive(x, y), anchors) !== expected) errors++;
+    if (binaryModule(sampler.sampleActive(x, y), anchors.atActive(x, y)) !== expected) errors++;
   };
   for (let x = 0; x < layout.data.width; x++) {
     const top = (x & 1) === 0 ? 1 : 0;
@@ -821,6 +892,25 @@ function resolveThresholds(
   };
 }
 
+function observeBinaryAnchors(anchors: BinaryAnchors): BinaryAnchorObservation {
+  return Object.freeze({
+    black: anchors.black,
+    white: anchors.white,
+    contrast: anchors.white - anchors.black,
+  });
+}
+
+function observeBinaryAnchorsByFiducial(
+  anchors: BinaryAnchorsByFiducial,
+): Readonly<Record<FiducialId, BinaryAnchorObservation>> {
+  return Object.freeze({
+    TL: observeBinaryAnchors(anchors.TL),
+    TR: observeBinaryAnchors(anchors.TR),
+    BR: observeBinaryAnchors(anchors.BR),
+    BL: observeBinaryAnchors(anchors.BL),
+  });
+}
+
 /**
  * Decode a square, orientation-correct, homography-normalized COLOR_4 raster.
  * Camera location and perspective recovery intentionally live outside this
@@ -839,7 +929,8 @@ export function decodeCanonicalColor4Raster(
   const finishGeometry = (
     outcome: "completed" | "rejected",
     reason?: CanonicalRasterRejectReason,
-    anchors?: Readonly<{ black: number; white: number }>,
+    anchors?: BinaryAnchors,
+    anchorsByFiducial?: BinaryAnchorsByFiducial,
   ): void => {
     if (!observing) return;
     const timing = elapsedSince(options.clock, stageStartedAt);
@@ -854,12 +945,11 @@ export function decodeCanonicalColor4Raster(
       ...(anchors === undefined
         ? {}
         : {
-            binaryAnchors: Object.freeze({
-              black: anchors.black,
-              white: anchors.white,
-              contrast: anchors.white - anchors.black,
-            }),
+            binaryAnchors: observeBinaryAnchors(anchors),
           }),
+      ...(anchorsByFiducial === undefined
+        ? {}
+        : { binaryAnchorsByFiducial: observeBinaryAnchorsByFiducial(anchorsByFiducial) }),
     });
     stageStartedAt = readClock(options.clock);
   };
@@ -898,21 +988,36 @@ export function decodeCanonicalColor4Raster(
   const scale = image.width / TOTAL_MODULES;
   values.moduleScale = scale;
   const sampler = createSampler(image, scale);
-  const anchors = collectBinaryAnchors(sampler);
-  if (anchors.white - anchors.black < 40) {
-    finishGeometry("rejected", "invalid_geometry", anchors);
+  const collectedAnchors = collectBinaryAnchors(sampler);
+  const anchors = createSpatialBinaryAnchorModel(collectedAnchors.byFiducial);
+  const rgbAnchors = createSpatialRgbBinaryAnchorModel(collectedAnchors.rgbByFiducial);
+  if (anchors === null || rgbAnchors === null) {
+    finishGeometry(
+      "rejected",
+      "invalid_geometry",
+      collectedAnchors.pooled,
+      collectedAnchors.byFiducial,
+    );
     return rejected("invalid_geometry", values);
   }
   const fiducialErrors = countFiducialErrors(sampler, anchors);
   values.fiducialErrors = fiducialErrors.total;
   values.fiducialErrorsById = fiducialErrors.byId;
   values.fiducialErrorMax = fiducialErrors.maximum;
-  values.quietZoneErrors = countQuietZoneErrors(sampler, anchors);
-  if (values.fiducialErrorMax > thresholds.maximumFiducialErrors || values.quietZoneErrors > 2) {
-    finishGeometry("rejected", "invalid_geometry", anchors);
+  values.quietZoneErrors = countQuietZoneErrors(sampler, anchors, rgbAnchors);
+  if (
+    values.fiducialErrorMax > thresholds.maximumFiducialErrors ||
+    values.quietZoneErrors > MAXIMUM_QUIET_ZONE_ERRORS
+  ) {
+    finishGeometry(
+      "rejected",
+      "invalid_geometry",
+      collectedAnchors.pooled,
+      anchors.byFiducial,
+    );
     return rejected("invalid_geometry", values);
   }
-  finishGeometry("completed", undefined, anchors);
+  finishGeometry("completed", undefined, collectedAnchors.pooled, anchors.byFiducial);
 
   const bootstrapRect: ModuleRect = {
     x: (ACTIVE_MODULES - BOOTSTRAP_COLUMNS) / 2,

@@ -41,6 +41,7 @@ interface CameraScenario {
   readonly height?: number;
   readonly turns?: 0 | 1 | 2 | 3;
   readonly quad?: Quad;
+  readonly spatialPhotometry?: boolean;
   readonly blurKernel?: 3 | 7;
   readonly exposure?: number;
   readonly noise?: number;
@@ -152,6 +153,73 @@ function destinationQuad(scenario: CameraScenario, width: number, height: number
 
 function clampByte(value: number): number {
   return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+interface PhotometricAnchors {
+  readonly black: number;
+  readonly white: number;
+}
+
+const SPATIAL_ANCHOR_NEAR = 11;
+const SPATIAL_ANCHOR_FAR = 148;
+const CAPTURE_EQUIVALENT_ANCHORS = Object.freeze({
+  TL: Object.freeze({ black: 85.63, white: 179.59 }),
+  TR: Object.freeze({ black: 125.65, white: 206.97 }),
+  BR: Object.freeze({ black: 91.69, white: 174.03 }),
+  BL: Object.freeze({ black: 89.96, white: 176.38 }),
+});
+
+function interpolate(left: number, right: number, weight: number): number {
+  return left + (right - left) * weight;
+}
+
+function spatialAnchorsAtActive(activeX: number, activeY: number): PhotometricAnchors {
+  const span = SPATIAL_ANCHOR_FAR - SPATIAL_ANCHOR_NEAR;
+  const u = Math.max(0, Math.min(1, (activeX - SPATIAL_ANCHOR_NEAR) / span));
+  const v = Math.max(0, Math.min(1, (activeY - SPATIAL_ANCHOR_NEAR) / span));
+  const topBlack = interpolate(
+    CAPTURE_EQUIVALENT_ANCHORS.TL.black,
+    CAPTURE_EQUIVALENT_ANCHORS.TR.black,
+    u,
+  );
+  const bottomBlack = interpolate(
+    CAPTURE_EQUIVALENT_ANCHORS.BL.black,
+    CAPTURE_EQUIVALENT_ANCHORS.BR.black,
+    u,
+  );
+  const topWhite = interpolate(
+    CAPTURE_EQUIVALENT_ANCHORS.TL.white,
+    CAPTURE_EQUIVALENT_ANCHORS.TR.white,
+    u,
+  );
+  const bottomWhite = interpolate(
+    CAPTURE_EQUIVALENT_ANCHORS.BL.white,
+    CAPTURE_EQUIVALENT_ANCHORS.BR.white,
+    u,
+  );
+  return {
+    black: interpolate(topBlack, bottomBlack, v),
+    white: interpolate(topWhite, bottomWhite, v),
+  };
+}
+
+/** Models the measured corner-dependent display channel before camera projection. */
+function applySpatialPhotometry(frame: Raster): Uint8ClampedArray<ArrayBuffer> {
+  const output = Uint8ClampedArray.from(frame.pixels);
+  for (let y = 0; y < frame.height; y++) {
+    const activeY = Math.floor(y / frame.moduleScale) - frame.layout.quietModules;
+    for (let x = 0; x < frame.width; x++) {
+      const activeX = Math.floor(x / frame.moduleScale) - frame.layout.quietModules;
+      const anchors = spatialAnchorsAtActive(activeX, activeY);
+      const range = anchors.white - anchors.black;
+      const offset = (y * frame.width + x) * 4;
+      output[offset] = clampByte(anchors.black + frame.pixels[offset]! / 255 * range);
+      output[offset + 1] = clampByte(anchors.black + frame.pixels[offset + 1]! / 255 * range);
+      output[offset + 2] = clampByte(anchors.black + frame.pixels[offset + 2]! / 255 * range);
+      output[offset + 3] = 255;
+    }
+  }
+  return output;
 }
 
 function yuv420RoundTrip(
@@ -337,8 +405,11 @@ function projectWithOpenCv(
   const width = scenario.width ?? 1280;
   const height = scenario.height ?? 960;
   const rotatedDestination = destinationQuad(scenario, width, height);
+  const sourcePixels = scenario.spatialPhotometry
+    ? applySpatialPhotometry(frame)
+    : Uint8ClampedArray.from(frame.pixels);
   const source = cv.matFromImageData(
-    new ImageData(Uint8ClampedArray.from(frame.pixels), frame.width, frame.height),
+    new ImageData(sourcePixels, frame.width, frame.height),
   );
   const sourcePoints = cv.matFromArray(4, 1, cv.CV_32FC2, [
     0, 0,
@@ -595,6 +666,13 @@ test("required OpenCV corpus stays valid and extreme frames are exact-or-rejecte
     { name: "radial-minus-0.05", radialK1: -0.05 },
     { name: "radial-plus-0.05", radialK1: 0.05 },
     { name: "glare-data", glare: "data" },
+    { name: "spatial-photometry", spatialPhotometry: true },
+    {
+      name: "spatial-photometry-blur-yuv420",
+      spatialPhotometry: true,
+      blurKernel: 3,
+      yuv420: true,
+    },
     {
       name: "combined-required",
       blurKernel: 3,
@@ -618,10 +696,6 @@ test("required OpenCV corpus stays valid and extreme frames are exact-or-rejecte
     { name: "extreme-exposure-0.65", exposure: 0.65 },
     { name: "extreme-exposure-1.35", exposure: 1.35 },
     { name: "extreme-glare-fiducial", glare: "fiducial" },
-    {
-      name: "extreme-crop",
-      quad: [{ x: -90, y: 110 }, { x: 935, y: 80 }, { x: 1000, y: 875 }, { x: -65, y: 840 }],
-    },
     { name: "extreme-radial-minus-0.16", radialK1: -0.16 },
     { name: "extreme-radial-plus-0.16", radialK1: 0.16 },
   ];
@@ -671,6 +745,13 @@ test("required OpenCV corpus stays valid and extreme frames are exact-or-rejecte
     [
       "negative-mixed-phase",
       projectWithOpenCv(cv, mixedPhaseRaster(base.raster, next.raster), { name: "mixed-phase" }),
+    ],
+    [
+      "negative-severe-crop",
+      projectWithOpenCv(cv, base.raster, {
+        name: "severe-crop",
+        quad: [{ x: -90, y: 110 }, { x: 935, y: 80 }, { x: 1000, y: 875 }, { x: -65, y: 840 }],
+      }),
     ],
   ];
   for (const [name, camera] of negativeCameras) {

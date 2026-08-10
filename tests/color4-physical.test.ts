@@ -21,6 +21,7 @@ import {
   encodeBootstrap,
   encodePhasePilot,
   fiducialModule,
+  type FiducialId,
 } from "../shared/color4/physical.ts";
 import {
   EXPERIMENTAL_PROFILE,
@@ -93,6 +94,148 @@ function paintActiveModule(
       raster.pixels[offset + 3] = 0xff;
     }
   }
+}
+
+function paintLogicalModule(
+  raster: Color4Raster,
+  logicalX: number,
+  logicalY: number,
+  rgb: readonly [number, number, number],
+): void {
+  const startX = logicalX * raster.moduleScale;
+  const startY = logicalY * raster.moduleScale;
+  for (let y = 0; y < raster.moduleScale; y++) {
+    for (let x = 0; x < raster.moduleScale; x++) {
+      const offset = ((startY + y) * raster.width + startX + x) * 4;
+      raster.pixels[offset] = rgb[0];
+      raster.pixels[offset + 1] = rgb[1];
+      raster.pixels[offset + 2] = rgb[2];
+      raster.pixels[offset + 3] = 0xff;
+    }
+  }
+}
+
+interface PhotometricAnchors {
+  readonly black: number;
+  readonly white: number;
+}
+
+const CAPTURE_PHOTOMETRIC_ANCHORS: Readonly<Record<FiducialId, PhotometricAnchors>> =
+  Object.freeze({
+    TL: Object.freeze({ black: 85.63, white: 179.59 }),
+    TR: Object.freeze({ black: 125.65, white: 206.97 }),
+    BR: Object.freeze({ black: 91.69, white: 174.03 }),
+    BL: Object.freeze({ black: 89.96, white: 176.38 }),
+  });
+
+function clampUnit(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function interpolate(left: number, right: number, position: number): number {
+  return left + (right - left) * position;
+}
+
+function capturePhotometricAnchors(activeX: number, activeY: number): PhotometricAnchors {
+  const horizontal = clampUnit((activeX - 11) / (148 - 11));
+  const vertical = clampUnit((activeY - 11) / (148 - 11));
+  const interpolateField = (field: keyof PhotometricAnchors): number => {
+    const top = interpolate(
+      CAPTURE_PHOTOMETRIC_ANCHORS.TL[field],
+      CAPTURE_PHOTOMETRIC_ANCHORS.TR[field],
+      horizontal,
+    );
+    const bottom = interpolate(
+      CAPTURE_PHOTOMETRIC_ANCHORS.BL[field],
+      CAPTURE_PHOTOMETRIC_ANCHORS.BR[field],
+      horizontal,
+    );
+    return interpolate(top, bottom, vertical);
+  };
+  return { black: interpolateField("black"), white: interpolateField("white") };
+}
+
+/** Apply the measured spatial black/white field independently to each channel. */
+function applyCapturePhotometricField(raster: Color4Raster): void {
+  for (let logicalY = 0; logicalY < TOTAL_MODULES; logicalY++) {
+    for (let logicalX = 0; logicalX < TOTAL_MODULES; logicalX++) {
+      const anchors = capturePhotometricAnchors(
+        logicalX - QUIET_MODULES,
+        logicalY - QUIET_MODULES,
+      );
+      const sourceOffset =
+        (logicalY * raster.moduleScale * raster.width + logicalX * raster.moduleScale) * 4;
+      const range = anchors.white - anchors.black;
+      const mapped = [0, 1, 2].map((channel) =>
+        Math.round(anchors.black + (raster.pixels[sourceOffset + channel]! / 255) * range),
+      ) as [number, number, number];
+      paintLogicalModule(raster, logicalX, logicalY, mapped);
+    }
+  }
+}
+
+function medianNumber(values: readonly number[]): number {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = sorted.length >>> 1;
+  return sorted.length & 1
+    ? sorted[middle]!
+    : (sorted[middle - 1]! + sorted[middle]!) / 2;
+}
+
+function activeModuleLuminance(raster: Color4Raster, activeX: number, activeY: number): number {
+  const [red, green, blue] = rgbaAtModule(raster, activeX, activeY);
+  return red! * 0.2126 + green! * 0.7152 + blue! * 0.0722;
+}
+
+/** Pin that this fixture really reproduces the former pooled-anchor failure. */
+function legacyGlobalFiducialErrors(
+  raster: Color4Raster,
+): Readonly<Record<FiducialId, number>> {
+  const dark: number[] = [];
+  const light: number[] = [];
+  for (const marker of FIDUCIALS) {
+    for (let y = 0; y < 9; y++) {
+      for (let x = 0; x < 9; x++) {
+        const border = x === 0 || y === 0 || x === 8 || y === 8;
+        const ring = !border && (x === 1 || y === 1 || x === 7 || y === 7);
+        if (!border && !ring) continue;
+        (border ? dark : light).push(
+          activeModuleLuminance(raster, marker.x + x, marker.y + y),
+        );
+      }
+    }
+  }
+  const black = medianNumber(dark);
+  const white = medianNumber(light);
+  const range = white - black;
+  const byId: Record<FiducialId, number> = { TL: 0, TR: 0, BR: 0, BL: 0 };
+  for (const marker of FIDUCIALS) {
+    for (let y = 0; y < 9; y++) {
+      for (let x = 0; x < 9; x++) {
+        const normalized =
+          (activeModuleLuminance(raster, marker.x + x, marker.y + y) - black) / range;
+        const sampled = normalized <= 0.35 ? 1 : normalized >= 0.65 ? 0 : -1;
+        if (sampled !== fiducialModule(marker.id, x, y)) byId[marker.id]++;
+      }
+    }
+  }
+  return Object.freeze(byId);
+}
+
+function flatCanonicalImage(
+  pixel: (index: number) => readonly [number, number, number],
+): RgbaImage {
+  const width = TOTAL_MODULES;
+  const pixels = new Uint8ClampedArray(width * width * 4);
+  for (let index = 0; index < width * width; index++) {
+    const [red, green, blue] = pixel(index);
+    const offset = index * 4;
+    pixels[offset] = red;
+    pixels[offset + 1] = green;
+    pixels[offset + 2] = blue;
+    pixels[offset + 3] = 0xff;
+  }
+  return { width, height: width, pixels };
 }
 
 function paintActiveModuleOutsideInset(
@@ -399,6 +542,57 @@ test("canonical KCMY raster decodes every coded byte with no erasures", () => {
   assert.equal(decoded.diagnostics.moduleScale, 3);
 });
 
+test("spatial binary anchors recover the measured bright-corner photometric field byte-exactly", () => {
+  const coded = deterministicBytes(ROBUST_PROFILE.codedBytes);
+  const raster = rasterizeColor4(coded, {
+    profile: ROBUST_PROFILE,
+    paletteId: 0,
+    sequence: 0x1234_567a,
+    moduleScale: 6,
+  });
+  applyCapturePhotometricField(raster);
+
+  // This is the pre-repair failure signature: the pooled model turns every
+  // genuinely black TR module into an uncertain mismatch.
+  assert.deepEqual(legacyGlobalFiducialErrors(raster), {
+    TL: 0,
+    TR: 47,
+    BR: 0,
+    BL: 0,
+  });
+
+  const decoded = decodeCanonicalColor4Raster(raster);
+  assert.equal(decoded.status, "valid");
+  if (decoded.status !== "valid") return;
+  assert.deepEqual(decoded.codedBytes, coded);
+  assert.deepEqual([...decoded.byteErasures], []);
+  for (const [id, errors] of Object.entries(decoded.diagnostics.fiducialErrorsById)) {
+    assert.ok(errors <= COLOR4_MAX_FIDUCIAL_ERRORS, `${id} has ${errors} errors`);
+  }
+  assert.equal(decoded.diagnostics.fiducialErrorsById.TR, 0);
+  assert.equal(decoded.diagnostics.uncertainCells, 0);
+});
+
+test("spatial adaptation still rejects five structural errors in the bright TR fiducial", () => {
+  const raster = rasterizeColor4(deterministicBytes(ROBUST_PROFILE.codedBytes), {
+    profile: ROBUST_PROFILE,
+    paletteId: 0,
+    sequence: 0,
+    moduleScale: 6,
+  });
+  const topRight = FIDUCIALS.find((marker) => marker.id === "TR");
+  assert.notEqual(topRight, undefined);
+  flipFiducialModules(raster, topRight!, 5);
+  applyCapturePhotometricField(raster);
+
+  const decoded = decodeCanonicalColor4Raster(raster);
+  assert.equal(decoded.status, "rejected");
+  if (decoded.status !== "rejected") return;
+  assert.equal(decoded.reason, "invalid_geometry");
+  assert.equal(decoded.diagnostics.fiducialErrorsById.TR, 5);
+  assert.equal(decoded.diagnostics.fiducialErrorMax, 5);
+});
+
 test("canonical sampling uses the inset center and per-channel medians at scales 4, 6 and 8", () => {
   const coded = deterministicBytes(ROBUST_PROFILE.codedBytes);
   const sampleCases = [
@@ -603,6 +797,88 @@ test("damaged complementary timing rails reject geometry before color decode", (
   if (decoded.status === "rejected") {
     assert.equal(decoded.reason, "invalid_geometry");
     assert.ok(decoded.diagnostics.timingErrors > 0);
+  }
+});
+
+test("outermost quiet-zone corner contamination cannot decide an otherwise valid frame", () => {
+  const coded = deterministicBytes(ROBUST_PROFILE.codedBytes);
+  const corners = [
+    [0, 0],
+    [TOTAL_MODULES - 1, 0],
+    [TOTAL_MODULES - 1, TOTAL_MODULES - 1],
+    [0, TOTAL_MODULES - 1],
+  ] as const;
+
+  for (const contaminatedCorners of [3, 4] as const) {
+    const raster = rasterizeColor4(coded, {
+      profile: ROBUST_PROFILE,
+      paletteId: 0,
+      sequence: 0,
+      moduleScale: 3,
+    });
+    for (const [x, y] of corners.slice(0, contaminatedCorners)) {
+      paintLogicalModule(raster, x, y, [144, 144, 144]);
+    }
+
+    const decoded = decodeCanonicalColor4Raster(raster);
+    assert.equal(decoded.status, "valid", `${contaminatedCorners} corners`);
+    if (decoded.status !== "valid") continue;
+    assert.equal(decoded.diagnostics.quietZoneErrors, 0);
+    assert.deepEqual(decoded.codedBytes, coded);
+  }
+});
+
+test("a dark or colored interior quiet-zone strip still rejects fail-closed", () => {
+  const quietDepth = Math.floor(QUIET_MODULES / 2);
+  const cases = [
+    { name: "black", color: [0, 0, 0] as const },
+    { name: "red", color: [255, 0, 0] as const },
+    { name: "green", color: [0, 255, 0] as const },
+    { name: "blue", color: [0, 0, 255] as const },
+    { name: "cyan", color: [0, 255, 255] as const },
+    { name: "magenta", color: [255, 0, 255] as const },
+    { name: "yellow", color: [255, 255, 0] as const },
+  ] as const;
+
+  for (const { name, color } of cases) {
+    const raster = rasterizeColor4(deterministicBytes(ROBUST_PROFILE.codedBytes), {
+      profile: ROBUST_PROFILE,
+      paletteId: 0,
+      sequence: 0,
+      moduleScale: 3,
+    });
+    for (let x = QUIET_MODULES; x < QUIET_MODULES + ACTIVE_MODULES; x++) {
+      paintLogicalModule(raster, x, quietDepth, color);
+    }
+
+    const decoded = decodeCanonicalColor4Raster(raster);
+    assert.equal(decoded.status, "rejected", name);
+    if (decoded.status !== "rejected") continue;
+    assert.equal(decoded.reason, "invalid_geometry", name);
+    assert.equal(decoded.diagnostics.quietZoneErrors, 8, name);
+  }
+});
+
+test("blank and deterministic-random canonical rasters remain fail-closed", () => {
+  let noiseState = 0x434f_4c34;
+  const randomImage = flatCanonicalImage(() => {
+    const channels = [0, 0, 0] as [number, number, number];
+    for (let channel = 0; channel < channels.length; channel++) {
+      noiseState = (Math.imul(noiseState, 1664525) + 1013904223) >>> 0;
+      channels[channel] = noiseState >>> 24;
+    }
+    return channels;
+  });
+  const cases = [
+    { name: "white", image: flatCanonicalImage(() => [255, 255, 255]) },
+    { name: "black", image: flatCanonicalImage(() => [0, 0, 0]) },
+    { name: "random", image: randomImage },
+  ] as const;
+
+  for (const { name, image } of cases) {
+    const decoded = decodeCanonicalColor4Raster(image);
+    assert.equal(decoded.status, "rejected", name);
+    if (decoded.status === "rejected") assert.equal(decoded.reason, "invalid_geometry", name);
   }
 });
 
