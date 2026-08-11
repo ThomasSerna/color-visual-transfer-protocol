@@ -856,6 +856,9 @@ test("a dark or colored interior quiet-zone strip still rejects fail-closed", ()
     if (decoded.status !== "rejected") continue;
     assert.equal(decoded.reason, "invalid_geometry", name);
     assert.equal(decoded.diagnostics.quietZoneErrors, 8, name);
+    assert.equal(decoded.diagnostics.quietZoneRgbErrors, 8, name);
+    if (name === "yellow") assert.equal(decoded.diagnostics.quietZoneLumaErrors, 0, name);
+    if (name === "black") assert.equal(decoded.diagnostics.quietZoneLumaErrors, 8, name);
   }
 });
 

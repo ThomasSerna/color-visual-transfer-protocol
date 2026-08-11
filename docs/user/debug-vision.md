@@ -25,8 +25,10 @@ stage canvas is updated at no more than two frames per second so diagnostics do
 not become the main decoding workload.
 
 Each bounded candidate trace records its primary threshold pass, support across
-all three passes and deterministic candidate score. These per-frame details
-stay in the opt-in debug snapshot rather than the persisted experiment history.
+all three passes and deterministic candidate score. The cheap pre-warp score
+combines square-ness, border contrast and contour nesting; it ranks work but is
+not by itself a validity decision. These per-frame details stay in the opt-in
+debug snapshot rather than the persisted experiment history.
 
 The advanced controls select canonical scale 4, 6 or 8 (default 6) and a
 detection limit of 960, 1280 (default) or the source resolution. They, along
@@ -34,15 +36,24 @@ with the declared run conditions, are locked once reception starts. Stop and
 begin a fresh session to change them; mixing configurations inside one
 experiment would make the result ambiguous.
 
+The panel also selects the temporal prefilter mode. **observe (shadow)** is the
+default: it measures every capture but does not drop one for instability.
+**enabled** enforces the stable-frame decision described below. The mode is
+locked for the run and is included in its exported conditions.
+
 Live metrics identify the last completed stage and rejection reason, detected
 fiducials, and worker p50/p95 timing. The exported experiment JSON keeps bounded
-histograms and timing reservoirs, not an unbounded frame log.
+histograms and timing reservoirs, not an unbounded frame log. COLOR_4 summaries
+also include warmup/stable/unstable captures, vision submissions, unstable and
+redundant-stable skips, and the bounded stability-score distribution.
 
 ## Capture a diagnostic ZIP
 
-While a COLOR_4 reception is active, select **Capture debug snapshot**. The
-button arms the next free camera capture; it does not interrupt the one-frame-
-in-flight rule. A single ZIP is downloaded with a zero-padded capture ID:
+While a COLOR_4 reception is active, select **Capture raw camera frame +
+diagnostics**. This action remains available when live Debug Vision is off. The
+button arms the next eligible free camera capture; it does not interrupt the
+one-frame-in-flight rule. A single ZIP is downloaded with a zero-padded capture
+ID:
 
 ```text
 capture-000123-raw.png
@@ -52,11 +63,24 @@ capture-000123.json
 ```
 
 The JSON says `warped.available=false` when the warped PNG is legitimately
-absent. It also contains the frame diagnosis, bounded candidate/fiducial/
-calibration traces, accumulated experiment metrics, effective debug settings,
-build label, browser identifier and the physical conditions entered in the
-panel. The ZIP uses uncompressed STORE entries because PNG is already
-compressed; each entry is protected by the standard ZIP IEEE CRC-32.
+absent. Its version-1 record also contains:
+
+- carrier, palette, expected and observed profile, declared transmitter FPS,
+  canonical scale, detection limit and prefilter mode;
+- requested camera width/height/FPS alongside the authoritative negotiated
+  values from `MediaStreamTrack.getSettings()`;
+- raw width, height, RGBA row stride (`width * 4`) and `rgbaSha256`;
+- frame diagnosis, bounded candidate/fiducial/calibration traces, accumulated
+  experiment metrics, build label, browser identifier and declared physical
+  conditions.
+
+`rgbaSha256` hashes the exact row-major RGBA bytes supplied to the worker before
+grayscale conversion, detection resize, thresholding, homography or colour
+normalization. It is not a hash of the PNG container and is unrelated to the
+SHA-256 of a transferred file. The PNG is the lossless, shareable rendering of
+that plane. The ZIP uses uncompressed STORE entries because PNG is already
+compressed; each entry is protected separately by the standard ZIP IEEE
+CRC-32.
 
 The application does not put snapshot images, per-frame traces or coordinates
 in IndexedDB. Pixel buffers, blobs and temporary object URLs are released after
@@ -67,28 +91,70 @@ folder until you delete it.
 > screens, reflections, documents and surroundings outside the transmitted
 > frame. Inspect the ZIP before sharing it and use a controlled scene for tests.
 
-## Frozen first physical baseline
+## Temporal stability score
 
-Use this run before changing thresholds or tuning more than one stage. Its goal
-is to locate the dominant failure, not to prove throughput.
+For every COLOR_4 camera callback, the receiver first draws a cheap 64×48
+fingerprint and converts it to rounded BT.709 luma:
+
+```text
+Y = round(0.2126 R + 0.7152 G + 0.0722 B)
+```
+
+It divides the fingerprint into 48 row-major 8×8 blocks. Each block score is
+its mean absolute luma difference from the preceding fingerprint divided by
+255; the frame score is the nearest-rank p90 of those block scores. A score at
+or below `0.025` is stable.
+
+- The first capture after start/reset is `warmup` because it has no predecessor.
+- In `observe`, warmup, stable and unstable captures remain eligible for vision
+  (the normal one-frame-in-flight rule still applies); the decision is
+  telemetry only.
+- In `enabled`, warmup and unstable captures stop before the full-resolution
+  canvas/worker path. The first stable capture after a transition is submitted;
+  later stable captures in the same interval are skipped unless a diagnostic
+  snapshot is pending.
+
+This is receiver acquisition policy, not a COLOR_4 wire constant. Keep
+`observe` when collecting a neutral baseline and compare it with `enabled`
+under the same physical setup.
+
+## Frozen capture-first physical protocol
+
+Use this protocol before changing thresholds or tuning more than one stage. Its
+goal is to locate the dominant failure, not to prove throughput.
 
 1. On the transmitter select **COLOR_4**, **ROBUST**, **KCMY**, **5 fps** and
    fullscreen. Use high/max display brightness.
-2. On the receiver select capture width **1280**, enable Debug Vision, keep
-   canonical scale **6** and detection limit **1280**, then enter TX FPS 5,
-   distance 0.5 m, angle 0 degrees,
+2. On the receiver enable Debug Vision, keep detection limit **1280**, then
+   enter expected profile ROBUST, TX FPS 5, distance 0.5 m, angle 0 degrees,
    brightness and a unique run label.
 3. Fix the phone in place about **0.5 m** from the display, nearly square-on
    (approximately **0 degrees**) under normal indoor lighting. Keep the complete
    white quiet zone visible.
-4. Start reception. Run for at least **60 seconds** and until **300 processed
-   attempts** have been observed, with a hard maximum of **180 seconds**.
+4. Run each A–E variant below for at least **60 seconds**. When a run targets
+   processed attempts, continue until **300 vision submissions** or a hard
+   maximum of **180 seconds**.
 5. Arm one debug snapshot near the end of the run. Keep the downloaded ZIP and
    also use **Export measurements** for the experiment history.
 
+The variants are cumulative only where the table says so; all unspecified
+settings remain frozen:
+
+| Variant | Capture | Prefilter | Canonical scale |
+|---|---|---|---:|
+| A | 1280 @ 30 | observe | 6 |
+| B | 1920 @ 30 | observe | 6 |
+| C | 1920 @ 15 | observe | 6 |
+| D | 1920 @ 30 | enabled | 6 |
+| E | 1920 @ 30 | enabled | 8 |
+
 Record the actual negotiated camera resolution and FPS shown by the receiver,
-not only the requested values. Do not alter the palette, profile, scale,
-detection limit, distance or angle during the run.
+not only the requested values. For every variant retain captures,
+warmup/stable/unstable counts, vision submissions, valid frames, dominant
+fiducial/geometry/calibration/RS rejection, worker p50/p95 and the optical
+metrics when four fiducials were available. Do not alter palette, profile,
+detection limit, distance, angle, display size or lighting during the matrix.
+Run all variants three times before treating a difference as repeatable.
 
 ## Sharing the bundle for diagnosis
 
@@ -112,11 +178,22 @@ variable at a time. Never relax CRC or the Reed-Solomon correction bound to make
 a frame appear valid. A proposed change is kept only when the exact baseline
 produces more valid frames without CRC failures or incorrect inner frames.
 
+## Real-capture gate and fixture privacy
+
+The A–E runs and their unmodified ZIP/experiment exports remain an external
+hardware gate. Unit, corpus and fake-camera E2E tests do not satisfy it. A real
+camera fixture may enter `tests/fixtures/color4/physical/` only after privacy
+review, with controlled or anonymized imagery, its metadata and an explicit
+expected result. Cropping changes apparent resolution and candidate load, so a
+crop is not interchangeable with the original full-camera replay and must be
+identified as such. Until reviewed fixtures exist, preserve the originals
+outside the repository and report the physical run separately.
+
 ## Follow-up matrix
 
-After valid frames are observed in three baseline sessions, reconstruct the
-same incompressible pseudo-random 1 MiB file with a verified SHA-256 in three of
-three runs. Then run every combination below while holding the remaining
+After valid frames are observed repeatedly in the A–E protocol, reconstruct the
+same incompressible pseudo-random 1 MiB file with a verified file SHA-256 in
+three of three runs. Then run every combination below while holding the winning
 baseline conditions fixed:
 
 | Dimension | Values |

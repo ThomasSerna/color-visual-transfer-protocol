@@ -1,7 +1,9 @@
 import { expect, test } from "@playwright/test";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
+import { PNG } from "pngjs";
 import { expectColor4CameraReconstruction } from "./color4-camera-test";
 
 const retiredPrimaryBrand = ["Decimen", "COLOR_4"].join(" ");
@@ -130,11 +132,18 @@ test("receiver exposes one explicit carrier and carrier-specific settings", asyn
   const color = page.locator('input[name="carrier"][value="color4"]');
   await expect(qr).toBeChecked();
   await page.locator("#settings > summary").click();
+  await expect(page.locator("#cfg-width")).toHaveValue("1280");
+  await expect(page.locator("#cfg-capfps")).toHaveValue("60");
   await expect(page.locator("#cfg-workers")).toBeVisible();
   await page.locator("#carrier-color-option").click();
   await expect(color).toBeChecked();
   await expect(qr).not.toBeChecked();
   await expect(page.locator("#cfg-color-palette")).toBeVisible();
+  await expect(page.locator("#cfg-width")).toHaveValue("1920");
+  await expect(page.locator("#cfg-width option[value='max']")).toHaveText("max supported");
+  await expect(page.locator("#cfg-capfps")).toHaveValue("30");
+  await expect(page.locator("#cfg-capfps option[value='15']")).not.toHaveAttribute("hidden", "");
+  await expect(page.locator("#cfg-capfps option[value='60']")).toHaveAttribute("hidden", "");
   await expect(page.locator("#cfg-workers")).toBeHidden();
   await expect(page.locator("details:has(> summary:text-is('Debug Vision'))")).toBeVisible();
   await expect(page.locator("#cfg-vision-debug")).not.toBeChecked();
@@ -166,6 +175,14 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
   await page.locator("#cfg-debug-view").selectOption("raw");
   await page.locator("#start").click();
   await openCvLoaded;
+  // RAW capture is an acquisition action, not a live-overlay prerequisite.
+  await expect(page.locator("#cfg-vision-debug")).not.toBeChecked();
+  await expect(page.locator("#capture-debug-snapshot")).toBeEnabled({ timeout: 30_000 });
+  const rawOnlyDownload = page.waitForEvent("download");
+  await page.locator("#capture-debug-snapshot").click();
+  const rawOnlyArtifact = await rawOnlyDownload;
+  expect(rawOnlyArtifact.suggestedFilename()).toMatch(/^cvtp-vision-.+-capture-\d{6}\.zip$/);
+  await expect(page.locator("#debug-snapshot-status")).toContainText("Snapshot ZIP downloaded");
   // Enabling after capture starts must activate diagnostics without restarting
   // the camera; advanced controls are already locked to the session config.
   await page.locator("#cfg-vision-debug").check();
@@ -240,13 +257,20 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
     schema: string;
     version: number;
     configuration: {
+      carrier: string;
       canonicalScale: number;
       maxDetectionDimension: number | string;
       paletteId: number;
       palette: string;
+      prefilterMode: string;
+      expectedProfile?: string;
+      observedProfile?: string;
+      declaredTxFps?: number;
+      requestedCamera: { width: number | string; height?: number; fps: number };
+      actualCamera?: { width?: number; height?: number; fps?: number };
     };
-    conditions: { label?: string; expectedTxFps: number; distanceM: number; angleDeg: number };
-    artifacts: { raw: { available: boolean }; threshold: { available: boolean }; warped: { available: boolean } };
+    conditions: { label?: string; expectedTxFps: number; expectedProfile?: string; prefilterMode?: string; distanceM: number; angleDeg: number };
+    artifacts: { raw: { available: boolean; width?: number; height?: number; rgbaRowStride?: number; rgbaSha256?: string }; threshold: { available: boolean }; warped: { available: boolean } };
     vision: { traces: unknown[] };
     experiment?: { vision?: { debugEnabled?: boolean } };
   };
@@ -254,14 +278,22 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
     schema: "cvtp-color4-vision-snapshot",
     version: 1,
     configuration: {
+      carrier: "COLOR_4",
       canonicalScale: 6,
       maxDetectionDimension: 1280,
       paletteId: 1,
       palette: "KRGB",
+      prefilterMode: "observe",
+      expectedProfile: "ROBUST",
+      declaredTxFps: 5,
+      requestedCamera: { width: 1920, height: 1440, fps: 30 },
+      actualCamera: { width: 1280, height: 960, fps: 5 },
     },
     conditions: {
       label: "playwright-debug-baseline",
       expectedTxFps: 5,
+      expectedProfile: "ROBUST",
+      prefilterMode: "observe",
       distanceM: 0.5,
       angleDeg: 0,
     },
@@ -272,6 +304,17 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
     },
   });
   expect(snapshot.vision.traces.length).toBeGreaterThanOrEqual(4);
+  const rawEntry = snapshotEntries.find((entry) => entry.name.endsWith("-raw.png"));
+  expect(rawEntry).toBeDefined();
+  const decodedRaw = PNG.sync.read(Buffer.from(rawEntry!.data));
+  expect(snapshot.artifacts.raw).toMatchObject({
+    width: decodedRaw.width,
+    height: decodedRaw.height,
+    rgbaRowStride: decodedRaw.width * 4,
+  });
+  expect(createHash("sha256").update(decodedRaw.data).digest("hex")).toBe(
+    snapshot.artifacts.raw.rgbaSha256,
+  );
   expect(snapshot.experiment?.vision?.debugEnabled).toBe(true);
   await expect(page.locator("#debug-snapshot-status")).toContainText(
     "No camera images were retained",

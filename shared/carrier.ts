@@ -62,7 +62,10 @@ export interface VisionDetectionDiagnostics {
   readonly nonConvex?: number;
   readonly quads?: number;
   readonly mergedCandidates?: number;
+  readonly candidateCountRaw?: number;
+  readonly candidateCountRanked?: number;
   readonly decodedMarkers?: number;
+  readonly lowContrastCandidates?: number;
   readonly uniqueFiducials?: number;
   readonly duplicateIds?: number;
   readonly ambiguousCandidates?: number;
@@ -85,7 +88,9 @@ export interface BrowserVisionDiagnostics {
   readonly canonicalScale?: 4 | 6 | 8;
   readonly detectionDimension?: 960 | 1280 | "source";
   readonly rejectReason?: string;
+  readonly diagnosticReason?: Color4DiagnosticReason;
   readonly timings?: Readonly<Partial<Record<VisionTimingKey, number>>>;
+  readonly warnings?: readonly string[];
   readonly detection?: VisionDetectionDiagnostics;
   readonly fiducials?: Readonly<Partial<Record<"TL" | "TR" | "BR" | "BL", VisionFiducialNumericDiagnostic>>>;
   readonly homography?: Readonly<{
@@ -99,11 +104,25 @@ export interface BrowserVisionDiagnostics {
     refinementAttempted: boolean;
     refinementApplied: boolean;
   }>;
+  readonly optical?: Readonly<{
+    apparentFrameWidthPx: number;
+    apparentFrameHeightPx: number;
+    pixelsPerModuleX: number;
+    pixelsPerModuleY: number;
+    minimumPixelsPerModule: number;
+    fiducialWidthPx: number;
+    fiducialHeightPx: number;
+    fiducialContrast: number;
+    blurMetric: number;
+    clippedPixelFraction?: number;
+  }>;
   readonly canonical?: Readonly<{
     fiducialErrors?: number;
     fiducialErrorsById?: Readonly<Record<"TL" | "TR" | "BR" | "BL", number>>;
     fiducialErrorMax?: number;
     quietZoneErrors?: number;
+    quietZoneLumaErrors?: number;
+    quietZoneRgbErrors?: number;
     timingErrors?: number;
     timingModules?: number;
     calibrationMad?: number;
@@ -115,6 +134,20 @@ export interface BrowserVisionDiagnostics {
     maximumBestDeltaE?: number;
   }>;
 }
+
+/** Additive, browser-only failure localization; never serialized on the wire. */
+export type Color4DiagnosticReason =
+  | "CANONICAL_DIMENSIONS"
+  | "FIDUCIAL_CANONICAL"
+  | "QUIET_ZONE_LUMA"
+  | "QUIET_ZONE_RGB"
+  | "TIMING"
+  | "BOOTSTRAP"
+  | "PHASE"
+  | "CALIBRATION"
+  | "COLOR_CLASSIFICATION_TOO_UNCERTAIN"
+  | "RS_FAILED"
+  | "CRC_FAILED";
 
 export function carrierId(choice: CarrierChoice): CarrierId {
   return choice === "color4" ? "COLOR_4" : "QR_LEGACY";

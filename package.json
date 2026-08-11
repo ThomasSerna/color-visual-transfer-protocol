@@ -27,12 +27,14 @@
     "test:stress": "node --expose-gc --max-old-space-size=4096 --import tsx --test tests/stress/*.stress.ts"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@resvg/resvg-js": "2.6.2",
     "@techstark/opencv-js": "5.0.0-release.1",
-    "@playwright/test": "1.62.1",
     "@types/node": "^26.1.2",
+    "@types/pngjs": "^6.0.5",
     "@types/qrcode": "^1.5.5",
     "@vitejs/plugin-basic-ssl": "^1.2.0",
+    "pngjs": "^5.0.0",
     "qrcode": "1.5.4",
     "tsx": "4.20.6",
     "typescript": "^5.5.0",

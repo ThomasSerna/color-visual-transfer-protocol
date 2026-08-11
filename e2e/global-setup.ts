@@ -24,9 +24,9 @@ export const COLOR4_CAMERA_DEGRADED_FIXTURE = join(
  */
 export const COLOR4_CAMERA_SCHEDULE = [
   { sequence: 1, hold: 4 },
-  { sequence: 2, hold: 2 },
-  { sequence: 1, hold: 2 },
-  { sequence: 3, hold: 2 },
+  { sequence: 2, hold: 4 },
+  { sequence: 1, hold: 4 },
+  { sequence: 3, hold: 4 },
   { sequence: 0, hold: 4 },
 ] as const;
 
@@ -266,8 +266,7 @@ function degradedCameraRgba(
 }
 
 function y4mFixture(
-  frames: ReadonlyMap<number, Uint8Array>,
-  schedule: readonly number[],
+  frames: readonly Uint8Array[],
 ): Uint8Array {
   const header = new TextEncoder().encode(
     `YUV4MPEG2 W${WIDTH} H${HEIGHT} F5:1 Ip A1:1 C420jpeg\n`,
@@ -275,20 +274,47 @@ function y4mFixture(
   const frameHeader = new TextEncoder().encode("FRAME\n");
   const frameBytes = WIDTH * HEIGHT * 3 / 2;
   const fixture = new Uint8Array(
-    header.length + schedule.length * (frameHeader.length + frameBytes),
+    header.length + frames.length * (frameHeader.length + frameBytes),
   );
   let offset = 0;
   fixture.set(header, offset);
   offset += header.length;
-  for (const sequence of schedule) {
-    const i420 = frames.get(sequence);
-    if (!i420) throw new Error(`Missing fake-camera raster for sequence ${sequence}.`);
+  for (const i420 of frames) {
     fixture.set(frameHeader, offset);
     offset += frameHeader.length;
     fixture.set(i420, offset);
     offset += i420.length;
   }
   return fixture;
+}
+
+/** Deterministic rolling-display surrogate: old symbol on top, new on bottom. */
+function splitTransitionI420(previous: Uint8Array, current: Uint8Array): Uint8Array {
+  const yBytes = WIDTH * HEIGHT;
+  const chromaBytes = yBytes / 4;
+  const output = new Uint8Array(current.length);
+  const copySplitPlane = (offset: number, length: number): void => {
+    const half = length / 2;
+    output.set(previous.subarray(offset, offset + half), offset);
+    output.set(current.subarray(offset + half, offset + length), offset + half);
+  };
+  copySplitPlane(0, yBytes);
+  copySplitPlane(yBytes, chromaBytes);
+  copySplitPlane(yBytes + chromaBytes, chromaBytes);
+  return output;
+}
+
+function cameraTimeline(frames: ReadonlyMap<number, Uint8Array>): Uint8Array[] {
+  const timeline: Uint8Array[] = [];
+  let previous: Uint8Array | undefined;
+  for (const entry of COLOR4_CAMERA_SCHEDULE) {
+    const current = frames.get(entry.sequence);
+    if (!current) throw new Error(`Missing fake-camera raster for sequence ${entry.sequence}.`);
+    if (previous && previous !== current) timeline.push(splitTransitionI420(previous, current));
+    for (let held = 0; held < entry.hold; held++) timeline.push(current);
+    previous = current;
+  }
+  return timeline;
 }
 
 export default async function globalSetup(): Promise<void> {
@@ -309,11 +335,9 @@ export default async function globalSetup(): Promise<void> {
     sessionId,
     packed.container.length,
   );
-  const expandedSchedule: number[] = [];
   for (const entry of COLOR4_CAMERA_SCHEDULE) {
     const block = fountain.encode(entry.sequence);
     for (let held = 0; held < entry.hold; held++) {
-      expandedSchedule.push(entry.sequence);
       probe.addFrame(entry.sequence, block);
     }
     if (baselineFrameForSequence.has(entry.sequence)) continue;
@@ -354,10 +378,10 @@ export default async function globalSetup(): Promise<void> {
 
   await writeFile(
     COLOR4_CAMERA_FIXTURE,
-    y4mFixture(baselineFrameForSequence, expandedSchedule),
+    y4mFixture(cameraTimeline(baselineFrameForSequence)),
   );
   await writeFile(
     COLOR4_CAMERA_DEGRADED_FIXTURE,
-    y4mFixture(degradedFrameForSequence, expandedSchedule),
+    y4mFixture(cameraTimeline(degradedFrameForSequence)),
   );
 }

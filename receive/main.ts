@@ -33,9 +33,15 @@ import { statusLine } from "../shared/status-line";
 import { releaseScreenWakeLock, requestScreenWakeLock } from "../shared/wake-lock";
 import { applyContinuousCameraModes, probeCameraCapabilities } from "../shared/platform";
 import {
+  applyMaximumSupportedWidth,
+  cameraConstraintLadder,
+  type CaptureWidthChoice,
+} from "../shared/camera-negotiation";
+import {
   DEFAULT_COLOR4_CANONICAL_SCALE,
   DEFAULT_COLOR4_DETECTION_DIMENSION,
   defaultCaptureFps,
+  defaultCaptureWidth,
 } from "../shared/receiver-defaults";
 import { closeOnBackdropClick } from "../shared/dialog";
 import { loadColor4Receiver } from "../shared/color-loader";
@@ -58,6 +64,14 @@ import {
 import type { Color4CameraDecoder } from "./color4-carrier";
 import type { VisionDebugController } from "./color4-debug-ui";
 import type { QrLegacyCameraDecoder } from "./qr-carrier";
+import {
+  COLOR4_CAPTURE_FINGERPRINT_HEIGHT,
+  COLOR4_CAPTURE_FINGERPRINT_WIDTH,
+  CaptureStabilityTracker,
+  createCaptureLumaFingerprint,
+  type CaptureStabilityResult,
+} from "./color4-capture-stability";
+import { classifyColor4CaptureQuality } from "./color4-capture-quality";
 
 const startBtn = document.getElementById("start") as HTMLButtonElement;
 const video = document.getElementById("video") as HTMLVideoElement;
@@ -119,7 +133,8 @@ let startTs = 0;
 let captureGen = 0;
 let done = false;
 let settingsWired = false;
-let captureFpsManuallySelected = false;
+const manualCaptureWidths = new Map<CarrierChoice, string>();
+const manualCaptureFps = new Map<CarrierChoice, string>();
 let statsTimer: ReturnType<typeof setInterval> | undefined;
 let activeCarrier: CarrierChoice | null = null;
 let colorDecoder: Color4CameraDecoder | null = null;
@@ -132,6 +147,15 @@ let experimentSave: Promise<void> = Promise.resolve();
 let negotiatedCamera:
   | { cameraWidth?: number; cameraHeight?: number; cameraFps?: number }
   | undefined;
+let requestedCamera: {
+  width: CaptureWidthChoice;
+  height?: number;
+  fps: number;
+} = { width: 1280, height: 960, fps: 60 };
+let captureStability: CaptureStabilityTracker | null = null;
+let stableIntervalSubmitted = false;
+
+const COLOR4_STABILITY_THRESHOLD = 0.025;
 
 const noSignal = new NoSignalHintTimer(NO_SIGNAL_FIRST_MS, NO_SIGNAL_DISMISSED_MS);
 const captureTimes: number[] = [];
@@ -158,16 +182,46 @@ function applyCarrierControls(): void {
     return;
   }
   const carrier = currentCarrier();
-  if (!captureFpsManuallySelected) cfgCapFps.value = String(defaultCaptureFps(carrier));
+  const maxOption = Array.from(cfgWidth.options).find((option) => option.value === "max");
+  if (maxOption) maxOption.hidden = carrier !== "color4";
+  for (const option of Array.from(cfgCapFps.options)) {
+    const fps = Number(option.value);
+    option.hidden = carrier === "color4" ? fps === 60 : fps === 15;
+  }
+  cfgWidth.value = manualCaptureWidths.get(carrier) ?? String(defaultCaptureWidth(carrier));
+  cfgCapFps.value = manualCaptureFps.get(carrier) ?? String(defaultCaptureFps(carrier));
   qrSettings.forEach((element) => { element.hidden = carrier !== "qr"; });
   colorSettings.forEach((element) => { element.hidden = carrier !== "color4"; });
 }
 
-cfgCapFps.addEventListener("change", () => {
-  // Carrier-specific defaults follow the picker until the user makes an
-  // explicit choice. That choice then wins for the rest of this page session.
-  captureFpsManuallySelected = true;
+if (__COLOR4_ENABLED__) {
+  if (!Array.from(cfgWidth.options).some((option) => option.value === "max")) {
+    const option = document.createElement("option");
+    option.value = "max";
+    option.textContent = "max supported";
+    cfgWidth.append(option);
+  }
+  if (!Array.from(cfgCapFps.options).some((option) => option.value === "15")) {
+    const option = document.createElement("option");
+    option.value = "15";
+    option.textContent = "15";
+    cfgCapFps.insertBefore(option, cfgCapFps.firstChild);
+  }
+}
+
+cfgWidth.addEventListener("change", () => {
+  manualCaptureWidths.set(currentCarrier(), cfgWidth.value);
 });
+
+cfgCapFps.addEventListener("change", () => {
+  manualCaptureFps.set(currentCarrier(), cfgCapFps.value);
+});
+
+function captureWidthChoice(): CaptureWidthChoice {
+  if (cfgWidth.value === "max") return "max";
+  const width = Number(cfgWidth.value);
+  return width === 960 || width === 1920 ? width : 1280;
+}
 
 async function ensureVisionDebugController(): Promise<VisionDebugController> {
   if (!__COLOR4_ENABLED__) throw new Error("Debug Vision is unavailable in this build.");
@@ -175,6 +229,16 @@ async function ensureVisionDebugController(): Promise<VisionDebugController> {
   visionDebugPromise ??= import("./color4-debug-ui").then((module) =>
     module.createVisionDebugController({
       currentExperiment: () => experimentSnapshot(false),
+      snapshotContext: () => ({
+        requested: requestedCamera,
+        actual: negotiatedCamera === undefined
+          ? undefined
+          : {
+              width: negotiatedCamera.cameraWidth,
+              height: negotiatedCamera.cameraHeight,
+              fps: negotiatedCamera.cameraFps,
+            },
+      }),
     }),
   );
   try {
@@ -237,6 +301,8 @@ function cancelActiveReceiver(message: string): void {
   qrDecoder = null;
   colorDecoder?.dispose();
   colorDecoder = null;
+  captureStability = null;
+  stableIntervalSubmitted = false;
   deactivateVisionDebug();
   void releaseScreenWakeLock();
   activeCarrier = null;
@@ -382,6 +448,8 @@ function offerRetry(message: string) {
   qrDecoder = null;
   colorDecoder?.dispose();
   colorDecoder = null;
+  captureStability = null;
+  stableIntervalSubmitted = false;
   deactivateVisionDebug();
   void releaseScreenWakeLock();
   activeCarrier = null;
@@ -455,28 +523,37 @@ async function start() {
       return;
     }
   }
-  const captureWidth = Number(cfgWidth.value);
+  const captureWidth = captureWidthChoice();
   const captureFps = Number(cfgCapFps.value);
+  requestedCamera = {
+    width: captureWidth,
+    ...(captureWidth === "max"
+      ? {}
+      : { height: Math.round((captureWidth * 3) / 4) }),
+    fps: captureFps,
+  };
   // Nothing on the page changes until the camera is actually running: the
   // error paths below all have to leave a usable Start button behind.
   startBtn.disabled = true;
   startBtn.textContent = "Starting…";
-  const base: MediaTrackConstraints = {
-    facingMode: "environment",
-    width: { ideal: captureWidth },
-    height: { ideal: Math.round((captureWidth * 3) / 4) },
-  };
+  const attempts = cameraConstraintLadder(requestedCarrier, captureWidth, captureFps);
+  let cameraError: unknown;
   try {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { ...base, frameRate: { exact: captureFps } },
-      });
-    } catch {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { ...base, frameRate: { ideal: captureFps } },
-      });
+    for (const attempt of attempts) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: attempt.constraints,
+        });
+        break;
+      } catch (error) {
+        cameraError = error;
+      }
+    }
+    if (!stream) throw cameraError ?? new Error("No camera constraint attempt succeeded.");
+    if (requestedCarrier === "color4" && captureWidth === "max") {
+      const track = stream.getVideoTracks()[0];
+      if (track) await applyMaximumSupportedWidth(track, captureFps);
     }
   } catch (err) {
     if (startGeneration !== captureGen) return;
@@ -521,6 +598,11 @@ async function start() {
   latestCarrierDiagnostics = undefined;
   if (__COLOR4_ENABLED__ && requestedCarrier === "color4") {
     visionDebugController?.setTransferActive(true);
+    captureStability = new CaptureStabilityTracker(
+      visionDebugController?.prefilterMode ?? "observe",
+      COLOR4_STABILITY_THRESHOLD,
+    );
+    stableIntervalSubmitted = false;
     experiment.setVisionContext({
       debugEnabled: visionDebugController?.enabled ?? false,
       canonicalScale: visionDebugController?.canonicalScale ?? DEFAULT_COLOR4_CANONICAL_SCALE,
@@ -533,8 +615,8 @@ async function start() {
     `camera ${settings?.width}×${settings?.height}@${settings?.frameRate} — searching for a stream…`,
   );
 
+  await applyCameraExtras();
   reportCameraSettings();
-  void applyCameraExtras();
   if (!settingsWired) {
     settingsWired = true;
     for (const el of [cfgWidth, cfgCapFps, cfgWorkers]) {
@@ -562,11 +644,17 @@ function reportCameraSettings() {
     cameraFps: s.frameRate,
   };
   const fpsNote = gotFps && gotFps !== askedFps ? ` (asked ${askedFps})` : "";
+  const askedWidth = captureWidthChoice();
+  const widthNote = askedWidth === "max"
+    ? " (asked max supported)"
+    : s.width !== undefined && s.width !== askedWidth
+      ? ` (asked ${askedWidth})`
+      : "";
   const workers = __COLOR4_ENABLED__ && activeCarrier === "color4"
     ? "1 COLOR_4 vision worker"
     : `${qrDecoder?.size ?? 0} QR decode worker${qrDecoder?.size === 1 ? "" : "s"}`;
   cameraActual.textContent =
-    `camera ${s.width}×${s.height} @ ${gotFps} fps${fpsNote} · ${workers} · changes apply live`;
+    `camera ${s.width}×${s.height}${widthNote} @ ${gotFps} fps${fpsNote} · ${workers} · changes apply live`;
 }
 
 /** Use what this camera can actually do, probed rather than UA-sniffed.
@@ -591,19 +679,33 @@ async function applyReceiveSettings() {
   if (activeCarrier === "qr") qrDecoder?.resize(Number(cfgWorkers.value));
   const track = stream?.getVideoTracks()[0];
   if (!track) return;
-  const width = Number(cfgWidth.value);
+  const width = captureWidthChoice();
+  // Record the user's request before negotiation. If the track refuses a live
+  // change, snapshot metadata must still distinguish that request from the
+  // unchanged authoritative getSettings() values.
+  requestedCamera = {
+    width,
+    ...(width === "max" ? {} : { height: Math.round((width * 3) / 4) }),
+    fps: Number(cfgCapFps.value),
+  };
   try {
-    await track.applyConstraints({
-      width: { ideal: width },
-      height: { ideal: Math.round((width * 3) / 4) },
-      frameRate: { ideal: Number(cfgCapFps.value) },
-    });
+    if (activeCarrier === "color4" && width === "max") {
+      await applyMaximumSupportedWidth(track, Number(cfgCapFps.value));
+    } else {
+      const numericWidth = width === "max" ? 1280 : width;
+      await track.applyConstraints({
+        width: { ideal: numericWidth },
+        height: { ideal: Math.round((numericWidth * 3) / 4) },
+        frameRate: { ideal: Number(cfgCapFps.value) },
+      });
+    }
   } catch {
     // Some devices (notably iOS) refuse a live reconfigure. Keep the stream we
     // have rather than tearing down a transfer in progress.
     cameraActual.textContent = "this camera refused a live change — restart to apply";
     return;
   }
+  await applyCameraExtras();
   reportCameraSettings();
 }
 
@@ -622,6 +724,32 @@ function scheduleFrame(gen: number) {
 }
 
 const grab = document.createElement("canvas");
+const stabilityGrab = document.createElement("canvas");
+stabilityGrab.width = COLOR4_CAPTURE_FINGERPRINT_WIDTH;
+stabilityGrab.height = COLOR4_CAPTURE_FINGERPRINT_HEIGHT;
+
+function measureColor4Stability(): CaptureStabilityResult {
+  const context = stabilityGrab.getContext("2d", { willReadFrequently: true })!;
+  context.drawImage(
+    video,
+    0,
+    0,
+    COLOR4_CAPTURE_FINGERPRINT_WIDTH,
+    COLOR4_CAPTURE_FINGERPRINT_HEIGHT,
+  );
+  const pixels = context.getImageData(
+    0,
+    0,
+    COLOR4_CAPTURE_FINGERPRINT_WIDTH,
+    COLOR4_CAPTURE_FINGERPRINT_HEIGHT,
+  );
+  const fingerprint = createCaptureLumaFingerprint(
+    pixels.data,
+    COLOR4_CAPTURE_FINGERPRINT_WIDTH,
+    COLOR4_CAPTURE_FINGERPRINT_HEIGHT,
+  );
+  return captureStability!.observe(fingerprint);
+}
 
 function captureFrame() {
   const vw = video.videoWidth;
@@ -629,10 +757,42 @@ function captureFrame() {
   if (!vw || !vh) return;
   captureTimes.push(performance.now());
   experiment?.recordCapture();
+  let stability: CaptureStabilityResult | undefined;
+  let qualityRecorded = false;
   if (__COLOR4_ENABLED__ && activeCarrier === "color4") {
     if (!colorDecoder) return;
+    if (!captureStability) return;
+    stability = measureColor4Stability();
+    if (stability.state === "warmup") {
+      experiment?.recordStabilityWarmupCapture();
+      experiment?.recordQualityClass("UNKNOWN");
+      qualityRecorded = true;
+    } else if (stability.state === "stable") {
+      experiment?.recordStableCapture(stability.p90MaeNormalized);
+    } else {
+      experiment?.recordUnstableCapture(stability.p90MaeNormalized);
+      experiment?.recordQualityClass("UNUSABLE");
+      qualityRecorded = true;
+      stableIntervalSubmitted = false;
+    }
+    if (!stability.shouldSubmit) {
+      if (stability.state === "unstable") experiment?.recordSkippedUnstable();
+      return;
+    }
+    if (
+      captureStability.mode === "enabled" &&
+      stability.state === "stable" &&
+      stableIntervalSubmitted &&
+      !visionDebugController?.snapshotPending
+    ) {
+      experiment?.recordSkippedRedundantStable();
+      experiment?.recordQualityClass("UNKNOWN");
+      qualityRecorded = true;
+      return;
+    }
     if (colorDecoder.busy) {
       experiment?.recordSkippedWhileBusy();
+      if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
       return;
     }
   } else {
@@ -655,6 +815,10 @@ function captureFrame() {
   if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder) {
     const decoderGeneration = captureGen;
     const debugOptions = visionDebugController?.decodeOptions(capturedAt);
+    if (captureStability?.mode === "enabled" && stability?.state === "stable") {
+      stableIntervalSubmitted = true;
+    }
+    experiment?.recordVisionSubmission();
     void colorDecoder.decode(
       { source: img, timestamp: capturedAt },
       { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
@@ -664,6 +828,10 @@ function captureFrame() {
         decodeTimes.push(performance.now());
         const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
         latestCarrierDiagnostics = diagnostics;
+        if (!qualityRecorded) {
+          experiment?.recordQualityClass(classifyColor4CaptureQuality(stability?.state, diagnostics.vision));
+          qualityRecorded = true;
+        }
         if (decoded.debug && visionDebugController) {
           visionDebugController.handleFrame({
             ...decoded.debug,
@@ -681,6 +849,7 @@ function captureFrame() {
       (error) => {
         if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
         decodeTimes.push(performance.now());
+        if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
         visionDebugController?.failSnapshot("Snapshot failed because the vision worker stopped.");
         experiment?.recordAttempt("rejected", { stage: "wire" });
         const failureReason =
@@ -788,6 +957,8 @@ function goodputKbs(elapsed: number): number {
 async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
   done = true;
   captureGen++;
+  captureStability = null;
+  stableIntervalSubmitted = false;
   // Tear the whole capture pipeline down: the camera, the stats timer, and the
   // decode pool. Each worker holds its own ~940 KB zxing WASM instance, which
   // is worth reclaiming on a phone the moment the last frame is in.
@@ -1041,7 +1212,10 @@ function updateStats() {
   if (__COLOR4_ENABLED__) {
     metric("m-stage").textContent = latestCarrierDiagnostics?.stage ?? "—";
     metric("m-reason").textContent =
-      latestCarrierDiagnostics?.vision?.rejectReason ?? latestCarrierDiagnostics?.rejectReason ?? "—";
+      latestCarrierDiagnostics?.vision?.diagnosticReason ??
+      latestCarrierDiagnostics?.vision?.rejectReason ??
+      latestCarrierDiagnostics?.rejectReason ??
+      "—";
     const fiducials = latestCarrierDiagnostics?.vision?.fiducials;
     metric("m-fiducials").textContent = fiducials
       ? `${(["TL", "TR", "BR", "BL"] as const).filter((id) => fiducials[id]?.found).length}/4`
@@ -1049,7 +1223,9 @@ function updateStats() {
     const visionSummary = experimentSnapshot(false)?.vision ?? latestExperiment?.vision;
     const workerTiming = visionSummary?.timingsMs.workerTotal;
     metric("m-pipeline").textContent = workerTiming
-      ? `${workerTiming.p50.toFixed(0)}/${workerTiming.p95.toFixed(0)} ms`
+      ? `${workerTiming.p50.toFixed(0)}/${workerTiming.p95.toFixed(0)} ms${
+          visionSummary?.workerP95ExceedsTxFrameInterval ? " ⚠ slower than TX interval" : ""
+        }`
       : "—";
   }
   if (noSignal.tick(now)) showNoSignalHint();

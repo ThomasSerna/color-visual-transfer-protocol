@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cvtp.invalid/schemas/color4-physical-capture-v1.json",
+  "title": "CVTP COLOR_4 physical camera capture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema",
+    "version",
+    "provenance",
+    "rawFrame",
+    "camera",
+    "configuration",
+    "oracle"
+  ],
+  "properties": {
+    "$schema": { "const": "../metadata.schema.json" },
+    "schema": { "const": "cvtp-color4-physical-capture" },
+    "version": { "const": 1 },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "rawFrame": { "$ref": "#/$defs/rawFrame" },
+    "camera": { "$ref": "#/$defs/camera" },
+    "configuration": { "$ref": "#/$defs/configuration" },
+    "oracle": { "$ref": "#/$defs/oracle" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "rawFrame": {
+            "properties": { "scope": { "const": "limited-evidence" } },
+            "required": ["scope"]
+          }
+        },
+        "required": ["rawFrame"]
+      },
+      "then": {
+        "not": {
+          "properties": {
+            "oracle": {
+              "properties": {
+                "vision": {
+                  "properties": {
+                    "reason": { "const": "CANDIDATE_BUDGET_EXCEEDED" }
+                  },
+                  "required": ["reason"]
+                }
+              },
+              "required": ["vision"]
+            }
+          },
+          "required": ["oracle"]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "device", "browser"],
+      "properties": {
+        "kind": { "const": "physical-camera" },
+        "device": { "type": "string", "minLength": 1 },
+        "browser": { "type": "string", "minLength": 1 },
+        "operatingSystem": { "type": "string", "minLength": 1 },
+        "capturedAt": { "type": "string", "format": "date-time" },
+        "notes": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rawFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "rgbaSha256", "preparation", "scope"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "rgbaSha256": { "$ref": "#/$defs/sha256" },
+        "preparation": {
+          "enum": ["unaltered-export", "privacy-crop", "privacy-redacted"]
+        },
+        "scope": {
+          "description": "Only full-camera-frame supports whole-acquisition and candidate-budget claims.",
+          "enum": ["full-camera-frame", "limited-evidence"]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "preparation": { "const": "unaltered-export" } } },
+          "then": { "properties": { "scope": { "const": "full-camera-frame" } } },
+          "else": { "properties": { "scope": { "const": "limited-evidence" } } }
+        }
+      ]
+    },
+    "captureSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "frameRate"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "frameRate": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "actual", "distanceM", "angleDeg"],
+      "properties": {
+        "requested": { "$ref": "#/$defs/captureSettings" },
+        "actual": { "$ref": "#/$defs/captureSettings" },
+        "distanceM": { "type": "number", "minimum": 0 },
+        "angleDeg": { "type": "number", "minimum": -90, "maximum": 90 }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "carrier",
+        "expectedProfile",
+        "palette",
+        "paletteId",
+        "txFps",
+        "canonicalScale",
+        "maxDetectionDimension"
+      ],
+      "properties": {
+        "carrier": { "const": "COLOR_4" },
+        "expectedProfile": { "enum": ["ROBUST", "EXPERIMENTAL"] },
+        "palette": { "enum": ["KCMY", "KRGB"] },
+        "paletteId": { "enum": [0, 1] },
+        "txFps": { "enum": [1, 2, 5, 10] },
+        "canonicalScale": { "enum": [4, 6, 8] },
+        "maxDetectionDimension": { "enum": [960, 1280, "source"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "palette": { "const": "KCMY" } } },
+          "then": { "properties": { "paletteId": { "const": 0 } } },
+          "else": { "properties": { "paletteId": { "const": 1 } } }
+        }
+      ]
+    },
+    "visionValid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "const": "valid" } }
+    },
+    "visionRejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "const": "rejected" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "classifierValid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "profile",
+        "paletteId",
+        "sequencePhase",
+        "codedBytesSha256"
+      ],
+      "properties": {
+        "status": { "const": "valid" },
+        "profile": { "enum": ["ROBUST", "EXPERIMENTAL"] },
+        "paletteId": { "enum": [0, 1] },
+        "sequencePhase": { "enum": [0, 1, 2, 3] },
+        "codedBytesSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "classifierRejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "const": "rejected" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "unwrapValid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "sequence", "innerFrameSha256"],
+      "properties": {
+        "status": { "const": "valid" },
+        "sequence": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "innerFrameSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "unwrapRejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "const": "rejected" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "publicReason", "internalReason", "diagnosticReason"],
+      "properties": {
+        "stage": {
+          "enum": [
+            "geometry",
+            "bootstrap",
+            "calibration",
+            "classification",
+            "rs",
+            "crc",
+            "wire"
+          ]
+        },
+        "publicReason": { "type": "string", "minLength": 1 },
+        "internalReason": { "type": "string", "minLength": 1 },
+        "diagnosticReason": {
+          "type": ["string", "null"],
+          "minLength": 1
+        }
+      }
+    },
+    "oracle": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vision", "rejection"],
+          "properties": {
+            "vision": { "$ref": "#/$defs/visionRejected" },
+            "rejection": { "$ref": "#/$defs/rejection" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vision", "classifier", "rejection"],
+          "properties": {
+            "vision": { "$ref": "#/$defs/visionValid" },
+            "classifier": { "$ref": "#/$defs/classifierRejected" },
+            "rejection": { "$ref": "#/$defs/rejection" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vision", "classifier", "unwrap"],
+          "properties": {
+            "vision": { "$ref": "#/$defs/visionValid" },
+            "classifier": { "$ref": "#/$defs/classifierValid" },
+            "unwrap": { "$ref": "#/$defs/unwrapValid" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vision", "classifier", "unwrap", "rejection"],
+          "properties": {
+            "vision": { "$ref": "#/$defs/visionValid" },
+            "classifier": { "$ref": "#/$defs/classifierValid" },
+            "unwrap": { "$ref": "#/$defs/unwrapRejected" },
+            "rejection": { "$ref": "#/$defs/rejection" }
+          }
+        }
+      ]
+    }
+  }
+}

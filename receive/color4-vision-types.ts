@@ -50,12 +50,18 @@ export interface VisionCandidateScore {
   readonly passSupport: number;
   /** Mean corner spread divided by the candidate's mean side length. */
   readonly normalizedCornerSpread: number;
+  /** Cheap pre-warp rank in the range 0..1. */
+  readonly prewarpScore: number;
+  readonly squareness: number;
+  readonly borderContrast: number;
+  readonly nestingDepth: number;
   readonly area: number;
 }
 
 export type VisionCandidateStatus =
   | "DECODED"
   | "DUPLICATE_ID"
+  | "FIDUCIAL_LOW_CONTRAST"
   | "FIDUCIAL_AMBIGUOUS"
   | "FIDUCIAL_TOO_MANY_ERRORS"
   | "FIDUCIAL_DECODE_FAILED";
@@ -97,11 +103,40 @@ export interface VisionContourCounters {
   readonly quads: number;
   /** Geometric candidates remaining after cross-pass de-duplication. */
   readonly mergedCandidates: number;
+  /** Raw quads observed after cheap geometry filters and before bounded ranking. */
+  readonly candidateCountRaw: number;
+  /** Candidates actually submitted to the expensive 90x90 fiducial warp. */
+  readonly candidateCountRanked: number;
   readonly decoded: number;
   readonly duplicateIds: number;
+  readonly lowContrast: number;
   readonly ambiguous: number;
   readonly tooManyErrors: number;
   readonly decodeFailures: number;
+}
+
+export type VisionWarning =
+  | "CONTOUR_BUDGET_UNIFORMLY_SAMPLED"
+  | "CANDIDATE_BUDGET_RANKED";
+
+export interface VisionOpticalMetrics {
+  /** Mean of the projected top/bottom frame edges. */
+  readonly apparentFrameWidthPx: number;
+  /** Mean of the projected left/right frame edges. */
+  readonly apparentFrameHeightPx: number;
+  readonly pixelsPerModuleX: number;
+  readonly pixelsPerModuleY: number;
+  readonly minimumPixelsPerModule: number;
+  /** Weakest mean horizontal fiducial side among TL/TR/BR/BL. */
+  readonly fiducialWidthPx: number;
+  /** Weakest mean vertical fiducial side among TL/TR/BR/BL. */
+  readonly fiducialHeightPx: number;
+  /** Weakest accepted local white-minus-black fiducial anchor separation. */
+  readonly fiducialContrast: number;
+  /** Weakest Laplacian variance measured inside a normalized fiducial ROI. */
+  readonly blurMetric: number;
+  /** Fraction [0,1] of fully clipped RGB pixels in the canonical active frame. */
+  readonly clippedPixelFraction?: number;
 }
 
 export interface VisionEffectiveConfig {
@@ -121,6 +156,10 @@ export interface VisionEffectiveConfig {
   readonly polygonEpsilonFraction: 0.045;
   readonly maximumContoursPerPass: 50_000;
   readonly maximumQuadProposals: 256;
+  readonly candidateBucketDivisions: 4;
+  readonly maximumCandidatesPerBucket: 8;
+  readonly contourRetrievalMode: "tree" | "list";
+  readonly minimumFiducialContrast: 30;
   readonly maximumFiducialErrors: 4;
 }
 
@@ -128,6 +167,9 @@ export interface VisionDiagnostics {
   readonly config: VisionEffectiveConfig;
   readonly timings: VisionStageTimings;
   readonly counters: VisionContourCounters;
+  readonly warnings: readonly VisionWarning[];
+  /** Available once all four oriented camera-stage fiducials are retained. */
+  readonly optical?: VisionOpticalMetrics;
   /** IDs retained for homography after duplicate resolution. */
   readonly fiducials: Readonly<Partial<Record<FiducialId, VisionFiducialMatch>>>;
   readonly homography: Readonly<{
@@ -179,6 +221,7 @@ export type VisionRejectReason =
   | "ONLY_1_FIDUCIAL"
   | "ONLY_2_FIDUCIALS"
   | "ONLY_3_FIDUCIALS"
+  | "FIDUCIAL_LOW_CONTRAST"
   | "FIDUCIAL_AMBIGUOUS"
   | "FIDUCIAL_TOO_MANY_ERRORS"
   | "QUADS_FOUND_NO_MARKERS"

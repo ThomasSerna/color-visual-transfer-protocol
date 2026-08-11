@@ -9,6 +9,7 @@ import {
 import type {
   BrowserCarrierDiagnostics,
   BrowserVisionDiagnostics,
+  Color4DiagnosticReason,
   VisionTimingKey,
 } from "../shared/carrier";
 import {
@@ -17,6 +18,7 @@ import {
   type VisionResult,
 } from "./color4-vision";
 import { color4SequencePhaseMatches } from "./color4-binding";
+import { canonicalDiagnosticReason, fecDiagnosticReason } from "./color4-diagnostic-reason";
 import type {
   Color4WorkerDebugFrame,
   Color4WorkerDecodeRequest,
@@ -74,6 +76,27 @@ function classifierStage(reason: string): RequiredStage {
   return "classification";
 }
 
+function actionableDiagnosticReason(
+  raster: CanonicalRasterResult | undefined,
+  classifier: readonly CanonicalRasterObservation[],
+  unwrap: readonly Color4UnwrapObservation[],
+  rejectReason: string | undefined,
+): Color4DiagnosticReason | undefined {
+  const fec = fecDiagnosticReason(
+    rejectReason ?? "",
+    unwrap.flatMap((observation) =>
+      observation.stage === "rs" ? observation.shards.map((shard) => shard.reason) : []
+    ),
+  );
+  if (fec !== undefined) return fec;
+  const rejectedStage = classifier.find((observation) => observation.outcome === "rejected")?.stage;
+  return canonicalDiagnosticReason(
+    rejectReason ?? "",
+    raster?.diagnostics,
+    rejectedStage,
+  );
+}
+
 function stageTimings(
   request: Color4WorkerDecodeRequest,
   normalized: VisionResult | undefined,
@@ -115,11 +138,13 @@ function visionDiagnostics(
 ): BrowserVisionDiagnostics {
   const geometry = normalized?.diagnostics;
   const fiducials = geometry?.fiducials;
+  const diagnosticReason = actionableDiagnosticReason(raster, classifier, unwrap, rejectReason);
   return {
     debugEnabled: request.debug.enabled,
     canonicalScale: request.debug.canonicalScale,
     detectionDimension: request.debug.maxDetectionDimension,
     ...(rejectReason === undefined ? {} : { rejectReason }),
+    ...(diagnosticReason === undefined ? {} : { diagnosticReason }),
     timings: stageTimings(request, normalized, classifier, unwrap, workerTotal),
     ...(geometry === undefined
       ? {}
@@ -146,7 +171,10 @@ function visionDiagnostics(
             nonConvex: geometry.counters.nonConvex,
             quads: geometry.counters.quads,
             mergedCandidates: geometry.counters.mergedCandidates,
+            candidateCountRaw: geometry.counters.candidateCountRaw,
+            candidateCountRanked: geometry.counters.candidateCountRanked,
             decodedMarkers: geometry.counters.decoded,
+            lowContrastCandidates: geometry.counters.lowContrast,
             uniqueFiducials: Object.keys(geometry.fiducials).length,
             duplicateIds: geometry.counters.duplicateIds,
             ambiguousCandidates: geometry.counters.ambiguous,
@@ -159,6 +187,8 @@ function visionDiagnostics(
             BR: { found: fiducials?.BR !== undefined, errors: fiducials?.BR?.errors },
             BL: { found: fiducials?.BL !== undefined, errors: fiducials?.BL?.errors },
           },
+          warnings: geometry.warnings,
+          ...(geometry.optical === undefined ? {} : { optical: geometry.optical }),
           homography: geometry.homography,
         }),
     ...(raster === undefined
@@ -169,6 +199,8 @@ function visionDiagnostics(
             fiducialErrorsById: raster.diagnostics.fiducialErrorsById,
             fiducialErrorMax: raster.diagnostics.fiducialErrorMax,
             quietZoneErrors: raster.diagnostics.quietZoneErrors,
+            quietZoneLumaErrors: raster.diagnostics.quietZoneLumaErrors,
+            quietZoneRgbErrors: raster.diagnostics.quietZoneRgbErrors,
             timingErrors: raster.diagnostics.timingErrors,
             timingModules: raster.diagnostics.timingModules,
             calibrationMad: raster.diagnostics.calibrationMad,
@@ -224,10 +256,15 @@ function updateReject(
   diagnostics: MutableDiagnostics,
   stage: RequiredStage,
   reason: string,
+  diagnosticReason?: Color4DiagnosticReason,
 ): void {
   diagnostics.stage = stage;
   diagnostics.rejectReason = reason;
-  diagnostics.vision = { ...diagnostics.vision, rejectReason: reason };
+  diagnostics.vision = {
+    ...diagnostics.vision,
+    rejectReason: reason,
+    ...(diagnosticReason === undefined ? {} : { diagnosticReason }),
+  };
 }
 
 function debugFrame(
@@ -359,7 +396,7 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
         started,
         "palette-selection-mismatch",
       );
-      updateReject(diagnostics, "bootstrap", "palette-selection-mismatch");
+      updateReject(diagnostics, "bootstrap", "palette-selection-mismatch", "BOOTSTRAP");
       postRejected(
         request,
         "unsupported-palette",
@@ -392,10 +429,15 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
     diagnostics.profile = raster.profile.name;
     if (unwrapped.status === "rejected") {
       if (unwrapped.reason === "fec-uncorrectable") {
-        updateReject(diagnostics, "rs", unwrapped.reason);
+        updateReject(
+          diagnostics,
+          "rs",
+          unwrapped.reason,
+          actionableDiagnosticReason(raster, classifierObservations, unwrapObservations, unwrapped.reason),
+        );
         diagnostics.rsFailures = 1;
       } else if (unwrapped.reason === "crc-mismatch") {
-        updateReject(diagnostics, "crc", unwrapped.reason);
+        updateReject(diagnostics, "crc", unwrapped.reason, "CRC_FAILED");
         diagnostics.crcFailures = 1;
       } else updateReject(diagnostics, "wire", unwrapped.reason);
       postRejected(
@@ -407,7 +449,7 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
       return;
     }
     if (!color4SequencePhaseMatches(unwrapped.header.sequence, raster.sequencePhase)) {
-      updateReject(diagnostics, "bootstrap", "sequence-phase-mismatch");
+      updateReject(diagnostics, "bootstrap", "sequence-phase-mismatch", "PHASE");
       postRejected(
         request,
         "identity-mismatch",

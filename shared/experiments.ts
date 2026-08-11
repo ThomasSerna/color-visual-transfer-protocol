@@ -14,6 +14,9 @@ const MAX_STORED_RUNS = 100;
 
 export type ExperimentDirection = "send" | "receive";
 
+/** Capture-quality classes are diagnostic policy, not protocol outcomes. */
+export type CaptureQualityClass = "UNKNOWN" | "UNUSABLE" | "BORDERLINE" | "GOOD";
+
 export interface TimingDistribution {
   readonly count: number;
   readonly average: number;
@@ -26,6 +29,8 @@ export interface TimingDistribution {
 export interface VisionExperimentConditions {
   readonly label?: string;
   readonly expectedTxFps?: 1 | 2 | 5 | 10;
+  readonly expectedProfile?: "ROBUST" | "EXPERIMENTAL";
+  readonly prefilterMode?: "observe" | "enabled";
   readonly distanceM?: 0.3 | 0.5 | 1;
   readonly angleDeg?: 0 | 15;
   readonly brightness?: "high" | "maximum";
@@ -49,7 +54,11 @@ export interface VisionExperimentSummary {
     quads: number;
     /** Absent in schema-v1 records written before multi-pass detection. */
     mergedCandidates?: number;
+    candidateCountRaw?: number;
+    candidateCountRanked?: number;
     decodedMarkers: number;
+    /** Absent in schema-v1 records written before the fiducial contrast gate. */
+    lowContrastCandidates?: number;
     uniqueFiducials: number;
     duplicateIds: number;
     ambiguousCandidates: number;
@@ -65,6 +74,16 @@ export interface VisionExperimentSummary {
     maximumErrors: number;
   }>>>;
   readonly timingsMs: Readonly<Partial<Record<VisionTimingKey, TimingDistribution>>>;
+  readonly warnings?: Readonly<Record<string, number>>;
+  readonly optical?: Readonly<Partial<Record<
+    keyof NonNullable<BrowserVisionDiagnostics["optical"]>,
+    TimingDistribution
+  >>>;
+  /**
+   * Derived only when both worker timing samples and an expected transmitter
+   * rate are available. Absent in older schema-v1 records.
+   */
+  readonly workerP95ExceedsTxFrameInterval?: boolean;
   /** Absent in schema-v1 records written before homography instrumentation. */
   readonly homography?: Readonly<{
     methods: Readonly<Record<string, number>>;
@@ -91,6 +110,16 @@ export interface ExperimentSummary {
   cameraHeight?: number;
   cameraFps?: number;
   captures: number;
+  /** COLOR_4 capture-prefilter telemetry; absent in older schema-v1 records. */
+  stableCaptures?: number;
+  unstableCaptures?: number;
+  stabilityWarmupCaptures?: number;
+  visionSubmissions?: number;
+  skippedUnstable?: number;
+  skippedRedundantStable?: number;
+  /** Bounded distribution of normalized inter-frame difference scores. */
+  stabilityScore?: TimingDistribution;
+  qualityClassCounts?: Readonly<Record<CaptureQualityClass, number>>;
   skippedWhileBusy: number;
   carrierAttempts: number;
   candidates: number;
@@ -124,10 +153,34 @@ export interface ExperimentExport {
   history: ExperimentSummary[];
 }
 
+/**
+ * A worker that takes longer than one transmitted-frame interval cannot keep
+ * pace with every distinct sender frame. Invalid or unavailable inputs are
+ * deliberately non-warning so optional diagnostics never break a transfer.
+ */
+export function workerP95ExceedsTxFrameInterval(
+  workerP95Ms: number | undefined,
+  expectedTxFps: number | undefined,
+): boolean {
+  return workerP95Ms !== undefined &&
+    expectedTxFps !== undefined &&
+    Number.isFinite(workerP95Ms) &&
+    Number.isFinite(expectedTxFps) &&
+    workerP95Ms >= 0 &&
+    expectedTxFps > 0 &&
+    workerP95Ms > 1_000 / expectedTxFps;
+}
+
 export class ExperimentMetrics {
   readonly startedAt = new Date().toISOString();
   readonly startedAtMs: number;
   captures = 0;
+  stableCaptures = 0;
+  unstableCaptures = 0;
+  stabilityWarmupCaptures = 0;
+  visionSubmissions = 0;
+  skippedUnstable = 0;
+  skippedRedundantStable = 0;
   skippedWhileBusy = 0;
   carrierAttempts = 0;
   candidates = 0;
@@ -143,13 +196,25 @@ export class ExperimentMetrics {
   erasureBytes = 0;
   private readonly latencySamples: number[] = [];
   private readonly erasureSamples: number[] = [];
+  private readonly stabilityScoreSamples: number[] = [];
+  private readonly qualityClassCounts: Record<CaptureQualityClass, number> = {
+    UNKNOWN: 0,
+    UNUSABLE: 0,
+    BORDERLINE: 0,
+    GOOD: 0,
+  };
   private visionSeen = false;
   private visionDebugEnabled = false;
   private visionConfiguration: VisionExperimentSummary["configuration"];
   private visionConditions: VisionExperimentConditions | undefined;
   private readonly visionRejectReasons = new Map<string, number>();
   private readonly visionStageRejections = new Map<string, number>();
+  private readonly visionWarnings = new Map<string, number>();
   private readonly visionTimings = new Map<VisionTimingKey, number[]>();
+  private readonly visionOptical = new Map<
+    keyof NonNullable<BrowserVisionDiagnostics["optical"]>,
+    number[]
+  >();
   private readonly visionDetection: Record<
     | "contours"
     | "areaTooSmall"
@@ -158,7 +223,10 @@ export class ExperimentMetrics {
     | "nonConvex"
     | "quads"
     | "mergedCandidates"
+    | "candidateCountRaw"
+    | "candidateCountRanked"
     | "decodedMarkers"
+    | "lowContrastCandidates"
     | "uniqueFiducials"
     | "duplicateIds"
     | "ambiguousCandidates"
@@ -173,7 +241,10 @@ export class ExperimentMetrics {
     nonConvex: 0,
     quads: 0,
     mergedCandidates: 0,
+    candidateCountRaw: 0,
+    candidateCountRanked: 0,
     decodedMarkers: 0,
+    lowContrastCandidates: 0,
     uniqueFiducials: 0,
     duplicateIds: 0,
     ambiguousCandidates: 0,
@@ -207,8 +278,43 @@ export class ExperimentMetrics {
     this.captures++;
   }
 
+  recordStableCapture(stabilityScore?: number): void {
+    this.stableCaptures++;
+    this.recordStabilityScore(stabilityScore);
+  }
+
+  recordUnstableCapture(stabilityScore?: number): void {
+    this.unstableCaptures++;
+    this.recordStabilityScore(stabilityScore);
+  }
+
+  recordStabilityWarmupCapture(): void {
+    this.stabilityWarmupCaptures++;
+  }
+
+  recordVisionSubmission(): void {
+    this.visionSubmissions++;
+  }
+
+  recordSkippedUnstable(): void {
+    this.skippedUnstable++;
+  }
+
+  recordSkippedRedundantStable(): void {
+    this.skippedRedundantStable++;
+  }
+
+  recordQualityClass(qualityClass: CaptureQualityClass): void {
+    this.qualityClassCounts[qualityClass]++;
+  }
+
   recordSkippedWhileBusy(): void {
     this.skippedWhileBusy++;
+  }
+
+  private recordStabilityScore(value: number | undefined): void {
+    if (value === undefined || !Number.isFinite(value)) return;
+    this.pushBounded(this.stabilityScoreSamples, Math.min(1, Math.max(0, value)));
   }
 
   setProfile(profile: string | undefined): void {
@@ -269,11 +375,25 @@ export class ExperimentMetrics {
       };
     }
     if (status === "rejected") {
-      const reason = vision.rejectReason ?? diagnostics.rejectReason ?? "unknown";
+      const reason = vision.diagnosticReason ?? vision.rejectReason ?? diagnostics.rejectReason ?? "unknown";
       this.increment(this.visionRejectReasons, reason);
       this.increment(this.visionStageRejections, diagnostics.stage ?? "unknown");
     }
     this.addDetection(vision.detection);
+    for (const warning of vision.warnings ?? []) this.increment(this.visionWarnings, warning);
+    if (vision.optical) {
+      for (const [key, raw] of Object.entries(vision.optical) as Array<
+        [keyof NonNullable<BrowserVisionDiagnostics["optical"]>, number]
+      >) {
+        if (!Number.isFinite(raw)) continue;
+        let samples = this.visionOptical.get(key);
+        if (!samples) {
+          samples = [];
+          this.visionOptical.set(key, samples);
+        }
+        this.pushBounded(samples, Math.max(0, raw));
+      }
+    }
     if (vision.homography) {
       this.increment(this.homographyMethods, vision.homography.method);
       if (vision.homography.refinementAttempted) this.homographyRefinementAttempts++;
@@ -365,6 +485,18 @@ export class ExperimentMetrics {
     const now = input.now ?? Date.now();
     const elapsedMs = Math.max(0, now - this.startedAtMs);
     const decodeLatencyMs = distribution(this.latencySamples);
+    const color4CaptureTelemetry = this.carrier !== "COLOR_4"
+      ? {}
+      : {
+          stableCaptures: this.stableCaptures,
+          unstableCaptures: this.unstableCaptures,
+          stabilityWarmupCaptures: this.stabilityWarmupCaptures,
+          visionSubmissions: this.visionSubmissions,
+          skippedUnstable: this.skippedUnstable,
+          skippedRedundantStable: this.skippedRedundantStable,
+          stabilityScore: distribution(this.stabilityScoreSamples),
+          qualityClassCounts: { ...this.qualityClassCounts },
+        };
     return {
       schemaVersion: 1,
       startedAt: this.startedAt,
@@ -379,6 +511,7 @@ export class ExperimentMetrics {
       cameraHeight: input.cameraHeight,
       cameraFps: input.cameraFps,
       captures: this.captures,
+      ...color4CaptureTelemetry,
       skippedWhileBusy: this.skippedWhileBusy,
       carrierAttempts: this.carrierAttempts,
       candidates: this.candidates,
@@ -415,6 +548,9 @@ export class ExperimentMetrics {
     if (!this.visionSeen) return undefined;
     const timingsMs: Partial<Record<VisionTimingKey, TimingDistribution>> = {};
     for (const [stage, samples] of this.visionTimings) timingsMs[stage] = distribution(samples);
+    const workerP95Ms = timingsMs.workerTotal?.p95;
+    const expectedTxFps = this.visionConditions?.expectedTxFps;
+    const hasWorkerPressureInputs = workerP95Ms !== undefined && expectedTxFps !== undefined;
     const fiducials = Object.fromEntries(
       (["TL", "TR", "BR", "BL"] as const).map((id) => {
         const value = this.visionFiducials[id];
@@ -427,6 +563,9 @@ export class ExperimentMetrics {
         }];
       }),
     ) as VisionExperimentSummary["fiducials"];
+    const optical = Object.fromEntries(
+      [...this.visionOptical].map(([key, samples]) => [key, distribution(samples)]),
+    ) as VisionExperimentSummary["optical"];
     return {
       debugEnabled: this.visionDebugEnabled,
       configuration: this.visionConfiguration,
@@ -436,6 +575,16 @@ export class ExperimentMetrics {
       detection: { ...this.visionDetection },
       fiducials,
       timingsMs,
+      ...(this.visionWarnings.size === 0 ? {} : { warnings: Object.fromEntries(this.visionWarnings) }),
+      ...(this.visionOptical.size === 0 ? {} : { optical }),
+      ...(hasWorkerPressureInputs
+        ? {
+            workerP95ExceedsTxFrameInterval: workerP95ExceedsTxFrameInterval(
+              workerP95Ms,
+              expectedTxFps,
+            ),
+          }
+        : {}),
       homography: {
         methods: Object.fromEntries(this.homographyMethods),
         refinementAttempts: this.homographyRefinementAttempts,

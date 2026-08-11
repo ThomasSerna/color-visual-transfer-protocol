@@ -1,5 +1,6 @@
 import type { ExperimentSummary, VisionExperimentConditions } from "../shared/experiments";
 import { createStoredZip } from "../shared/zip-store";
+import { sha256Hex } from "../shared/sha256";
 import {
   QUIET_MODULES,
   createPhysicalLayout,
@@ -49,6 +50,18 @@ export function objectFitCoverProjection(
 
 interface DebugControllerOptions {
   readonly currentExperiment: () => ExperimentSummary | undefined;
+  readonly snapshotContext: () => Readonly<{
+    requested: Readonly<{
+      width: number | "max";
+      height?: number;
+      fps: number;
+    }>;
+    actual?: Readonly<{
+      width?: number;
+      height?: number;
+      fps?: number;
+    }>;
+  }>;
 }
 
 const viewLabels: Readonly<Record<VisionDebugView, string>> = {
@@ -78,6 +91,8 @@ export class VisionDebugController {
   private readonly detectionInput = required<HTMLSelectElement>("cfg-debug-detection");
   private readonly labelInput = required<HTMLInputElement>("cfg-debug-label");
   private readonly txInput = required<HTMLSelectElement>("cfg-debug-tx");
+  private readonly profileInput = required<HTMLSelectElement>("cfg-debug-profile");
+  private readonly prefilterInput = required<HTMLSelectElement>("cfg-debug-prefilter");
   private readonly distanceInput = required<HTMLSelectElement>("cfg-debug-distance");
   private readonly angleInput = required<HTMLSelectElement>("cfg-debug-angle");
   private readonly brightnessInput = required<HTMLSelectElement>("cfg-debug-brightness");
@@ -104,7 +119,6 @@ export class VisionDebugController {
       this.generationValue++;
       if (!this.enabled) {
         this.latest = undefined;
-        this.cancelSnapshot("Debug Vision is off. No debug images were retained.");
       }
       this.applyVisibility();
     });
@@ -117,7 +131,7 @@ export class VisionDebugController {
       this.clearCanvases();
     });
     this.snapshotButton.addEventListener("click", () => {
-      if (!this.enabled || !this.transferActive || this.snapshotBusy) return;
+      if (!this.transferActive || this.snapshotBusy) return;
       this.snapshotEpoch++;
       this.snapshotArmed = true;
       this.snapshotButton.disabled = true;
@@ -149,11 +163,25 @@ export class VisionDebugController {
       : numberChoice<960 | 1280>(this.detectionInput);
   }
 
+  get prefilterMode(): "observe" | "enabled" {
+    return this.prefilterInput.value === "enabled" ? "enabled" : "observe";
+  }
+
+  get snapshotPending(): boolean {
+    return this.snapshotArmed || this.snapshotBusy;
+  }
+
   conditions(): VisionExperimentConditions {
     const label = this.labelInput.value.trim();
+    const expectedProfile = this.profileInput.value === "ROBUST" ||
+        this.profileInput.value === "EXPERIMENTAL"
+      ? this.profileInput.value
+      : undefined;
     return {
       label: label.length > 0 ? label : undefined,
       expectedTxFps: numberChoice<1 | 2 | 5 | 10>(this.txInput),
+      expectedProfile,
+      prefilterMode: this.prefilterMode,
       distanceM: numberChoice<0.3 | 0.5 | 1>(this.distanceInput),
       angleDeg: numberChoice<0 | 15>(this.angleInput),
       brightness: this.brightnessInput.value as "high" | "maximum",
@@ -188,6 +216,8 @@ export class VisionDebugController {
       this.detectionInput,
       this.labelInput,
       this.txInput,
+      this.profileInput,
+      this.prefilterInput,
       this.distanceInput,
       this.angleInput,
       this.brightnessInput,
@@ -200,8 +230,10 @@ export class VisionDebugController {
   }
 
   handleFrame(frame: Color4DebugFrame): void {
-    if (!this.enabled || !this.transferActive || frame.generation !== this.generationValue) return;
+    if (!this.transferActive) return;
     if (frame.snapshot) void this.downloadSnapshot(frame, this.snapshotEpoch);
+    if (frame.generation !== this.generationValue) return;
+    if (!this.enabled) return;
     this.latest = frame;
     this.renderOverlay();
     // Geometry overlays may follow every processed frame, but copying a full
@@ -231,7 +263,7 @@ export class VisionDebugController {
     const visible = this.enabled && this.transferActive;
     this.overlayWrap.hidden = !visible;
     this.output.hidden = !visible;
-    this.snapshotButton.disabled = !visible || this.snapshotBusy || this.snapshotArmed;
+    this.snapshotButton.disabled = !this.transferActive || this.snapshotBusy || this.snapshotArmed;
     if (!visible) this.clearCanvases();
   }
 
@@ -240,7 +272,7 @@ export class VisionDebugController {
     this.snapshotArmed = false;
     this.snapshotBusy = false;
     this.snapshotStatus.textContent = message;
-    this.snapshotButton.disabled = !this.enabled || !this.transferActive;
+    this.snapshotButton.disabled = !this.transferActive;
   }
 
   private clearCanvases(): void {
@@ -476,6 +508,11 @@ export class VisionDebugController {
       const raw = frame.artifacts.planes.raw;
       const threshold = frame.artifacts.planes.threshold;
       const warped = frame.artifacts.planes.warped;
+      const rgbaSha256 = raw ? await sha256Hex(raw.pixels) : undefined;
+      const camera = this.options.snapshotContext();
+      const observedProfile = frame.profileId === undefined
+        ? undefined
+        : getColor4Profile(frame.profileId)?.name;
       if (raw) entries.push({ name: `${base}-raw.png`, data: await this.planePng(raw), modifiedAt: generatedAt });
       if (threshold) entries.push({ name: `${base}-threshold.png`, data: await this.planePng(threshold), modifiedAt: generatedAt });
       if (warped) entries.push({ name: `${base}-warped.png`, data: await this.planePng(warped), modifiedAt: generatedAt });
@@ -489,15 +526,28 @@ export class VisionDebugController {
         browser: navigator.userAgent,
         build: document.querySelector(".footer-build")?.textContent?.trim(),
         configuration: {
+          carrier: "COLOR_4",
           view: frame.view,
           canonicalScale: frame.artifacts.metadata.canonicalScale,
           maxDetectionDimension: frame.maxDetectionDimension,
           paletteId: frame.paletteId,
           palette: frame.paletteId === 0 ? "KCMY" : "KRGB",
+          prefilterMode: this.prefilterMode,
+          expectedProfile: this.conditions().expectedProfile,
+          observedProfile,
+          declaredTxFps: this.conditions().expectedTxFps,
+          requestedCamera: camera.requested,
+          actualCamera: camera.actual,
         },
         conditions: this.conditions(),
         artifacts: {
-          raw: { available: raw !== undefined, width: raw?.width, height: raw?.height },
+          raw: {
+            available: raw !== undefined,
+            width: raw?.width,
+            height: raw?.height,
+            rgbaRowStride: raw === undefined ? undefined : raw.width * 4,
+            rgbaSha256,
+          },
           threshold: { available: threshold !== undefined, width: threshold?.width, height: threshold?.height },
           warped: { available: warped !== undefined, width: warped?.width, height: warped?.height },
         },

@@ -190,6 +190,93 @@ materially reduces that residual. Confidence thresholds derive from
 calibration-swatch MAD and are corpus-tuned, not wire constants. All temporary
 `cv.Mat` and `ImageBitmap` objects must be released.
 
+### Acquisition and temporal stability
+
+Camera constraints and frame scheduling are reference-receiver policy, not
+COLOR_4/1 wire constants. QR defaults to 1280-wide capture at 60 fps. COLOR_4
+defaults to 1920 at 30 fps and exposes 15 fps plus a best-effort `max supported`
+width. For a numeric COLOR_4 width, the receiver attempts exact selected
+width/FPS, exact 1280/FPS fallback when different, and finally an ideal request.
+`max supported` first opens 1280 safely and then applies the capability-reported
+maximum width if the track accepts it. Requested and actual `getSettings()`
+values are recorded separately; negotiation failure above 1280 is never a
+protocol failure.
+
+Before allocating the full-resolution capture, the reference receiver draws a
+64×48 fingerprint. Each sample is rounded BT.709 luma:
+
+```text
+Y = round(0.2126 R + 0.7152 G + 0.0722 B)
+```
+
+For each of the 48 row-major 8×8 blocks `b`, consecutive fingerprints produce:
+
+```text
+blockMae[b] = sum(abs(Ycurrent - Yprevious)) / (64 * 255)
+stabilityScore = nearestRankP90(blockMae[0..47])
+stable = stabilityScore <= 0.025
+```
+
+The first observation is `warmup`. In `observe` mode all states remain eligible
+for vision under the normal one-frame-in-flight rule and the result is telemetry
+only. In `enabled` mode warmup and unstable captures are dropped before the
+heavy path; only the first stable capture in a display interval is submitted,
+except that a pending diagnostic snapshot may request another. This threshold
+is an acquisition experiment constant and MUST NOT be interpreted as a PHY
+compatibility boundary.
+
+### Candidate ranking and optical diagnostics
+
+Excess contours or quads no longer reject an otherwise usable camera frame
+solely because a global proposal count was crossed. If a threshold pass returns
+more than 50,000 contours, the receiver examines 50,000 uniformly distributed
+indices and records `CONTOUR_BUDGET_UNIFORMLY_SAMPLED`. Cheap valid quads are
+ranked before the 90×90 fiducial warp by:
+
+```text
+prewarpScore =
+    0.5 * squareness
+  + 0.3 * clamp(borderContrast / 96)
+  + 0.2 * clamp(nestingDepth / 3)
+```
+
+Candidates are partitioned by 4-way x position, 4-way y position and 4-way
+log-area band; only the best eight are retained per bucket. Cross-threshold
+duplicates are merged and final ranking prefers threshold-pass support,
+pre-warp score, nesting, contrast, square-ness and low corner spread before
+keeping at most 256 expensive decodes. Truncation records
+`CANDIDATE_BUDGET_RANKED`; it is a warning, not a rejection. The detector also
+requires at least 30 luma levels of local fiducial contrast before Hamming
+decode. This early detection gate is distinct from the 40-level canonical
+black/white requirement below.
+
+Once four oriented camera-stage fiducials exist, internal `VisionDiagnostics`
+reports projective optical measurements. A homography from the four known
+logical fiducial centres to their observed centres projects the four corners of
+the complete 172-module frame. With projected corners TL/TR/BR/BL:
+
+```text
+apparentFrameWidthPx  = (distance(TL, TR) + distance(BL, BR)) / 2
+apparentFrameHeightPx = (distance(TL, BL) + distance(TR, BR)) / 2
+pixelsPerModuleX      = apparentFrameWidthPx / 172
+pixelsPerModuleY      = apparentFrameHeightPx / 172
+minimumPixelsPerModule = min(top, right, bottom, left) / 172
+```
+
+`fiducialWidthPx` and `fiducialHeightPx` are the weakest, across the four
+markers, of each marker's mean opposing horizontal/vertical edges.
+`fiducialContrast` is the weakest accepted local white-minus-black separation.
+`blurMetric` is the weakest variance of the four-neighbour discrete Laplacian
+inside a normalized 90×90 fiducial ROI. `clippedPixelFraction` is the fraction
+in `[0,1]` of active-frame pixels whose three RGB channels are all at `<= 1` or
+`>= 254` after canonical warping. The optical object is bridged into
+`BrowserVisionDiagnostics`, so snapshots and experiment exports can report it;
+clipping is absent until a canonical warp exists. For physical interpretation only, below
+4 px/module is very poor, 4–5 risky, 5–6 borderline and at least 6 preferred;
+these bands are warnings, not device-independent validity gates.
+
+### Canonical validation
+
 Canonical monochrome validation estimates black from the border and white from
 the ring of each fiducial independently. Every local pair must be finite,
 ordered and provide at least 40 luminance levels of contrast. Fiducials use
@@ -207,9 +294,34 @@ distributed samples may be non-white or uncertain. This is a receiver
 fail-closed policy: a missing, dark or coloured side still rejects while
 isolated contamination at an extreme canonical corner cannot decide a frame.
 
-The reference implementation fails closed when one threshold pass exceeds
-50,000 contours or the merged search would require more than 256 raw quad
-proposals. These are receiver resource budgets, not PHY wire constants.
+### Internal rejection localization
+
+The browser may attach an optional `diagnosticReason` after rejection:
+
+```text
+CANONICAL_DIMENSIONS
+FIDUCIAL_CANONICAL
+QUIET_ZONE_LUMA
+QUIET_ZONE_RGB
+TIMING
+BOOTSTRAP
+PHASE
+CALIBRATION
+COLOR_CLASSIFICATION_TOO_UNCERTAIN
+RS_FAILED
+CRC_FAILED
+```
+
+This is additive, browser-only diagnostics. It is not serialized in COLOR_4,
+does not replace the lower-level `rejectReason`, and MUST NOT make a rejected
+frame eligible for the fountain decoder. Early contour, fiducial-detection and
+homography failures can remain expressed by their existing vision reject reason
+without a second `diagnosticReason`.
+
+Real-camera fixtures and repeated A–E hardware runs remain an external release
+gate, not normative protocol vectors. Synthetic/corpus/E2E success alone cannot
+establish physical acquisition success. See
+[benchmarking](benchmarking.md) and the [Debug Vision capture protocol](../user/debug-vision.md).
 
 ## Security and resource limits
 

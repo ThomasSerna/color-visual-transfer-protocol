@@ -11,7 +11,10 @@ import {
  * here makes the degraded project exercise the same contract as the baseline
  * without running or copying the rest of the browser suite.
  */
-export async function expectColor4CameraReconstruction(page: Page): Promise<void> {
+export async function expectColor4CameraReconstruction(
+  page: Page,
+  options: { readonly prefilterMode?: "observe" | "enabled" } = {},
+): Promise<void> {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   const openCvLoaded = page.waitForResponse(
@@ -19,6 +22,10 @@ export async function expectColor4CameraReconstruction(page: Page): Promise<void
   );
   await page.goto("/receive/");
   await page.locator("#carrier-color-option").click();
+  if (options.prefilterMode === "enabled") {
+    await page.locator("details:has(> summary:text-is('Debug Vision')) > summary").click();
+    await page.locator("#cfg-debug-prefilter").selectOption("enabled");
+  }
   await page.locator("#settings > summary").click();
   await page.locator("#cfg-color-palette").selectOption("0");
   await expect(page.locator("#cfg-color-palette")).toHaveValue("0");
@@ -59,6 +66,13 @@ export async function expectColor4CameraReconstruction(page: Page): Promise<void
       success: boolean;
       cameraWidth?: number;
       cameraHeight?: number;
+      captures: number;
+      stableCaptures?: number;
+      unstableCaptures?: number;
+      stabilityWarmupCaptures?: number;
+      visionSubmissions?: number;
+      skippedUnstable?: number;
+      skippedRedundantStable?: number;
       validFrames: number;
       newFrames: number;
       duplicateFrames: number;
@@ -85,5 +99,18 @@ export async function expectColor4CameraReconstruction(page: Page): Promise<void
   );
   expect(metrics.history[0]!.resolvedBlocks).toBe(2);
   expect(metrics.history[0]!.crcFailures).toBe(0);
+  expect(
+    (metrics.history[0]!.stableCaptures ?? 0) +
+      (metrics.history[0]!.unstableCaptures ?? 0) +
+      (metrics.history[0]!.stabilityWarmupCaptures ?? 0),
+  ).toBe(metrics.history[0]!.captures);
+  if (options.prefilterMode === "enabled") {
+    expect(metrics.history[0]!.skippedUnstable).toBeGreaterThan(0);
+    expect(metrics.history[0]!.skippedRedundantStable).toBeGreaterThan(0);
+    expect(metrics.history[0]!.visionSubmissions).toBeLessThan(metrics.history[0]!.captures);
+  } else {
+    expect(metrics.history[0]!.skippedUnstable).toBe(0);
+    expect(metrics.history[0]!.skippedRedundantStable).toBe(0);
+  }
   expect(errors).toEqual([]);
 }

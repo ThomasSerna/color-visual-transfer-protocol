@@ -45,30 +45,52 @@ history. Each summary includes negotiated camera resolution/fps, captures,
 busy-worker skips, candidates, geometry/bootstrap/calibration rejections,
 uncertain cells, RS corrections/failures, CRC failures, valid/new/duplicate
 frames, solved blocks, decode-latency statistics, container bitrate and file
-goodput when available. **Clear history** deletes these summaries but not app
-preferences. Use this export for paired QR/COLOR_4 benchmark runs.
+goodput when available. COLOR_4 runs additionally record stability warmup,
+stable/unstable captures, vision submissions, unstable/redundant-stable skips
+and the bounded normalized stability-score distribution. **Clear history**
+deletes these summaries but not app preferences. Use this export for paired
+QR/COLOR_4 benchmark runs.
 
 ## Receive settings
 
-Width and capture fps are applied live where the camera permits it. The fps
-picker follows the carrier default until you choose a rate manually; that
-manual choice then remains in force for the page session. If a device refuses
-reconfiguration, the current stream continues and the UI reports that a restart
-is needed. The line below the controls reports the actually negotiated camera
-settings.
+Width and capture fps are applied live where the camera permits it. Each
+carrier has its own default and remembers its own manual choices for the page
+session. If a device refuses reconfiguration, the current stream continues and
+the UI reports that a restart is needed. The line below the controls reports
+the actually negotiated camera settings; those values, rather than the request,
+are authoritative.
 
 | Setting | Default | Notes |
 |---|---:|---|
-| capture width | 1280 | 1920 adds sampling cost; 960 can help weak CPUs |
+| QR capture width | 1280 | selectable 960, 1280 or 1920 |
+| COLOR_4 capture width | 1920 | selectable 960, 1280, 1920 or **max supported** |
 | QR capture fps | 60 | unsupported rates are disabled; some devices negotiate 30 |
-| COLOR_4 capture fps | 30 | lowers vision-worker pressure and camera motion artifacts |
+| COLOR_4 capture fps | 30 | selectable 15 or 30; resolution and stability take priority over 60 |
 | QR decode workers | 2 | independent ZXing workers; busy workers discard captures |
 | COLOR_4 palette | KCMY | must match the sender; KRGB is Labs only |
+
+For a numeric COLOR_4 width, startup first requests that width and FPS exactly.
+If it is unavailable, the receiver tries 1280 at the requested FPS, then a
+non-fatal ideal request for the originally selected width. **max supported**
+opens a safe 1280 stream and then best-effort applies the maximum width reported
+by camera capabilities. A failed maximum upgrade is not fatal. Camera height
+remains an ideal 4:3 hint because not every sensor exposes that shape at every
+width.
 
 COLOR_4 uses one OpenCV vision worker and keeps only one image in flight. If it
 is busy, the next capture is deliberately discarded; this protects latency and
 memory, and the fountain layer absorbs the loss.
 
-For stage-by-stage overlays, a one-frame diagnostic ZIP and the reproducible
-60-second physical baseline, see [Debug Vision](debug-vision.md). Debug snapshots
-contain a real camera image and should be reviewed before sharing.
+Before that worker, COLOR_4 measures motion using a 64×48 BT.709-luma
+fingerprint. It compares 8×8 blocks, uses normalized p90 mean absolute error,
+and treats scores at or below `0.025` as stable. The default **observe
+(shadow)** mode records the decision without dropping captures. **enabled**
+skips warmup/unstable captures and submits only the first stable capture after
+each detected transition. This is an experimental receiver policy, not a wire
+protocol relaxation.
+
+For stage-by-stage overlays, the exact-RAW diagnostic ZIP and the reproducible
+A–E physical protocol, see [Debug Vision](debug-vision.md). Snapshot JSON records
+requested/actual camera settings and SHA-256 of the pre-processing RGBA bytes.
+Debug snapshots contain a real camera image and should be reviewed before
+sharing.

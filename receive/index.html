@@ -138,13 +138,15 @@
                 <div class="row">
                   <label>run label<input id="cfg-debug-label" type="text" maxlength="80" placeholder="baseline-01" /></label>
                   <label>TX fps<select id="cfg-debug-tx"><option>1</option><option>2</option><option selected>5</option><option>10</option></select></label>
+                  <label>expected profile<select id="cfg-debug-profile"><option value="ROBUST" selected>ROBUST</option><option value="EXPERIMENTAL">EXPERIMENTAL</option><option value="">unknown</option></select></label>
+                  <label>stability prefilter<select id="cfg-debug-prefilter"><option value="observe" selected>observe (shadow)</option><option value="enabled">enabled</option></select></label>
                   <label>distance<select id="cfg-debug-distance"><option>0.3</option><option selected>0.5</option><option>1</option></select></label>
                   <label>angle<select id="cfg-debug-angle"><option value="0" selected>0°</option><option value="15">15°</option></select></label>
                   <label>brightness<select id="cfg-debug-brightness"><option value="high">high</option><option value="maximum" selected>maximum</option></select></label>
                 </div>
               </fieldset>
-              <button id="capture-debug-snapshot" class="secondary-button" type="button" disabled>Capture debug snapshot</button>
-              <p class="hint" id="debug-snapshot-status">Off by default. A snapshot ZIP contains a real camera image and is never stored by CVTP.</p>
+              <button id="capture-debug-snapshot" class="secondary-button" type="button" disabled>Capture raw camera frame + diagnostics</button>
+              <p class="hint" id="debug-snapshot-status">Available during a COLOR_4 session even when live debug is off. The ZIP contains a real camera image and is never stored by CVTP.</p>
             </details>
           </aside>
 

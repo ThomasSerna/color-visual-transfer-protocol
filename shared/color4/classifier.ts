@@ -92,6 +92,9 @@ export interface CanonicalRasterDiagnostics {
   readonly fiducialErrorsById: Readonly<Record<FiducialId, number>>;
   readonly fiducialErrorMax: number;
   readonly quietZoneErrors: number;
+  /** Luminance failures and per-channel RGB failures are reported separately. */
+  readonly quietZoneLumaErrors: number;
+  readonly quietZoneRgbErrors: number;
   readonly timingErrors: number;
   readonly timingModules: number;
   readonly calibrationMad: number;
@@ -249,6 +252,8 @@ interface MutableDiagnostics {
   fiducialErrorsById: Readonly<Record<FiducialId, number>>;
   fiducialErrorMax: number;
   quietZoneErrors: number;
+  quietZoneLumaErrors: number;
+  quietZoneRgbErrors: number;
   timingErrors: number;
   timingModules: number;
   calibrationMad: number;
@@ -287,6 +292,8 @@ function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics 
     fiducialErrorsById: Object.freeze({ TL: 0, TR: 0, BR: 0, BL: 0 }),
     fiducialErrorMax: 0,
     quietZoneErrors: 0,
+    quietZoneLumaErrors: 0,
+    quietZoneRgbErrors: 0,
     timingErrors: 0,
     timingModules: 0,
     calibrationMad: 0,
@@ -563,21 +570,25 @@ function countQuietZoneErrors(
   sampler: ModuleSampler,
   anchors: SpatialBinaryAnchorModel,
   rgbAnchors: SpatialRgbBinaryAnchorModel,
-): number {
+): { readonly combined: number; readonly luma: number; readonly rgb: number } {
   const depth = Math.floor(QUIET_MODULES / 2);
   const far = TOTAL_MODULES - 1 - depth;
   let errors = 0;
+  let lumaErrors = 0;
+  let rgbErrors = 0;
   const check = (x: number, y: number): void => {
     const sample = sampler.sampleLogical(x, y);
     const localRgb = rgbAnchors.atLogical(x, y);
-    const isWhite = binaryModule(sample, anchors.atLogical(x, y)) === 0 &&
-      sample.every((channel, index) => {
+    const lumaWhite = binaryModule(sample, anchors.atLogical(x, y)) === 0;
+    const rgbWhite = sample.every((channel, index) => {
         const black = localRgb.black[index]!;
         const white = localRgb.white[index]!;
         const normalized = (channel - black) / (white - black);
         return Number.isFinite(normalized) && normalized >= BINARY_WHITE_MINIMUM;
       });
-    if (!isWhite) errors++;
+    if (!lumaWhite) lumaErrors++;
+    if (!rgbWhite) rgbErrors++;
+    if (!lumaWhite || !rgbWhite) errors++;
   };
   for (let index = 0; index < QUIET_ZONE_SAMPLES_PER_EDGE; index++) {
     const position = QUIET_MODULES + Math.floor(
@@ -588,7 +599,7 @@ function countQuietZoneErrors(
     check(depth, position);
     check(far, position);
   }
-  return errors;
+  return { combined: errors, luma: lumaErrors, rgb: rgbErrors };
 }
 
 function countTimingErrors(
@@ -1004,7 +1015,10 @@ export function decodeCanonicalColor4Raster(
   values.fiducialErrors = fiducialErrors.total;
   values.fiducialErrorsById = fiducialErrors.byId;
   values.fiducialErrorMax = fiducialErrors.maximum;
-  values.quietZoneErrors = countQuietZoneErrors(sampler, anchors, rgbAnchors);
+  const quietZone = countQuietZoneErrors(sampler, anchors, rgbAnchors);
+  values.quietZoneErrors = quietZone.combined;
+  values.quietZoneLumaErrors = quietZone.luma;
+  values.quietZoneRgbErrors = quietZone.rgb;
   if (
     values.fiducialErrorMax > thresholds.maximumFiducialErrors ||
     values.quietZoneErrors > MAXIMUM_QUIET_ZONE_ERRORS
