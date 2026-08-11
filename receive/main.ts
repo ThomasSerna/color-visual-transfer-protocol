@@ -144,16 +144,19 @@ let visionDebugPromise: Promise<VisionDebugController> | null = null;
 let experiment: ExperimentMetrics | null = null;
 let latestExperiment: ExperimentSummary | undefined;
 let experimentSave: Promise<void> = Promise.resolve();
-let negotiatedCamera:
-  | { cameraWidth?: number; cameraHeight?: number; cameraFps?: number }
-  | undefined;
-let requestedCamera: {
+type RequestedCameraSettings = Readonly<{
   width: CaptureWidthChoice;
   height?: number;
   fps: number;
-} = { width: 1280, height: 960, fps: 60 };
+}>;
+let negotiatedCamera:
+  | { cameraWidth?: number; cameraHeight?: number; cameraFps?: number }
+  | undefined;
+let requestedCamera: RequestedCameraSettings = { width: 1280, height: 960, fps: 60 };
+let receiveSettingsQueue: Promise<void> = Promise.resolve();
 let captureStability: CaptureStabilityTracker | null = null;
-let stableIntervalSubmitted = false;
+let stableIntervalEpoch = 0;
+let validatedStableIntervalEpoch: number | undefined;
 
 const COLOR4_STABILITY_THRESHOLD = 0.025;
 
@@ -223,22 +226,43 @@ function captureWidthChoice(): CaptureWidthChoice {
   return width === 960 || width === 1920 ? width : 1280;
 }
 
+function requestedCameraFromControls(): RequestedCameraSettings {
+  const width = captureWidthChoice();
+  const fps = Number(cfgCapFps.value);
+  return {
+    width,
+    ...(width === "max" ? {} : { height: Math.round((width * 3) / 4) }),
+    fps,
+  };
+}
+
+function resetStableIntervalDedupe(): void {
+  stableIntervalEpoch = 0;
+  validatedStableIntervalEpoch = undefined;
+}
+
 async function ensureVisionDebugController(): Promise<VisionDebugController> {
   if (!__COLOR4_ENABLED__) throw new Error("Debug Vision is unavailable in this build.");
   if (visionDebugController) return visionDebugController;
   visionDebugPromise ??= import("./color4-debug-ui").then((module) =>
     module.createVisionDebugController({
       currentExperiment: () => experimentSnapshot(false),
-      snapshotContext: () => ({
-        requested: requestedCamera,
-        actual: negotiatedCamera === undefined
-          ? undefined
-          : {
-              width: negotiatedCamera.cameraWidth,
-              height: negotiatedCamera.cameraHeight,
-              fps: negotiatedCamera.cameraFps,
-            },
-      }),
+      snapshotContext: () => {
+        // Read the track at capture time. The cached UI summary can lag while
+        // a live applyConstraints call is settling; getSettings() is the
+        // authoritative negotiated state for snapshot evidence.
+        const settings = stream?.getVideoTracks()[0]?.getSettings();
+        return {
+          requested: requestedCamera,
+          actual: settings === undefined
+            ? undefined
+            : {
+                width: settings.width,
+                height: settings.height,
+                fps: settings.frameRate,
+              },
+        };
+      },
     }),
   );
   try {
@@ -302,7 +326,7 @@ function cancelActiveReceiver(message: string): void {
   colorDecoder?.dispose();
   colorDecoder = null;
   captureStability = null;
-  stableIntervalSubmitted = false;
+  resetStableIntervalDedupe();
   deactivateVisionDebug();
   void releaseScreenWakeLock();
   activeCarrier = null;
@@ -449,7 +473,7 @@ function offerRetry(message: string) {
   colorDecoder?.dispose();
   colorDecoder = null;
   captureStability = null;
-  stableIntervalSubmitted = false;
+  resetStableIntervalDedupe();
   deactivateVisionDebug();
   void releaseScreenWakeLock();
   activeCarrier = null;
@@ -523,15 +547,9 @@ async function start() {
       return;
     }
   }
-  const captureWidth = captureWidthChoice();
-  const captureFps = Number(cfgCapFps.value);
-  requestedCamera = {
-    width: captureWidth,
-    ...(captureWidth === "max"
-      ? {}
-      : { height: Math.round((captureWidth * 3) / 4) }),
-    fps: captureFps,
-  };
+  requestedCamera = requestedCameraFromControls();
+  const captureWidth = requestedCamera.width;
+  const captureFps = requestedCamera.fps;
   // Nothing on the page changes until the camera is actually running: the
   // error paths below all have to leave a usable Start button behind.
   startBtn.disabled = true;
@@ -602,7 +620,7 @@ async function start() {
       visionDebugController?.prefilterMode ?? "observe",
       COLOR4_STABILITY_THRESHOLD,
     );
-    stableIntervalSubmitted = false;
+    resetStableIntervalDedupe();
     experiment.setVisionContext({
       debugEnabled: visionDebugController?.enabled ?? false,
       canonicalScale: visionDebugController?.canonicalScale ?? DEFAULT_COLOR4_CANONICAL_SCALE,
@@ -620,7 +638,7 @@ async function start() {
   if (!settingsWired) {
     settingsWired = true;
     for (const el of [cfgWidth, cfgCapFps, cfgWorkers]) {
-      el.addEventListener("change", () => void applyReceiveSettings());
+      el.addEventListener("change", queueReceiveSettingsApply);
     }
   }
 
@@ -632,11 +650,11 @@ async function start() {
 
 /** Report what the camera actually negotiated — iOS in particular will happily
  *  hand back 30 fps after accepting a request for 60. */
-function reportCameraSettings() {
+function reportCameraSettings(note?: string) {
   const track = stream?.getVideoTracks()[0];
   if (!track) return;
   const s = track.getSettings();
-  const askedFps = Number(cfgCapFps.value);
+  const askedFps = requestedCamera.fps;
   const gotFps = Math.round(s.frameRate ?? 0);
   negotiatedCamera = {
     cameraWidth: s.width,
@@ -644,7 +662,7 @@ function reportCameraSettings() {
     cameraFps: s.frameRate,
   };
   const fpsNote = gotFps && gotFps !== askedFps ? ` (asked ${askedFps})` : "";
-  const askedWidth = captureWidthChoice();
+  const askedWidth = requestedCamera.width;
   const widthNote = askedWidth === "max"
     ? " (asked max supported)"
     : s.width !== undefined && s.width !== askedWidth
@@ -654,15 +672,15 @@ function reportCameraSettings() {
     ? "1 COLOR_4 vision worker"
     : `${qrDecoder?.size ?? 0} QR decode worker${qrDecoder?.size === 1 ? "" : "s"}`;
   cameraActual.textContent =
-    `camera ${s.width}×${s.height}${widthNote} @ ${gotFps} fps${fpsNote} · ${workers} · changes apply live`;
+    `camera ${s.width}×${s.height}${widthNote} @ ${gotFps} fps${fpsNote} · ${workers} · ` +
+    (note ?? "changes apply live");
 }
 
 /** Use what this camera can actually do, probed rather than UA-sniffed.
  *  Continuous camera modes are applied individually and silently; unsupported
  *  or refused modes leave that camera setting unchanged. Frame rates the
  *  current mode can't reach are grayed out. */
-async function applyCameraExtras() {
-  const track = stream?.getVideoTracks()[0];
+async function applyCameraExtras(track: MediaStreamTrack | undefined = stream?.getVideoTracks()[0]) {
   if (!track) return;
   const caps = probeCameraCapabilities(track);
   await applyContinuousCameraModes(track, caps);
@@ -673,39 +691,69 @@ async function applyCameraExtras() {
   }
 }
 
-async function applyReceiveSettings() {
+function queueReceiveSettingsApply(): void {
+  const camera = requestedCameraFromControls();
+  const workerCount = Number(cfgWorkers.value);
+  const generation = captureGen;
+  // Publish the complete atomic request immediately. The actual values remain
+  // the last getSettings() observation until this queued request settles.
+  requestedCamera = camera;
+  receiveSettingsQueue = receiveSettingsQueue
+    .then(() => applyReceiveSettings(camera, workerCount, generation))
+    .catch((error: unknown) => {
+      if (generation !== captureGen || camera !== requestedCamera) return;
+      reportCameraSettings(
+        `live change failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+}
+
+async function applyReceiveSettings(
+  camera: RequestedCameraSettings,
+  workerCount: number,
+  generation: number,
+): Promise<void> {
   // finish() has already torn the pool down — don't resurrect it.
-  if (done) return;
-  if (activeCarrier === "qr") qrDecoder?.resize(Number(cfgWorkers.value));
+  if (done || generation !== captureGen) return;
+  if (activeCarrier === "qr") qrDecoder?.resize(workerCount);
   const track = stream?.getVideoTracks()[0];
   if (!track) return;
-  const width = captureWidthChoice();
-  // Record the user's request before negotiation. If the track refuses a live
-  // change, snapshot metadata must still distinguish that request from the
-  // unchanged authoritative getSettings() values.
-  requestedCamera = {
-    width,
-    ...(width === "max" ? {} : { height: Math.round((width * 3) / 4) }),
-    fps: Number(cfgCapFps.value),
-  };
   try {
-    if (activeCarrier === "color4" && width === "max") {
-      await applyMaximumSupportedWidth(track, Number(cfgCapFps.value));
+    if (activeCarrier === "color4" && camera.width === "max") {
+      const result = await applyMaximumSupportedWidth(track, camera.fps);
+      if (!result.applied) {
+        if (generation !== captureGen || track !== stream?.getVideoTracks()[0]) return;
+        reportCameraSettings(
+          camera === requestedCamera
+            ? "this camera refused the live change — restart to apply"
+            : undefined,
+        );
+        return;
+      }
     } else {
-      const numericWidth = width === "max" ? 1280 : width;
+      const numericWidth = camera.width === "max" ? 1280 : camera.width;
       await track.applyConstraints({
         width: { ideal: numericWidth },
         height: { ideal: Math.round((numericWidth * 3) / 4) },
-        frameRate: { ideal: Number(cfgCapFps.value) },
+        frameRate: { ideal: camera.fps },
       });
     }
   } catch {
+    if (generation !== captureGen || track !== stream?.getVideoTracks()[0]) return;
+    // Refresh actual settings even on refusal. Only the newest queued request
+    // owns the refusal annotation; an older refusal must not overwrite it.
+    reportCameraSettings(
+      camera === requestedCamera
+        ? "this camera refused the live change — restart to apply"
+        : undefined,
+    );
     // Some devices (notably iOS) refuse a live reconfigure. Keep the stream we
     // have rather than tearing down a transfer in progress.
-    cameraActual.textContent = "this camera refused a live change — restart to apply";
     return;
   }
-  await applyCameraExtras();
+  if (generation !== captureGen || track !== stream?.getVideoTracks()[0]) return;
+  await applyCameraExtras(track);
+  if (generation !== captureGen || track !== stream?.getVideoTracks()[0]) return;
   reportCameraSettings();
 }
 
@@ -773,7 +821,8 @@ function captureFrame() {
       experiment?.recordUnstableCapture(stability.p90MaeNormalized);
       experiment?.recordQualityClass("UNUSABLE");
       qualityRecorded = true;
-      stableIntervalSubmitted = false;
+      stableIntervalEpoch++;
+      validatedStableIntervalEpoch = undefined;
     }
     if (!stability.shouldSubmit) {
       if (stability.state === "unstable") experiment?.recordSkippedUnstable();
@@ -782,7 +831,7 @@ function captureFrame() {
     if (
       captureStability.mode === "enabled" &&
       stability.state === "stable" &&
-      stableIntervalSubmitted &&
+      validatedStableIntervalEpoch === stableIntervalEpoch &&
       !visionDebugController?.snapshotPending
     ) {
       experiment?.recordSkippedRedundantStable();
@@ -814,11 +863,14 @@ function captureFrame() {
   const captureMs = Math.max(0, capturedAt - captureStarted);
   if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder) {
     const decoderGeneration = captureGen;
-    const debugOptions = visionDebugController?.decodeOptions(capturedAt);
-    if (captureStability?.mode === "enabled" && stability?.state === "stable") {
-      stableIntervalSubmitted = true;
-    }
+    // Count the submission before snapshot metadata is frozen so the capture's
+    // experiment view is coherent with the frame being handed to the worker.
     experiment?.recordVisionSubmission();
+    const debugOptions = visionDebugController?.decodeOptions(capturedAt);
+    const submittedStableIntervalEpoch =
+      captureStability?.mode === "enabled" && stability?.state === "stable"
+        ? stableIntervalEpoch
+        : undefined;
     void colorDecoder.decode(
       { source: img, timestamp: capturedAt },
       { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
@@ -844,7 +896,17 @@ function captureFrame() {
         }
         experiment?.setProfile(diagnostics.profile);
         experiment?.recordAttempt(decoded.status, diagnostics);
-        if (decoded.status === "valid") onDecoded(decoded.innerFrame);
+        if (decoded.status === "valid") {
+          // A result from before a detected transition must not dedupe the new
+          // interval. Rejections leave the interval eligible for another try.
+          if (
+            submittedStableIntervalEpoch !== undefined &&
+            submittedStableIntervalEpoch === stableIntervalEpoch
+          ) {
+            validatedStableIntervalEpoch = submittedStableIntervalEpoch;
+          }
+          onDecoded(decoded.innerFrame);
+        }
       },
       (error) => {
         if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
@@ -958,7 +1020,7 @@ async function finish(container: Uint8Array, hashOk: boolean, seconds: number) {
   done = true;
   captureGen++;
   captureStability = null;
-  stableIntervalSubmitted = false;
+  resetStableIntervalDedupe();
   // Tear the whole capture pipeline down: the camera, the stats timer, and the
   // decode pool. Each worker holds its own ~940 KB zxing WASM instance, which
   // is worth reclaiming on a phone the moment the last frame is in.

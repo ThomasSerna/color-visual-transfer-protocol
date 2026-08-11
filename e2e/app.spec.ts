@@ -123,7 +123,7 @@ test("hosted sender renders COLOR_4 in its worker and can return to legacy QR", 
   expect(errors).toEqual([]);
 });
 
-test("receiver exposes one explicit carrier and carrier-specific settings", async ({ page }) => {
+test("the COLOR_4 camera receiver exposes carrier-specific settings", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/receive/");
@@ -150,7 +150,7 @@ test("receiver exposes one explicit carrier and carrier-specific settings", asyn
   expect(errors).toEqual([]);
 });
 
-test("Debug Vision renders every stage, exports one private snapshot, and stops cleanly", async ({
+test("the COLOR_4 camera Debug Vision exports a private snapshot and stops cleanly", async ({
   page,
   browserName,
 }) => {
@@ -329,6 +329,142 @@ test("Debug Vision renders every stage, exports one private snapshot, and stops 
   await expect(page.locator("#vision-debug-output")).toBeHidden();
   await expect(page.locator("#cfg-debug-scale")).toBeEnabled();
   await page.waitForTimeout(750);
+  await expect(page.locator("#vision-debug-output")).toBeHidden();
+  expect(errors).toEqual([]);
+});
+
+test("a consumed COLOR_4 camera debug snapshot survives camera teardown", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(browserName !== "chromium", "Chromium provides Playwright's deterministic fake camera.");
+  test.setTimeout(120_000);
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const openCvLoaded = page.waitForResponse(
+    (response) => /\/assets\/opencv-[^/]+\.js$/.test(response.url()) && response.status() === 200,
+  );
+  await page.goto("/receive/");
+  await page.locator("#carrier-color-option").click();
+  await page.locator("details:has(> summary:text-is('Debug Vision')) > summary").click();
+  await page.locator("#settings > summary").click();
+  await page.locator("#cfg-debug-label").fill("snapshot-context-before-teardown");
+  await page.locator("#cfg-debug-tx").selectOption("5");
+  await page.locator("#cfg-debug-profile").selectOption("ROBUST");
+  await page.locator("#cfg-debug-prefilter").selectOption("enabled");
+  await page.locator("#cfg-debug-distance").selectOption("0.5");
+  await page.locator("#cfg-debug-angle").selectOption("0");
+  await page.locator("#start").click();
+  await openCvLoaded;
+  await expect(page.locator("#capture-debug-snapshot")).toBeEnabled({ timeout: 30_000 });
+
+  // Hold the first snapshot hash after the worker result reaches the UI. This
+  // makes ZIP encoding observably busy while camera callbacks continue and
+  // while the session is torn down. Count decode posts to prove that encoding
+  // busy no longer bypasses stable-frame dedupe.
+  await page.evaluate(() => {
+    document.documentElement.dataset.snapshotDigestStarted = "false";
+    document.documentElement.dataset.snapshotDecodePosts = "0";
+    const originalDigest = crypto.subtle.digest.bind(crypto.subtle);
+    let releaseDigest = (): void => undefined;
+    const digestGate = new Promise<void>((resolve) => {
+      releaseDigest = resolve;
+    });
+    window.addEventListener("cvtp-release-snapshot-digest", releaseDigest, { once: true });
+    Object.defineProperty(crypto.subtle, "digest", {
+      configurable: true,
+      value: async (algorithm: AlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer> => {
+        document.documentElement.dataset.snapshotDigestStarted = "true";
+        await digestGate;
+        return originalDigest(algorithm, data);
+      },
+    });
+    const originalPostMessage = Worker.prototype.postMessage;
+    Object.defineProperty(Worker.prototype, "postMessage", {
+      configurable: true,
+      value: function(this: Worker, ...args: unknown[]): void {
+        const request = args[0] as { kind?: unknown } | undefined;
+        if (request?.kind === "decode") {
+          const count = Number(document.documentElement.dataset.snapshotDecodePosts ?? "0");
+          document.documentElement.dataset.snapshotDecodePosts = String(count + 1);
+        }
+        Reflect.apply(originalPostMessage, this, args);
+      },
+    });
+  });
+
+  const snapshotDownload = page.waitForEvent("download");
+  await page.locator("#capture-debug-snapshot").click();
+  await expect.poll(
+    () => page.evaluate(() => document.documentElement.dataset.snapshotDigestStarted),
+    { message: "the snapshot worker result must reach asynchronous ZIP encoding" },
+  ).toBe("true");
+  // The captured frame owns its original view after consumption. A live-view
+  // change may advance overlay generation, but must not revoke this download.
+  await page.locator("#cfg-debug-view").selectOption("warped");
+  const postsWhenEncodingStarted = await page.evaluate(
+    () => Number(document.documentElement.dataset.snapshotDecodePosts ?? "0"),
+  );
+  await page.waitForTimeout(1_000);
+  expect(await page.evaluate(
+    () => Number(document.documentElement.dataset.snapshotDecodePosts ?? "0"),
+  )).toBe(postsWhenEncodingStarted);
+
+  // Teardown clears the live camera/experiment globals. Mutating unlocked
+  // controls before releasing the digest catches any metadata read performed
+  // after an await instead of when the snapshot frame was consumed.
+  await page.locator('label:has(input[name="carrier"][value="qr"])').click();
+  await expect(page.locator("#stats")).toContainText("Carrier changed");
+  await page.evaluate(() => {
+    (document.getElementById("cfg-debug-label") as HTMLInputElement).value =
+      "snapshot-context-after-teardown";
+    (document.getElementById("cfg-debug-tx") as HTMLSelectElement).value = "10";
+    (document.getElementById("cfg-debug-profile") as HTMLSelectElement).value = "EXPERIMENTAL";
+    (document.getElementById("cfg-debug-prefilter") as HTMLSelectElement).value = "observe";
+    window.dispatchEvent(new Event("cvtp-release-snapshot-digest"));
+  });
+
+  const snapshotArtifact = await snapshotDownload;
+  const snapshotPath = await snapshotArtifact.path();
+  expect(snapshotPath).not.toBeNull();
+  const snapshotEntries = storedZipEntries(await readFile(snapshotPath!));
+  const jsonEntry = snapshotEntries.find((entry) => entry.name.endsWith(".json"));
+  expect(jsonEntry).toBeDefined();
+  const snapshot = JSON.parse(new TextDecoder().decode(jsonEntry!.data)) as {
+    configuration: {
+      prefilterMode: string;
+      expectedProfile?: string;
+      declaredTxFps?: number;
+      requestedCamera: { width: number | string; height?: number; fps: number };
+      actualCamera?: { width?: number; height?: number; fps?: number };
+    };
+    conditions: { label?: string; expectedTxFps?: number; prefilterMode?: string };
+    experiment?: { vision?: { conditions?: { label?: string; prefilterMode?: string } } };
+  };
+  expect(snapshot).toMatchObject({
+    configuration: {
+      prefilterMode: "enabled",
+      expectedProfile: "ROBUST",
+      declaredTxFps: 5,
+      requestedCamera: { width: 1920, height: 1440, fps: 30 },
+      actualCamera: { width: 1280, height: 960, fps: 5 },
+    },
+    conditions: {
+      label: "snapshot-context-before-teardown",
+      expectedTxFps: 5,
+      prefilterMode: "enabled",
+    },
+    experiment: {
+      vision: {
+        conditions: {
+          label: "snapshot-context-before-teardown",
+          prefilterMode: "enabled",
+        },
+      },
+    },
+  });
+  await expect(page.locator("#debug-snapshot-status")).toContainText("Snapshot ZIP downloaded");
+  await expect(page.locator("#preview")).toBeHidden();
   await expect(page.locator("#vision-debug-output")).toBeHidden();
   expect(errors).toEqual([]);
 });

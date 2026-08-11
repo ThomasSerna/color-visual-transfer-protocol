@@ -48,20 +48,28 @@ export function objectFitCoverProjection(
   };
 }
 
+interface SnapshotCameraContext {
+  readonly requested: Readonly<{
+    width: number | "max";
+    height?: number;
+    fps: number;
+  }>;
+  readonly actual?: Readonly<{
+    width?: number;
+    height?: number;
+    fps?: number;
+  }>;
+}
+
+interface SnapshotMetadataContext {
+  readonly camera: SnapshotCameraContext;
+  readonly conditions: VisionExperimentConditions;
+  readonly experiment: ExperimentSummary | undefined;
+}
+
 interface DebugControllerOptions {
   readonly currentExperiment: () => ExperimentSummary | undefined;
-  readonly snapshotContext: () => Readonly<{
-    requested: Readonly<{
-      width: number | "max";
-      height?: number;
-      fps: number;
-    }>;
-    actual?: Readonly<{
-      width?: number;
-      height?: number;
-      fps?: number;
-    }>;
-  }>;
+  readonly snapshotContext: () => SnapshotCameraContext;
 }
 
 const viewLabels: Readonly<Record<VisionDebugView, string>> = {
@@ -109,6 +117,8 @@ export class VisionDebugController {
   private transferActive = false;
   private snapshotArmed = false;
   private snapshotBusy = false;
+  private snapshotDownloadStarted = false;
+  private snapshotMetadataContext: SnapshotMetadataContext | undefined;
   private snapshotEpoch = 0;
   private lastPlaneRequest = Number.NEGATIVE_INFINITY;
   private generationValue = 0;
@@ -124,7 +134,7 @@ export class VisionDebugController {
     });
     this.viewInput.addEventListener("change", () => {
       this.generationValue++;
-      if (this.snapshotArmed || this.snapshotBusy) {
+      if (this.snapshotArmed) {
         this.cancelSnapshot("Snapshot cancelled because the debug view changed.");
       }
       this.outputTitle.textContent = viewLabels[this.view];
@@ -134,6 +144,7 @@ export class VisionDebugController {
       if (!this.transferActive || this.snapshotBusy) return;
       this.snapshotEpoch++;
       this.snapshotArmed = true;
+      this.snapshotDownloadStarted = false;
       this.snapshotButton.disabled = true;
       this.snapshotStatus.textContent = "Snapshot armed for the next free camera frame…";
     });
@@ -168,7 +179,10 @@ export class VisionDebugController {
   }
 
   get snapshotPending(): boolean {
-    return this.snapshotArmed || this.snapshotBusy;
+    // This getter exists for capture dedupe: only an armed request needs the
+    // next stable frame. ZIP encoding is independent and must not keep
+    // bypassing stable-frame dedupe while a completed worker result downloads.
+    return this.snapshotArmed;
   }
 
   conditions(): VisionExperimentConditions {
@@ -193,6 +207,8 @@ export class VisionDebugController {
     if (snapshot) {
       this.snapshotArmed = false;
       this.snapshotBusy = true;
+      this.snapshotDownloadStarted = false;
+      this.snapshotMetadataContext = this.captureSnapshotMetadataContext();
       this.snapshotStatus.textContent = "Capturing and encoding the diagnostic bundle…";
     }
     const emitPlane = this.enabled && (snapshot || now - this.lastPlaneRequest >= 500);
@@ -224,14 +240,22 @@ export class VisionDebugController {
     ]) control.disabled = active;
     if (!active) {
       this.latest = undefined;
-      this.cancelSnapshot("Camera stopped. No debug images were retained.");
+      if (!this.snapshotDownloadStarted) {
+        this.cancelSnapshot("Camera stopped. No debug images were retained.");
+      }
     }
     this.applyVisibility();
   }
 
   handleFrame(frame: Color4DebugFrame): void {
+    if (frame.snapshot && this.snapshotBusy) {
+      // A transfer may finish immediately after this worker result. Start the
+      // already-owned download even when camera teardown won that race.
+      const metadata = this.snapshotMetadataContext ?? this.captureSnapshotMetadataContext();
+      this.snapshotDownloadStarted = true;
+      void this.downloadSnapshot(frame, this.snapshotEpoch, metadata);
+    }
     if (!this.transferActive) return;
-    if (frame.snapshot) void this.downloadSnapshot(frame, this.snapshotEpoch);
     if (frame.generation !== this.generationValue) return;
     if (!this.enabled) return;
     this.latest = frame;
@@ -248,6 +272,8 @@ export class VisionDebugController {
     this.snapshotEpoch++;
     this.snapshotBusy = false;
     this.snapshotArmed = false;
+    this.snapshotDownloadStarted = false;
+    this.snapshotMetadataContext = undefined;
     this.snapshotStatus.textContent = message;
     this.applyVisibility();
   }
@@ -271,6 +297,8 @@ export class VisionDebugController {
     this.snapshotEpoch++;
     this.snapshotArmed = false;
     this.snapshotBusy = false;
+    this.snapshotDownloadStarted = false;
+    this.snapshotMetadataContext = undefined;
     this.snapshotStatus.textContent = message;
     this.snapshotButton.disabled = !this.transferActive;
   }
@@ -499,7 +527,23 @@ export class VisionDebugController {
     context.restore();
   }
 
-  private async downloadSnapshot(frame: Color4DebugFrame, snapshotEpoch: number): Promise<void> {
+  private captureSnapshotMetadataContext(): SnapshotMetadataContext {
+    const camera = this.options.snapshotContext();
+    return {
+      camera: {
+        requested: { ...camera.requested },
+        ...(camera.actual === undefined ? {} : { actual: { ...camera.actual } }),
+      },
+      conditions: { ...this.conditions() },
+      experiment: this.options.currentExperiment(),
+    };
+  }
+
+  private async downloadSnapshot(
+    frame: Color4DebugFrame,
+    snapshotEpoch: number,
+    metadata: SnapshotMetadataContext,
+  ): Promise<void> {
     try {
       const generatedAt = new Date();
       const id = String(frame.frameId).padStart(6, "0");
@@ -509,7 +553,6 @@ export class VisionDebugController {
       const threshold = frame.artifacts.planes.threshold;
       const warped = frame.artifacts.planes.warped;
       const rgbaSha256 = raw ? await sha256Hex(raw.pixels) : undefined;
-      const camera = this.options.snapshotContext();
       const observedProfile = frame.profileId === undefined
         ? undefined
         : getColor4Profile(frame.profileId)?.name;
@@ -532,14 +575,14 @@ export class VisionDebugController {
           maxDetectionDimension: frame.maxDetectionDimension,
           paletteId: frame.paletteId,
           palette: frame.paletteId === 0 ? "KCMY" : "KRGB",
-          prefilterMode: this.prefilterMode,
-          expectedProfile: this.conditions().expectedProfile,
+          prefilterMode: metadata.conditions.prefilterMode,
+          expectedProfile: metadata.conditions.expectedProfile,
           observedProfile,
-          declaredTxFps: this.conditions().expectedTxFps,
-          requestedCamera: camera.requested,
-          actualCamera: camera.actual,
+          declaredTxFps: metadata.conditions.expectedTxFps,
+          requestedCamera: metadata.camera.requested,
+          actualCamera: metadata.camera.actual,
         },
-        conditions: this.conditions(),
+        conditions: metadata.conditions,
         artifacts: {
           raw: {
             available: raw !== undefined,
@@ -553,7 +596,7 @@ export class VisionDebugController {
         },
         vision: artifactTrace,
         diagnostics: frame.diagnostics,
-        experiment: this.options.currentExperiment(),
+        experiment: metadata.experiment,
       };
       entries.push({
         name: `${base}.json`,
@@ -589,6 +632,8 @@ export class VisionDebugController {
       }
       if (snapshotEpoch === this.snapshotEpoch) {
         this.snapshotBusy = false;
+        this.snapshotDownloadStarted = false;
+        this.snapshotMetadataContext = undefined;
         this.applyVisibility();
       }
     }

@@ -288,7 +288,13 @@ function y4mFixture(
   return fixture;
 }
 
-/** Deterministic rolling-display surrogate: old symbol on top, new on bottom. */
+/**
+ * Deterministic rolling-display surrogate: old symbol on top, new on bottom,
+ * with a short dark blanking band at the scan boundary. A plain KCMY split can
+ * remain below the frozen 0.025 luma threshold because much of the carrier is
+ * photometrically unchanged; the band makes this fixture an actual transition
+ * test instead of silently exercising the redundant-stable path.
+ */
 function splitTransitionI420(previous: Uint8Array, current: Uint8Array): Uint8Array {
   const yBytes = WIDTH * HEIGHT;
   const chromaBytes = yBytes / 4;
@@ -301,6 +307,19 @@ function splitTransitionI420(previous: Uint8Array, current: Uint8Array): Uint8Ar
   copySplitPlane(0, yBytes);
   copySplitPlane(yBytes, chromaBytes);
   copySplitPlane(yBytes + chromaBytes, chromaBytes);
+  const bandStart = Math.floor(HEIGHT * 5 / 12);
+  const bandEnd = Math.ceil(HEIGHT * 7 / 12);
+  for (let y = bandStart; y < bandEnd; y++) {
+    output.fill(16, y * WIDTH, (y + 1) * WIDTH);
+  }
+  const chromaStart = Math.floor(bandStart / 2);
+  const chromaEnd = Math.ceil(bandEnd / 2);
+  const chromaWidth = WIDTH / 2;
+  for (const planeOffset of [yBytes, yBytes + chromaBytes]) {
+    for (let y = chromaStart; y < chromaEnd; y++) {
+      output.fill(128, planeOffset + y * chromaWidth, planeOffset + (y + 1) * chromaWidth);
+    }
+  }
   return output;
 }
 

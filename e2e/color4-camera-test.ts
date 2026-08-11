@@ -32,9 +32,27 @@ export async function expectColor4CameraReconstruction(
   await page.locator("#start").click();
   await openCvLoaded;
 
-  await expect(page.locator("#result .done")).toHaveText("Signal recovered", {
-    timeout: 90_000,
-  });
+  try {
+    await expect(page.locator("#result .done")).toHaveText("Signal recovered", {
+      timeout: 90_000,
+    });
+  } catch (error) {
+    // Preserve the live experiment on timeout; otherwise the DOM snapshot only
+    // says that recovery stalled and hides which acquisition stage dominated.
+    const diagnostics = page.locator("#diagnostics");
+    if ((await diagnostics.getAttribute("open")) === null) {
+      await diagnostics.locator("summary").click();
+    }
+    const diagnosticDownload = page.waitForEvent("download");
+    await page.locator("#export-metrics").click();
+    const artifact = await diagnosticDownload;
+    const path = await artifact.path();
+    const exportRecord = path === null ? undefined : JSON.parse(await readFile(path, "utf8"));
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\n` +
+        `Live COLOR_4 metrics: ${JSON.stringify(exportRecord?.current ?? null)}`,
+    );
+  }
   await expect(page.locator('#result a[download="camera-e2e.bin"]')).toHaveText(
     "Save camera-e2e.bin",
   );
@@ -73,6 +91,7 @@ export async function expectColor4CameraReconstruction(
       visionSubmissions?: number;
       skippedUnstable?: number;
       skippedRedundantStable?: number;
+      skippedWhileBusy: number;
       validFrames: number;
       newFrames: number;
       duplicateFrames: number;
@@ -106,8 +125,14 @@ export async function expectColor4CameraReconstruction(
   ).toBe(metrics.history[0]!.captures);
   if (options.prefilterMode === "enabled") {
     expect(metrics.history[0]!.skippedUnstable).toBeGreaterThan(0);
-    expect(metrics.history[0]!.skippedRedundantStable).toBeGreaterThan(0);
     expect(metrics.history[0]!.visionSubmissions).toBeLessThan(metrics.history[0]!.captures);
+    expect(metrics.history[0]!.captures).toBe(
+      (metrics.history[0]!.stabilityWarmupCaptures ?? 0) +
+        (metrics.history[0]!.skippedUnstable ?? 0) +
+        (metrics.history[0]!.skippedRedundantStable ?? 0) +
+        metrics.history[0]!.skippedWhileBusy +
+        (metrics.history[0]!.visionSubmissions ?? 0),
+    );
   } else {
     expect(metrics.history[0]!.skippedUnstable).toBe(0);
     expect(metrics.history[0]!.skippedRedundantStable).toBe(0);

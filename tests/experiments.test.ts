@@ -149,8 +149,8 @@ test("experiment summaries contain measurements but no payload identity", () => 
   assert.equal(summary.vision?.fiducials.TR.found, 1);
   assert.equal(summary.vision?.timingsMs.rs?.p95, 3);
   assert.deepEqual(summary.vision?.warnings, { CANDIDATE_BUDGET_RANKED: 1 });
-  assert.equal(summary.vision?.optical?.minimumPixelsPerModule.p50, 4.5);
-  assert.equal(summary.vision?.optical?.fiducialContrast.p95, 35);
+  assert.equal(summary.vision?.optical?.minimumPixelsPerModule?.p50, 4.5);
+  assert.equal(summary.vision?.optical?.fiducialContrast?.p95, 35);
   assert.equal(summary.vision?.workerP95ExceedsTxFrameInterval, false);
   assert.equal(summary.vision?.conditions?.distanceM, 0.5);
   assert.equal(summary.vision?.conditions?.expectedProfile, "ROBUST");
@@ -206,7 +206,7 @@ test("aggregated optical diagnostics permit a genuinely partial metric set", () 
   };
 
   assert.deepEqual(optical, { minimumPixelsPerModule: sample });
-  assert.equal(optical.clippedPixelFraction, undefined);
+  assert.equal("clippedPixelFraction" in optical, false);
 });
 
 test("capture stability telemetry is bounded, normalized and COLOR_4-only", () => {
