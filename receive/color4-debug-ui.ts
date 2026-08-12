@@ -31,6 +31,19 @@ export interface CoverProjection {
   readonly offsetY: number;
 }
 
+const NON_PERSISTED_SNAPSHOT_KEYS = new Set(["bootstrapBytes", "bootstrapCrc"]);
+
+/** Encode a Debug Vision record while retaining bootstrap bytes only in memory. */
+export function encodeColor4SnapshotJson(record: unknown): Uint8Array {
+  const serialized = JSON.stringify(
+    record,
+    (key, value: unknown) => NON_PERSISTED_SNAPSHOT_KEYS.has(key) ? undefined : value,
+    2,
+  );
+  if (serialized === undefined) throw new TypeError("Debug Vision snapshot record is not serializable.");
+  return new TextEncoder().encode(`${serialized}\n`);
+}
+
 export function objectFitCoverProjection(
   sourceWidth: number,
   sourceHeight: number,
@@ -600,7 +613,7 @@ export class VisionDebugController {
       };
       entries.push({
         name: `${base}.json`,
-        data: new TextEncoder().encode(`${JSON.stringify(record, null, 2)}\n`),
+        data: encodeColor4SnapshotJson(record),
         modifiedAt: generatedAt,
       });
       const archive = await createStoredZip(entries);

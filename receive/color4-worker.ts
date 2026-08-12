@@ -127,6 +127,53 @@ function stageTimings(
   return timings;
 }
 
+export function canonicalVisionDiagnostics(
+  diagnostics: CanonicalRasterResult["diagnostics"],
+): NonNullable<BrowserVisionDiagnostics["canonical"]> {
+  const bootstrap = diagnostics.bootstrapSampling;
+  const rails = diagnostics.timingRails;
+  return {
+    fiducialErrors: diagnostics.fiducialErrors,
+    fiducialErrorsById: diagnostics.fiducialErrorsById,
+    fiducialErrorMax: diagnostics.fiducialErrorMax,
+    quietZoneErrors: diagnostics.quietZoneErrors,
+    quietZoneLumaErrors: diagnostics.quietZoneLumaErrors,
+    quietZoneRgbErrors: diagnostics.quietZoneRgbErrors,
+    timingErrors: diagnostics.timingErrors,
+    timingModules: diagnostics.timingModules,
+    ...(bootstrap === undefined
+      ? {}
+      : {
+          bootstrapSampling: {
+            doubleVoteColumns: bootstrap.doubleVoteColumns,
+            singleVoteColumns: bootstrap.singleVoteColumns,
+            uncertainColumns: bootstrap.uncertainColumns,
+            contradictoryColumns: bootstrap.contradictoryColumns,
+            minimumDifferentialLuma: bootstrap.minimumDifferentialLuma,
+            medianDifferentialLuma: bootstrap.medianDifferentialLuma,
+          },
+        }),
+    ...(rails === undefined
+      ? {}
+      : {
+          timingUncertainModules: diagnostics.timingUncertainModules,
+          timingRails: {
+            top: { ...rails.top },
+            right: { ...rails.right },
+            bottom: { ...rails.bottom },
+            left: { ...rails.left },
+          },
+        }),
+    calibrationMad: diagnostics.calibrationMad,
+    observedContrast: diagnostics.observedContrast,
+    minimumPaletteDistance: diagnostics.minimumPaletteDistance,
+    uncertainCells: diagnostics.uncertainCells,
+    erasureBytes: diagnostics.erasureBytes,
+    meanBestDeltaE: diagnostics.meanBestDeltaE,
+    maximumBestDeltaE: diagnostics.maximumBestDeltaE,
+  };
+}
+
 function visionDiagnostics(
   request: Color4WorkerDecodeRequest,
   normalized: VisionResult | undefined,
@@ -194,23 +241,7 @@ function visionDiagnostics(
     ...(raster === undefined
       ? {}
       : {
-          canonical: {
-            fiducialErrors: raster.diagnostics.fiducialErrors,
-            fiducialErrorsById: raster.diagnostics.fiducialErrorsById,
-            fiducialErrorMax: raster.diagnostics.fiducialErrorMax,
-            quietZoneErrors: raster.diagnostics.quietZoneErrors,
-            quietZoneLumaErrors: raster.diagnostics.quietZoneLumaErrors,
-            quietZoneRgbErrors: raster.diagnostics.quietZoneRgbErrors,
-            timingErrors: raster.diagnostics.timingErrors,
-            timingModules: raster.diagnostics.timingModules,
-            calibrationMad: raster.diagnostics.calibrationMad,
-            observedContrast: raster.diagnostics.observedContrast,
-            minimumPaletteDistance: raster.diagnostics.minimumPaletteDistance,
-            uncertainCells: raster.diagnostics.uncertainCells,
-            erasureBytes: raster.diagnostics.erasureBytes,
-            meanBestDeltaE: raster.diagnostics.meanBestDeltaE,
-            maximumBestDeltaE: raster.diagnostics.maximumBestDeltaE,
-          },
+          canonical: canonicalVisionDiagnostics(raster.diagnostics),
         }),
   };
 }

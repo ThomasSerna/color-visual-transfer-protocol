@@ -78,6 +78,28 @@ export interface VisionFiducialNumericDiagnostic {
   readonly errors?: number;
 }
 
+export interface VisionBootstrapSamplingDiagnostics {
+  readonly doubleVoteColumns: number;
+  readonly singleVoteColumns: number;
+  readonly uncertainColumns: number;
+  readonly contradictoryColumns: number;
+  readonly minimumDifferentialLuma: number;
+  readonly medianDifferentialLuma: number;
+}
+
+export type VisionTimingRailName = "top" | "right" | "bottom" | "left";
+
+export interface VisionTimingRailDiagnostics {
+  readonly valid: boolean;
+  readonly blackLuma: number;
+  readonly whiteLuma: number;
+  readonly thresholdLuma: number;
+  readonly contrastLuma: number;
+  readonly errors: number;
+  readonly uncertainModules: number;
+  readonly modules: number;
+}
+
 /**
  * Small, persistence-safe COLOR_4 diagnostics. Pixel planes, quads, cell
  * traces and camera imagery deliberately stay in the receiver's ephemeral
@@ -125,6 +147,9 @@ export interface BrowserVisionDiagnostics {
     quietZoneRgbErrors?: number;
     timingErrors?: number;
     timingModules?: number;
+    timingUncertainModules?: number;
+    bootstrapSampling?: Readonly<VisionBootstrapSamplingDiagnostics>;
+    timingRails?: Readonly<Record<VisionTimingRailName, Readonly<VisionTimingRailDiagnostics>>>;
     calibrationMad?: number;
     observedContrast?: number;
     minimumPaletteDistance?: number;

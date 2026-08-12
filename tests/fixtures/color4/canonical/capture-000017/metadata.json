@@ -1,0 +1,62 @@
+{
+  "formatVersion": 1,
+  "fixtureKind": "canonical-warp",
+  "image": {
+    "file": "capture-000017-warped.png",
+    "width": 1032,
+    "height": 1032,
+    "moduleScale": 6,
+    "pngSha256": "3af7b4dd41ef15447fc54f7ef99e2d150a3f8a754b5c6a8a900003ae8e864bcc",
+    "rgbaSha256": "86ebacb71a5bb9268848c3c478cdc51452ad4671d30bd38dc0d20e03a1402554"
+  },
+  "configuration": {
+    "carrier": "COLOR_4",
+    "expectedProfile": "ROBUST",
+    "palette": "KCMY",
+    "paletteId": 0
+  },
+  "oracle": {
+    "stages": [
+      "canonicalGeometry",
+      "bootstrapPhase",
+      "calibration",
+      "classification"
+    ],
+    "bootstrap": {
+      "version": 1,
+      "profileId": 1,
+      "paletteId": 0,
+      "sequencePhase": 3
+    },
+    "timing": {
+      "errors": 0,
+      "modules": 314
+    },
+    "classification": {
+      "uncertainCells": 219,
+      "erasureBytes": 195,
+      "codedBytesSha256": "fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df"
+    },
+    "unwrap": {
+      "status": "rejected",
+      "reason": "fec-uncorrectable",
+      "diagnosticReason": "COLOR_CLASSIFICATION_TOO_UNCERTAIN"
+    }
+  },
+  "evidenceBoundary": {
+    "includes": [
+      "canonical classifier",
+      "bootstrap and phase",
+      "calibration",
+      "colour classification",
+      "Reed-Solomon rejection localization"
+    ],
+    "excludes": [
+      "raw camera acquisition",
+      "OpenCV detection",
+      "fiducial search",
+      "homography estimation",
+      "successful end-to-end transfer"
+    ]
+  }
+}

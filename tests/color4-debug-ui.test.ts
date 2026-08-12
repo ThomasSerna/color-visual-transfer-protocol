@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { objectFitCoverProjection } from "../receive/color4-debug-ui.ts";
+import {
+  encodeColor4SnapshotJson,
+  objectFitCoverProjection,
+} from "../receive/color4-debug-ui.ts";
 
 function closeTo(actual: number, expected: number): void {
   assert.ok(
@@ -56,4 +59,43 @@ test("object-fit cover returns a safe identity for unavailable dimensions", () =
       offsetY: 0,
     });
   }
+});
+
+test("snapshot JSON omits bootstrap bytes and CRC without mutating in-memory diagnostics", () => {
+  const record = {
+    diagnostics: {
+      classifier: [{
+        stage: "bootstrapPhase",
+        bootstrapBytes: [0xd5, 0x24, 0x07],
+        bootstrapCrc: { expected: 0x07, observed: 0x07 },
+        diagnostics: {
+          bootstrapSampling: {
+            doubleVoteColumns: 24,
+            minimumDifferentialLuma: 47.7157,
+          },
+        },
+      }],
+      nested: {
+        bootstrapBytes: [1, 2, 3],
+        bootstrapCrc: { expected: 1, observed: 2 },
+      },
+    },
+  };
+  const before = structuredClone(record);
+
+  const encoded = encodeColor4SnapshotJson(record);
+  const persisted = JSON.parse(new TextDecoder().decode(encoded)) as typeof record;
+
+  assert.equal(JSON.stringify(persisted).includes("bootstrapBytes"), false);
+  assert.equal(JSON.stringify(persisted).includes("bootstrapCrc"), false);
+  assert.deepEqual(
+    persisted.diagnostics.classifier[0]?.diagnostics.bootstrapSampling,
+    record.diagnostics.classifier[0]?.diagnostics.bootstrapSampling,
+  );
+  assert.deepEqual(record, before);
+  assert.deepEqual(record.diagnostics.classifier[0]?.bootstrapBytes, [0xd5, 0x24, 0x07]);
+  assert.deepEqual(record.diagnostics.classifier[0]?.bootstrapCrc, {
+    expected: 0x07,
+    observed: 0x07,
+  });
 });

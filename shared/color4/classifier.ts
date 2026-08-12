@@ -14,6 +14,18 @@ import {
   type SpatialRgbBinaryAnchorModel,
 } from "./binary-anchors";
 import {
+  BINARY_BLACK_MAXIMUM,
+  BINARY_WHITE_MINIMUM,
+  classifyWithLocalBinaryRail,
+  evaluateLocalBinaryRail,
+  normalizeLumaThreshold,
+  sampleDifferentialBootstrap,
+  type BootstrapSamplingSummary,
+  type LocalBinaryRailEvaluation,
+  type LocalBinaryRailModel,
+} from "./binary-photometry";
+import { crc8Atm } from "./crc";
+import {
   ACTIVE_MODULES,
   BOOTSTRAP_COLUMNS,
   BOOTSTRAP_ROWS,
@@ -64,6 +76,10 @@ export interface ClassifierThresholds {
   readonly maximumFiducialErrors: number;
   /** Maximum fraction of timing-rail modules that may be wrong or uncertain. */
   readonly maximumTimingErrorRate: number;
+  /** Minimum reliable middle-to-outer luminance delta in a bootstrap column. */
+  readonly minimumBootstrapDifferentialLuma: number;
+  /** Minimum local white-minus-black luminance contrast on every timing rail. */
+  readonly minimumTimingRailContrastLuma: number;
 }
 
 export const DEFAULT_CLASSIFIER_THRESHOLDS: ClassifierThresholds = Object.freeze({
@@ -73,6 +89,8 @@ export const DEFAULT_CLASSIFIER_THRESHOLDS: ClassifierThresholds = Object.freeze
   minimumDeltaEGap: 6,
   maximumFiducialErrors: COLOR4_MAX_FIDUCIAL_ERRORS,
   maximumTimingErrorRate: 0.08,
+  minimumBootstrapDifferentialLuma: 16,
+  minimumTimingRailContrastLuma: 40,
 });
 
 export type CanonicalRasterRejectReason =
@@ -95,8 +113,11 @@ export interface CanonicalRasterDiagnostics {
   /** Luminance failures and per-channel RGB failures are reported separately. */
   readonly quietZoneLumaErrors: number;
   readonly quietZoneRgbErrors: number;
+  readonly bootstrapSampling?: BootstrapSamplingDiagnostics;
   readonly timingErrors: number;
+  readonly timingUncertainModules: number;
   readonly timingModules: number;
+  readonly timingRails?: TimingRailsDiagnostics;
   readonly calibrationMad: number;
   readonly observedContrast: number;
   readonly minimumPaletteDistance: number;
@@ -104,6 +125,26 @@ export interface CanonicalRasterDiagnostics {
   readonly erasureBytes: number;
   readonly meanBestDeltaE: number;
   readonly maximumBestDeltaE: number;
+}
+
+export type BootstrapSamplingDiagnostics = BootstrapSamplingSummary;
+
+export interface TimingRailDiagnostics {
+  readonly valid: boolean;
+  readonly blackLuma: number;
+  readonly whiteLuma: number;
+  readonly thresholdLuma: number;
+  readonly contrastLuma: number;
+  readonly errors: number;
+  readonly uncertainModules: number;
+  readonly modules: number;
+}
+
+export interface TimingRailsDiagnostics {
+  readonly top: TimingRailDiagnostics;
+  readonly right: TimingRailDiagnostics;
+  readonly bottom: TimingRailDiagnostics;
+  readonly left: TimingRailDiagnostics;
 }
 
 export interface ValidCanonicalRaster {
@@ -172,6 +213,10 @@ export interface CanonicalGeometryObservation extends CanonicalRasterObservation
 export interface BootstrapPhaseObservation extends CanonicalRasterObservationBase {
   readonly stage: "bootstrapPhase";
   readonly bootstrap?: BootstrapFields;
+  /** Debug-only raw bytes, available when all bootstrap columns were decided. */
+  readonly bootstrapBytes?: readonly [number, number, number];
+  /** Debug-only CRC comparison; decodeBootstrap() remains authoritative. */
+  readonly bootstrapCrc?: Readonly<{ expected: number; observed: number }>;
   readonly topPhase?: 0 | 1 | 2 | 3 | null;
   readonly bottomPhase?: 0 | 1 | 2 | 3 | null;
 }
@@ -241,8 +286,6 @@ export type CanonicalRasterObservation =
 export type CanonicalRasterObserver = (observation: CanonicalRasterObservation) => void;
 
 export const MAX_CLASSIFIER_CELL_OBSERVATIONS = 128;
-const BINARY_BLACK_MAXIMUM = 0.35;
-const BINARY_WHITE_MINIMUM = 0.65;
 const QUIET_ZONE_SAMPLES_PER_EDGE = 8;
 const MAXIMUM_QUIET_ZONE_ERRORS = 2;
 
@@ -254,8 +297,11 @@ interface MutableDiagnostics {
   quietZoneErrors: number;
   quietZoneLumaErrors: number;
   quietZoneRgbErrors: number;
+  bootstrapSampling?: BootstrapSamplingDiagnostics;
   timingErrors: number;
+  timingUncertainModules: number;
   timingModules: number;
+  timingRails?: TimingRailsDiagnostics;
   calibrationMad: number;
   observedContrast: number;
   minimumPaletteDistance: number;
@@ -295,6 +341,7 @@ function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics 
     quietZoneLumaErrors: 0,
     quietZoneRgbErrors: 0,
     timingErrors: 0,
+    timingUncertainModules: 0,
     timingModules: 0,
     calibrationMad: 0,
     observedContrast: 0,
@@ -311,6 +358,19 @@ function freezeDiagnostics(value: MutableDiagnostics): CanonicalRasterDiagnostic
   return Object.freeze({
     ...value,
     fiducialErrorsById: Object.freeze({ ...value.fiducialErrorsById }),
+    ...(value.bootstrapSampling === undefined
+      ? {}
+      : { bootstrapSampling: Object.freeze({ ...value.bootstrapSampling }) }),
+    ...(value.timingRails === undefined
+      ? {}
+      : {
+          timingRails: Object.freeze({
+            top: Object.freeze({ ...value.timingRails.top }),
+            right: Object.freeze({ ...value.timingRails.right }),
+            bottom: Object.freeze({ ...value.timingRails.bottom }),
+            left: Object.freeze({ ...value.timingRails.left }),
+          }),
+        }),
   });
 }
 
@@ -514,23 +574,28 @@ function binaryModule(rgb: FloatRgb, anchors: BinaryAnchors): 0 | 1 | -1 {
   return -1;
 }
 
-function sampleBinaryRect(
+function sampleLuminanceRect(
   sampler: ModuleSampler,
   rect: ModuleRect,
-  anchors: SpatialBinaryAnchorModel,
-): Int8Array {
-  const out = new Int8Array(rect.width * rect.height);
+): Float64Array {
+  const out = new Float64Array(rect.width * rect.height);
   for (let y = 0; y < rect.height; y++) {
     for (let x = 0; x < rect.width; x++) {
       const activeX = rect.x + x;
       const activeY = rect.y + y;
-      out[y * rect.width + x] = binaryModule(
-        sampler.sampleActive(activeX, activeY),
-        anchors.atActive(activeX, activeY),
-      );
+      out[y * rect.width + x] = luminance(sampler.sampleActive(activeX, activeY));
     }
   }
   return out;
+}
+
+function sampleRectWithRailModel(
+  sampler: ModuleSampler,
+  rect: ModuleRect,
+  model: LocalBinaryRailModel,
+): Int8Array {
+  const luminances = sampleLuminanceRect(sampler, rect);
+  return Int8Array.from(luminances, (value) => classifyWithLocalBinaryRail(value, model));
 }
 
 interface FiducialErrorSummary {
@@ -602,28 +667,77 @@ function countQuietZoneErrors(
   return { combined: errors, luma: lumaErrors, rgb: rgbErrors };
 }
 
-function countTimingErrors(
+interface TimingRailEvaluations {
+  readonly top: LocalBinaryRailEvaluation;
+  readonly right: LocalBinaryRailEvaluation;
+  readonly bottom: LocalBinaryRailEvaluation;
+  readonly left: LocalBinaryRailEvaluation;
+}
+
+interface TimingEvaluation {
+  readonly rails: TimingRailEvaluations;
+  readonly errors: number;
+  readonly uncertainModules: number;
+  readonly modules: number;
+  readonly allRailsValid: boolean;
+}
+
+function evaluateTimingRail(
+  sampler: ModuleSampler,
+  rect: ModuleRect,
+  inverted: boolean,
+  minimumContrastLuma: number,
+): LocalBinaryRailEvaluation {
+  const luminances = sampleLuminanceRect(sampler, rect);
+  const expected = new Int8Array(luminances.length);
+  for (let index = 0; index < expected.length; index++) {
+    const alternating = (index & 1) === 0 ? 1 : 0;
+    expected[index] = inverted ? alternating ^ 1 : alternating;
+  }
+  return evaluateLocalBinaryRail(luminances, expected, minimumContrastLuma);
+}
+
+function evaluateTimingRails(
   sampler: ModuleSampler,
   layout: PhysicalLayout,
-  anchors: SpatialBinaryAnchorModel,
-): { errors: number; modules: number } {
-  let errors = 0;
-  let modules = 0;
-  const check = (x: number, y: number, expected: 0 | 1): void => {
-    modules++;
-    if (binaryModule(sampler.sampleActive(x, y), anchors.atActive(x, y)) !== expected) errors++;
+  minimumContrastLuma: number,
+): TimingEvaluation {
+  const rails: TimingRailEvaluations = {
+    top: evaluateTimingRail(sampler, layout.timing.top, false, minimumContrastLuma),
+    right: evaluateTimingRail(sampler, layout.timing.right, true, minimumContrastLuma),
+    bottom: evaluateTimingRail(sampler, layout.timing.bottom, true, minimumContrastLuma),
+    left: evaluateTimingRail(sampler, layout.timing.left, false, minimumContrastLuma),
   };
-  for (let x = 0; x < layout.data.width; x++) {
-    const top = (x & 1) === 0 ? 1 : 0;
-    check(layout.timing.top.x + x, layout.timing.top.y, top);
-    check(layout.timing.bottom.x + x, layout.timing.bottom.y, top === 1 ? 0 : 1);
-  }
-  for (let y = 0; y < layout.data.height; y++) {
-    const left = (y & 1) === 0 ? 1 : 0;
-    check(layout.timing.left.x, layout.timing.left.y + y, left);
-    check(layout.timing.right.x, layout.timing.right.y + y, left === 1 ? 0 : 1);
-  }
-  return { errors, modules };
+  const values = Object.values(rails);
+  return {
+    rails,
+    errors: values.reduce((sum, rail) => sum + rail.errors, 0),
+    uncertainModules: values.reduce((sum, rail) => sum + rail.uncertainModules, 0),
+    modules: values.reduce((sum, rail) => sum + rail.modules, 0),
+    allRailsValid: values.every((rail) => rail.valid),
+  };
+}
+
+function observeTimingRail(rail: LocalBinaryRailEvaluation): TimingRailDiagnostics {
+  return Object.freeze({
+    valid: rail.valid,
+    blackLuma: rail.blackLuma,
+    whiteLuma: rail.whiteLuma,
+    thresholdLuma: rail.thresholdLuma,
+    contrastLuma: rail.contrastLuma,
+    errors: rail.errors,
+    uncertainModules: rail.uncertainModules,
+    modules: rail.modules,
+  });
+}
+
+function observeTimingRails(rails: TimingRailEvaluations): TimingRailsDiagnostics {
+  return Object.freeze({
+    top: observeTimingRail(rails.top),
+    right: observeTimingRail(rails.right),
+    bottom: observeTimingRail(rails.bottom),
+    left: observeTimingRail(rails.left),
+  });
 }
 
 function samplesForPlacement(
@@ -896,10 +1010,20 @@ function resolveThresholds(
   const maximumFiducialErrors = Number.isNaN(requestedFiducialErrors)
     ? DEFAULT_CLASSIFIER_THRESHOLDS.maximumFiducialErrors
     : Math.max(0, Math.min(COLOR4_MAX_FIDUCIAL_ERRORS, requestedFiducialErrors));
+  const minimumBootstrapDifferentialLuma = normalizeLumaThreshold(
+    overrides?.minimumBootstrapDifferentialLuma,
+    DEFAULT_CLASSIFIER_THRESHOLDS.minimumBootstrapDifferentialLuma,
+  );
+  const minimumTimingRailContrastLuma = normalizeLumaThreshold(
+    overrides?.minimumTimingRailContrastLuma,
+    DEFAULT_CLASSIFIER_THRESHOLDS.minimumTimingRailContrastLuma,
+  );
   return {
     ...DEFAULT_CLASSIFIER_THRESHOLDS,
     ...overrides,
     maximumFiducialErrors,
+    minimumBootstrapDifferentialLuma,
+    minimumTimingRailContrastLuma,
   };
 }
 
@@ -936,6 +1060,8 @@ export function decodeCanonicalColor4Raster(
   const thresholds = resolveThresholds(options.thresholds);
   const observedThresholds = observing ? Object.freeze({ ...thresholds }) : thresholds;
   const observingDetail = observing && options.observerDetail === true;
+  let observedBootstrapBytes: readonly [number, number, number] | undefined;
+  let observedBootstrapCrc: Readonly<{ expected: number; observed: number }> | undefined;
   let stageStartedAt = observing ? readClock(options.clock) : 0;
   const finishGeometry = (
     outcome: "completed" | "rejected",
@@ -980,6 +1106,12 @@ export function decodeCanonicalColor4Raster(
       ...(reason === undefined ? {} : { reason }),
       diagnostics: freezeDiagnostics(values),
       ...(bootstrap === undefined ? {} : { bootstrap }),
+      ...(observingDetail && observedBootstrapBytes !== undefined
+        ? { bootstrapBytes: observedBootstrapBytes }
+        : {}),
+      ...(observingDetail && observedBootstrapCrc !== undefined
+        ? { bootstrapCrc: observedBootstrapCrc }
+        : {}),
       ...(topPhase === undefined ? {} : { topPhase }),
       ...(bottomPhase === undefined ? {} : { bottomPhase }),
     });
@@ -1039,7 +1171,19 @@ export function decodeCanonicalColor4Raster(
     width: BOOTSTRAP_COLUMNS,
     height: BOOTSTRAP_ROWS,
   };
-  const bootstrap = decodeBootstrap(sampleBinaryRect(sampler, bootstrapRect, anchors));
+  const bootstrapSampling = sampleDifferentialBootstrap(
+    sampleLuminanceRect(sampler, bootstrapRect),
+    thresholds.minimumBootstrapDifferentialLuma,
+  );
+  values.bootstrapSampling = bootstrapSampling.diagnostics;
+  if (observingDetail && bootstrapSampling.decidedBytes !== undefined) {
+    observedBootstrapBytes = bootstrapSampling.decidedBytes;
+    observedBootstrapCrc = Object.freeze({
+      expected: crc8Atm(Uint8Array.from(bootstrapSampling.decidedBytes.slice(0, 2))),
+      observed: bootstrapSampling.decidedBytes[2],
+    });
+  }
+  const bootstrap = decodeBootstrap(bootstrapSampling.modules);
   if (bootstrap === null) {
     finishBootstrap("rejected", "invalid_bootstrap", undefined);
     return rejected("invalid_bootstrap", values);
@@ -1061,17 +1205,28 @@ export function decodeCanonicalColor4Raster(
   const paletteId = palette.id;
   const layout = createPhysicalLayout(profile);
 
-  const timing = countTimingErrors(sampler, layout, anchors);
+  const timing = evaluateTimingRails(
+    sampler,
+    layout,
+    thresholds.minimumTimingRailContrastLuma,
+  );
   values.timingErrors = timing.errors;
+  values.timingUncertainModules = timing.uncertainModules;
   values.timingModules = timing.modules;
-  if (timing.errors / timing.modules > thresholds.maximumTimingErrorRate) {
+  values.timingRails = observeTimingRails(timing.rails);
+  if (
+    !timing.allRailsValid ||
+    timing.errors / timing.modules > thresholds.maximumTimingErrorRate
+  ) {
     finishBootstrap("rejected", "invalid_geometry", bootstrap);
     return rejected("invalid_geometry", values);
   }
 
-  const topPhase = decodePhasePilot(sampleBinaryRect(sampler, layout.phasePilots.top, anchors));
+  const topPhase = decodePhasePilot(
+    sampleRectWithRailModel(sampler, layout.phasePilots.top, timing.rails.top),
+  );
   const bottomPhase = decodePhasePilot(
-    sampleBinaryRect(sampler, layout.phasePilots.bottom, anchors),
+    sampleRectWithRailModel(sampler, layout.phasePilots.bottom, timing.rails.bottom),
   );
   if (
     topPhase === null ||

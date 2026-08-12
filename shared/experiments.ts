@@ -2,7 +2,10 @@ import type {
   BrowserCarrierDiagnostics,
   BrowserVisionDiagnostics,
   CarrierId,
+  VisionBootstrapSamplingDiagnostics,
   VisionDetectionDiagnostics,
+  VisionTimingRailDiagnostics,
+  VisionTimingRailName,
   VisionTimingKey,
 } from "./carrier";
 
@@ -11,6 +14,26 @@ const VERSION = 1;
 const PREFERENCES = "preferences";
 const RUNS = "runs";
 const MAX_STORED_RUNS = 100;
+const BOOTSTRAP_SAMPLING_METRICS = [
+  "doubleVoteColumns",
+  "singleVoteColumns",
+  "uncertainColumns",
+  "contradictoryColumns",
+  "minimumDifferentialLuma",
+  "medianDifferentialLuma",
+] as const satisfies readonly (keyof VisionBootstrapSamplingDiagnostics)[];
+const TIMING_RAIL_NAMES = ["top", "right", "bottom", "left"] as const satisfies
+  readonly VisionTimingRailName[];
+const TIMING_RAIL_METRICS = [
+  "valid",
+  "blackLuma",
+  "whiteLuma",
+  "thresholdLuma",
+  "contrastLuma",
+  "errors",
+  "uncertainModules",
+  "modules",
+] as const satisfies readonly (keyof VisionTimingRailDiagnostics)[];
 
 export type ExperimentDirection = "send" | "receive";
 
@@ -24,6 +47,18 @@ export interface TimingDistribution {
   readonly max: number;
   readonly p50: number;
   readonly p95: number;
+}
+
+export interface VisionExperimentCanonicalSummary {
+  readonly bootstrapSampling?: Readonly<Partial<Record<
+    keyof VisionBootstrapSamplingDiagnostics,
+    TimingDistribution
+  >>>;
+  readonly timingUncertainModules?: TimingDistribution;
+  readonly timingRails?: Readonly<Partial<Record<
+    VisionTimingRailName,
+    Readonly<Partial<Record<keyof VisionTimingRailDiagnostics, TimingDistribution>>>
+  >>>;
 }
 
 export interface VisionExperimentConditions {
@@ -79,6 +114,8 @@ export interface VisionExperimentSummary {
     keyof NonNullable<BrowserVisionDiagnostics["optical"]>,
     TimingDistribution
   >>>;
+  /** Optional photometric receiver-policy distributions; absent in older schema-v1 records. */
+  readonly canonical?: VisionExperimentCanonicalSummary;
   /**
    * Derived only when both worker timing samples and an expected transmitter
    * rate are available. Absent in older schema-v1 records.
@@ -215,6 +252,15 @@ export class ExperimentMetrics {
   private readonly visionOptical = new Map<
     keyof NonNullable<BrowserVisionDiagnostics["optical"]>,
     number[]
+  >();
+  private readonly visionBootstrapSampling = new Map<
+    keyof VisionBootstrapSamplingDiagnostics,
+    number[]
+  >();
+  private readonly visionTimingUncertainModules: number[] = [];
+  private readonly visionTimingRails = new Map<
+    VisionTimingRailName,
+    Map<keyof VisionTimingRailDiagnostics, number[]>
   >();
   private readonly visionDetection: Record<
     | "contours"
@@ -431,6 +477,7 @@ export class ExperimentMetrics {
       }
     }
     const canonicalFiducialErrors = vision.canonical?.fiducialErrorsById;
+    this.addCanonicalPhotometry(vision.canonical);
     for (const id of ["TL", "TR", "BR", "BL"] as const) {
       const observed = canonicalFiducialErrors === undefined
         ? vision.fiducials?.[id]
@@ -475,6 +522,51 @@ export class ExperimentMetrics {
     for (const key of Object.keys(this.visionDetection) as Array<keyof typeof this.visionDetection>) {
       const value = detection[key];
       if (value !== undefined && Number.isFinite(value)) this.visionDetection[key] += value;
+    }
+  }
+
+  private addCanonicalPhotometry(
+    canonical: NonNullable<BrowserVisionDiagnostics["canonical"]> | undefined,
+  ): void {
+    if (canonical === undefined) return;
+    if (canonical.bootstrapSampling !== undefined) {
+      for (const key of BOOTSTRAP_SAMPLING_METRICS) {
+        const raw = canonical.bootstrapSampling[key];
+        if (!Number.isFinite(raw)) continue;
+        let samples = this.visionBootstrapSampling.get(key);
+        if (samples === undefined) {
+          samples = [];
+          this.visionBootstrapSampling.set(key, samples);
+        }
+        this.pushBounded(samples, Math.max(0, raw));
+      }
+    }
+    if (canonical.timingUncertainModules !== undefined &&
+        Number.isFinite(canonical.timingUncertainModules)) {
+      this.pushBounded(
+        this.visionTimingUncertainModules,
+        Math.max(0, canonical.timingUncertainModules),
+      );
+    }
+    if (canonical.timingRails === undefined) return;
+    for (const railName of TIMING_RAIL_NAMES) {
+      const rail = canonical.timingRails[railName];
+      let railSamples = this.visionTimingRails.get(railName);
+      if (railSamples === undefined) {
+        railSamples = new Map();
+        this.visionTimingRails.set(railName, railSamples);
+      }
+      for (const key of TIMING_RAIL_METRICS) {
+        const raw = rail[key];
+        const value = typeof raw === "boolean" ? Number(raw) : raw;
+        if (!Number.isFinite(value)) continue;
+        let samples = railSamples.get(key);
+        if (samples === undefined) {
+          samples = [];
+          railSamples.set(key, samples);
+        }
+        this.pushBounded(samples, key === "contrastLuma" ? value : Math.max(0, value));
+      }
     }
   }
 
@@ -575,6 +667,27 @@ export class ExperimentMetrics {
     const optical = Object.fromEntries(
       [...this.visionOptical].map(([key, samples]) => [key, distribution(samples)]),
     ) as VisionExperimentSummary["optical"];
+    const bootstrapSampling = Object.fromEntries(
+      [...this.visionBootstrapSampling].map(([key, samples]) => [key, distribution(samples)]),
+    ) as NonNullable<VisionExperimentCanonicalSummary["bootstrapSampling"]>;
+    const timingRails = Object.fromEntries(
+      [...this.visionTimingRails].map(([railName, metrics]) => [
+        railName,
+        Object.fromEntries(
+          [...metrics].map(([key, samples]) => [key, distribution(samples)]),
+        ),
+      ]),
+    ) as NonNullable<VisionExperimentCanonicalSummary["timingRails"]>;
+    const hasCanonicalPhotometry = this.visionBootstrapSampling.size > 0 ||
+      this.visionTimingUncertainModules.length > 0 ||
+      this.visionTimingRails.size > 0;
+    const canonical: VisionExperimentCanonicalSummary = {
+      ...(this.visionBootstrapSampling.size === 0 ? {} : { bootstrapSampling }),
+      ...(this.visionTimingUncertainModules.length === 0
+        ? {}
+        : { timingUncertainModules: distribution(this.visionTimingUncertainModules) }),
+      ...(this.visionTimingRails.size === 0 ? {} : { timingRails }),
+    };
     return {
       debugEnabled: this.visionDebugEnabled,
       configuration: this.visionConfiguration,
@@ -586,6 +699,7 @@ export class ExperimentMetrics {
       timingsMs,
       ...(this.visionWarnings.size === 0 ? {} : { warnings: Object.fromEntries(this.visionWarnings) }),
       ...(this.visionOptical.size === 0 ? {} : { optical }),
+      ...(hasCanonicalPhotometry ? { canonical } : {}),
       ...(hasWorkerPressureInputs
         ? {
             workerP95ExceedsTxFrameInterval: workerP95ExceedsTxFrameInterval(

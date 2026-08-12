@@ -47,6 +47,15 @@ histograms and timing reservoirs, not an unbounded frame log. COLOR_4 summaries
 also include warmup/stable/unstable captures, vision submissions, unstable and
 redundant-stable skips, and the bounded stability-score distribution.
 
+The classifier may also attach optional binary-structure diagnostics: bootstrap
+double/single/uncertain/contradictory vote counts and differential margins, plus
+per-rail black/white medians, threshold, contrast, errors and uncertain module
+counts. They explain why bootstrap, timing or phase passed or failed; they are
+not new live panel views and do not change the PHY. Experiment exports may keep
+bounded numeric distributions for these values, but never the decoded bootstrap
+bytes. Detailed bytes, when requested, exist only in the per-frame in-memory
+debug observation after all 24 bootstrap columns were decided.
+
 ## Capture a diagnostic ZIP
 
 While a COLOR_4 reception is active, select **Capture raw camera frame +
@@ -178,6 +187,13 @@ variable at a time. Never relax CRC or the Reed-Solomon correction bound to make
 a frame appear valid. A proposed change is kept only when the exact baseline
 produces more valid frames without CRC failures or incorrect inner frames.
 
+For the phase-1 photometric check, run three additional controlled captures
+with ROBUST, KCMY, 5 fps, canonical scale 6, detection limit 1280 and prefilter
+`observe`. Each run must contain at least one frame that completes bootstrap,
+timing and phase and reaches colour classification/RS. Reaching RS is only the
+acceptance boundary for this phase; an RS rejection caused by colour
+classification remains follow-up work and is not a successful transfer.
+
 ## Real-capture gate and fixture privacy
 
 The A–E runs and their unmodified ZIP/experiment exports remain an external
@@ -188,6 +204,13 @@ expected result. Cropping changes apparent resolution and candidate load, so a
 crop is not interchangeable with the original full-camera replay and must be
 identified as such. Until reviewed fixtures exist, preserve the originals
 outside the repository and report the physical run separately.
+
+A privacy-reviewed `warped.png` may instead enter
+`tests/fixtures/color4/canonical/` without its raw camera counterpart. It must
+pin both the PNG and decoded-RGBA hashes and explicitly identify itself as a
+canonical-boundary replay. It can verify bootstrap, timing, phase, calibration,
+classification and RS behavior, but cannot support claims about camera input,
+OpenCV contours/fiducials, homography, or physical end-to-end success.
 
 ## Follow-up matrix
 

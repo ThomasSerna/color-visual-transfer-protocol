@@ -209,6 +209,90 @@ test("aggregated optical diagnostics permit a genuinely partial metric set", () 
   assert.equal("clippedPixelFraction" in optical, false);
 });
 
+test("photometric canonical diagnostics aggregate as optional schema-v1 distributions", () => {
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  const rail = (
+    valid: boolean,
+    contrastLuma: number,
+    errors = 0,
+    uncertainModules = 0,
+    modules = 79,
+  ) => ({
+    valid,
+    blackLuma: 50,
+    whiteLuma: 50 + contrastLuma,
+    thresholdLuma: 50 + contrastLuma / 2,
+    contrastLuma,
+    errors,
+    uncertainModules,
+    modules,
+  });
+  const firstBootstrap = {
+    doubleVoteColumns: 20,
+    singleVoteColumns: 4,
+    uncertainColumns: 0,
+    contradictoryColumns: 0,
+    minimumDifferentialLuma: 16,
+    medianDifferentialLuma: 24,
+    // Runtime debug detail must never leak into persisted experiment exports.
+    bootstrapBytes: [0xd5, 0x24, 0x07],
+    expectedCrc: 0x07,
+  };
+  metrics.recordAttempt("valid", {
+    vision: {
+      canonical: {
+        bootstrapSampling: firstBootstrap,
+        timingUncertainModules: 1,
+        timingRails: {
+          top: rail(true, 40),
+          right: rail(true, 44, 0, 1, 78),
+          bottom: rail(true, 48),
+          left: rail(true, 52, 0, 0, 78),
+        },
+      },
+    },
+  });
+  metrics.recordAttempt("rejected", {
+    stage: "bootstrap",
+    vision: {
+      canonical: {
+        bootstrapSampling: {
+          doubleVoteColumns: 18,
+          singleVoteColumns: 3,
+          uncertainColumns: 3,
+          contradictoryColumns: 1,
+          minimumDifferentialLuma: 20,
+          medianDifferentialLuma: 28,
+        },
+        timingUncertainModules: 3,
+        timingRails: {
+          top: rail(false, -40, 79, 79),
+          right: rail(true, 40, 2, 1, 78),
+          bottom: rail(true, 42, 1),
+          left: rail(true, 46, 1, 0, 78),
+        },
+      },
+    },
+  });
+
+  const summary = metrics.snapshot({ success: false, now: 1 });
+  const canonical = summary.vision?.canonical;
+  assert.equal(summary.schemaVersion, 1);
+  assert.equal(canonical?.bootstrapSampling?.doubleVoteColumns?.count, 2);
+  assert.equal(canonical?.bootstrapSampling?.doubleVoteColumns?.average, 19);
+  assert.equal(canonical?.bootstrapSampling?.minimumDifferentialLuma?.min, 16);
+  assert.equal(canonical?.bootstrapSampling?.medianDifferentialLuma?.max, 28);
+  assert.equal(canonical?.timingUncertainModules?.average, 2);
+  assert.equal(canonical?.timingRails?.top?.valid?.average, 0.5);
+  assert.equal(canonical?.timingRails?.top?.contrastLuma?.min, -40);
+  assert.equal(canonical?.timingRails?.top?.contrastLuma?.average, 0);
+  assert.equal(canonical?.timingRails?.right?.uncertainModules?.max, 1);
+  assert.equal(canonical?.timingRails?.left?.modules?.p50, 78);
+  assert.equal(JSON.stringify(summary).includes("bootstrapBytes"), false);
+  assert.equal(JSON.stringify(summary).includes("expectedCrc"), false);
+  assert.deepEqual(structuredClone(summary), summary);
+});
+
 test("capture stability telemetry is bounded and normalized", () => {
   const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
   for (let index = 0; index < 300; index++) {

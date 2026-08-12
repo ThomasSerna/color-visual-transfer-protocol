@@ -165,9 +165,10 @@ in any one marker require rejection even if the other three are exact.
 The fixed 24×3 monochrome bootstrap encodes 16 data bits followed by CRC-8/ATM
 (polynomial `0x07`, init/xorout 0). Data fields are magic `110101` (6 bits),
 version (2), profile (3), palette (2), Gray-coded `sequence mod 4` (2), and a
-zero reserved bit. Rows are word, complement, word and decode by majority vote
-after inverting the middle row. Different upper and lower phase pilots mean a
-transition or rolling-shutter capture and require early rejection.
+zero reserved bit. Rows are word, complement, word. This wire representation
+and its majority decoder are unchanged by the receiver policy described below.
+Different upper and lower phase pilots mean a transition or rolling-shutter
+capture and require early rejection.
 
 The two calibration banks use, in order, K `#101010`, W `#FFFFFF`, C
 `#00D8D8`, M `#D800D8`, Y `#D8D800` and G50 `#808080`. The same bank is used
@@ -280,10 +281,30 @@ these bands are warnings, not device-independent validity gates.
 Canonical monochrome validation estimates black from the border and white from
 the ring of each fiducial independently. Every local pair must be finite,
 ordered and provide at least 40 luminance levels of contrast. Fiducials use
-their own pair; bootstrap, timing rails and phase pilots use a bilinear field
-that interpolates black and white separately between the four marker centres
-and clamps outside that domain. The binary deadband remains 0.35/0.65 and the
-four-error maximum remains per fiducial.
+their own pair, and the quiet zone retains the spatial model interpolated from
+the four marker centres. The four-error maximum remains per fiducial.
+
+Bootstrap sampling is differential within each column. The reference receiver
+forms a top vote from the sign of `Ymiddle - Ytop` and a bottom vote from the
+sign of `Ymiddle - Ybottom`; a vote is reliable only when its absolute
+difference is at least 16 luma levels. Two agreeing reliable votes, or one
+reliable vote when the other is unavailable, decide the bit. Opposing reliable
+votes and columns with no reliable vote are uncertain. Decided bits are then
+expanded back to `word/complement/word` and passed to the unchanged bootstrap
+majority/CRC/magic/reserved-bit decoder. The 16-level inclusive gate is a
+receiver sampling policy, not a new PHY field or wire-format constraint.
+
+Each timing rail supplies its own mandatory local black/white model. Samples
+are split by the rail's expected alternating bit, black and white are their
+respective medians, and `white - black` must be at least 40 luma levels. A
+valid model classifies timing modules with the existing normalized 0.35/0.65
+deadband. An invalid, flat or inverted model makes the complete rail uncertain
+and rejects before phase decoding. The existing global 8% timing-error limit
+continues to apply across all 314 ROBUST or 478 EXPERIMENTAL timing modules;
+there is no per-rail error allowance. Top and bottom phase pilots use the top
+and bottom rail models respectively and must still decode to the same phase.
+These differential and per-rail models are receiver photometric policy; the
+transmitted timing and pilot patterns remain unchanged.
 
 Quiet-zone validation samples eight positions per side halfway through the
 six-module white band, rather than relying on the extrapolated outer corners.
@@ -318,10 +339,25 @@ frame eligible for the fountain decoder. Early contour, fiducial-detection and
 homography failures can remain expressed by their existing vision reject reason
 without a second `diagnosticReason`.
 
+Classifier diagnostics may additionally report bootstrap vote counts and
+differential margins, the number of uncertain timing modules, and each local
+rail's median black, median white, threshold, contrast and error counts. These
+values are diagnostic receiver observations only. Bootstrap bytes may appear
+in an explicitly detailed in-memory observation after all 24 columns are
+decided, but are not persisted in experiment history and do not alter any
+acceptance rule.
+
 Real-camera fixtures and repeated A–E hardware runs remain an external release
 gate, not normative protocol vectors. Synthetic/corpus/E2E success alone cannot
 establish physical acquisition success. See
 [benchmarking](benchmarking.md) and the [Debug Vision capture protocol](../user/debug-vision.md).
+
+A canonical-warp replay may pin bootstrap, timing, phase, classification and RS
+behavior without preserving a privacy-sensitive raw frame. Such a replay does
+not exercise acquisition, OpenCV detection or homography. In particular, a
+canonical fixture that reaches classification and then rejects as
+`fec-uncorrectable` proves only the photometric phase of a staged repair; it is
+not evidence of a successful COLOR_4 transfer.
 
 ## Security and resource limits
 
