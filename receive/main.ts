@@ -156,7 +156,7 @@ let requestedCamera: RequestedCameraSettings = { width: 1280, height: 960, fps: 
 let receiveSettingsQueue: Promise<void> = Promise.resolve();
 let captureStability: CaptureStabilityTracker | null = null;
 let stableIntervalEpoch = 0;
-let validatedStableIntervalEpoch: number | undefined;
+let lastSubmittedStableIntervalEpoch: number | undefined;
 
 const COLOR4_STABILITY_THRESHOLD = 0.025;
 
@@ -238,7 +238,7 @@ function requestedCameraFromControls(): RequestedCameraSettings {
 
 function resetStableIntervalDedupe(): void {
   stableIntervalEpoch = 0;
-  validatedStableIntervalEpoch = undefined;
+  lastSubmittedStableIntervalEpoch = undefined;
 }
 
 async function ensureVisionDebugController(): Promise<VisionDebugController> {
@@ -569,7 +569,7 @@ async function start() {
       }
     }
     if (!stream) throw cameraError ?? new Error("No camera constraint attempt succeeded.");
-    if (requestedCarrier === "color4" && captureWidth === "max") {
+    if (__COLOR4_ENABLED__ && requestedCarrier === "color4" && captureWidth === "max") {
       const track = stream.getVideoTracks()[0];
       if (track) await applyMaximumSupportedWidth(track, captureFps);
     }
@@ -719,7 +719,7 @@ async function applyReceiveSettings(
   const track = stream?.getVideoTracks()[0];
   if (!track) return;
   try {
-    if (activeCarrier === "color4" && camera.width === "max") {
+    if (__COLOR4_ENABLED__ && activeCarrier === "color4" && camera.width === "max") {
       const result = await applyMaximumSupportedWidth(track, camera.fps);
       if (!result.applied) {
         if (generation !== captureGen || track !== stream?.getVideoTracks()[0]) return;
@@ -822,7 +822,7 @@ function captureFrame() {
       experiment?.recordQualityClass("UNUSABLE");
       qualityRecorded = true;
       stableIntervalEpoch++;
-      validatedStableIntervalEpoch = undefined;
+      lastSubmittedStableIntervalEpoch = undefined;
     }
     if (!stability.shouldSubmit) {
       if (stability.state === "unstable") experiment?.recordSkippedUnstable();
@@ -831,7 +831,7 @@ function captureFrame() {
     if (
       captureStability.mode === "enabled" &&
       stability.state === "stable" &&
-      validatedStableIntervalEpoch === stableIntervalEpoch &&
+      lastSubmittedStableIntervalEpoch === stableIntervalEpoch &&
       !visionDebugController?.snapshotPending
     ) {
       experiment?.recordSkippedRedundantStable();
@@ -863,14 +863,18 @@ function captureFrame() {
   const captureMs = Math.max(0, capturedAt - captureStarted);
   if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder) {
     const decoderGeneration = captureGen;
+    // Claim the stable interval when the frame is dispatched, not when its
+    // asynchronous result arrives. A rejection still consumes the interval;
+    // an explicitly armed snapshot remains the sole dedupe bypass so it can
+    // capture the next frame. Transitions increment the epoch before another
+    // submission, so an older callback cannot consume the new interval.
+    if (captureStability?.mode === "enabled" && stability?.state === "stable") {
+      lastSubmittedStableIntervalEpoch = stableIntervalEpoch;
+    }
     // Count the submission before snapshot metadata is frozen so the capture's
     // experiment view is coherent with the frame being handed to the worker.
     experiment?.recordVisionSubmission();
     const debugOptions = visionDebugController?.decodeOptions(capturedAt);
-    const submittedStableIntervalEpoch =
-      captureStability?.mode === "enabled" && stability?.state === "stable"
-        ? stableIntervalEpoch
-        : undefined;
     void colorDecoder.decode(
       { source: img, timestamp: capturedAt },
       { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
@@ -897,14 +901,6 @@ function captureFrame() {
         experiment?.setProfile(diagnostics.profile);
         experiment?.recordAttempt(decoded.status, diagnostics);
         if (decoded.status === "valid") {
-          // A result from before a detected transition must not dedupe the new
-          // interval. Rejections leave the interval eligible for another try.
-          if (
-            submittedStableIntervalEpoch !== undefined &&
-            submittedStableIntervalEpoch === stableIntervalEpoch
-          ) {
-            validatedStableIntervalEpoch = submittedStableIntervalEpoch;
-          }
           onDecoded(decoded.innerFrame);
         }
       },

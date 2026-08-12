@@ -209,7 +209,7 @@ test("aggregated optical diagnostics permit a genuinely partial metric set", () 
   assert.equal("clippedPixelFraction" in optical, false);
 });
 
-test("capture stability telemetry is bounded, normalized and COLOR_4-only", () => {
+test("capture stability telemetry is bounded and normalized", () => {
   const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
   for (let index = 0; index < 300; index++) {
     metrics.recordCapture();
@@ -238,6 +238,59 @@ test("capture stability telemetry is bounded, normalized and COLOR_4-only", () =
     UNUSABLE: 0,
     BORDERLINE: 0,
     GOOD: 2,
+  });
+});
+
+test("every capture-first entrypoint activates telemetry without inspecting the carrier", () => {
+  const activators: ReadonlyArray<readonly [string, (metrics: ExperimentMetrics) => void]> = [
+    ["stable capture", (metrics) => metrics.recordStableCapture()],
+    ["unstable capture", (metrics) => metrics.recordUnstableCapture()],
+    ["stability warm-up", (metrics) => metrics.recordStabilityWarmupCapture()],
+    ["vision submission", (metrics) => metrics.recordVisionSubmission()],
+    ["skipped unstable", (metrics) => metrics.recordSkippedUnstable()],
+    ["skipped redundant stable", (metrics) => metrics.recordSkippedRedundantStable()],
+    ["quality class", (metrics) => metrics.recordQualityClass("UNKNOWN")],
+    ["vision context", (metrics) => metrics.setVisionContext({
+      debugEnabled: false,
+      canonicalScale: 6,
+      detectionDimension: 1280,
+    })],
+  ];
+
+  for (const [name, activate] of activators) {
+    const metrics = new ExperimentMetrics("receive", "QR_LEGACY", undefined, 0);
+    activate(metrics);
+    const summary = metrics.snapshot({ success: false, now: 1 });
+
+    assert.equal("stableCaptures" in summary, true, name);
+    assert.equal("unstableCaptures" in summary, true, name);
+    assert.equal("stabilityWarmupCaptures" in summary, true, name);
+    assert.equal("visionSubmissions" in summary, true, name);
+    assert.equal("skippedUnstable" in summary, true, name);
+    assert.equal("skippedRedundantStable" in summary, true, name);
+    assert.equal("stabilityScore" in summary, true, name);
+    assert.equal("qualityClassCounts" in summary, true, name);
+  }
+
+  const initialized = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  initialized.setVisionContext({
+    debugEnabled: false,
+    canonicalScale: 6,
+    detectionDimension: 1280,
+  });
+  const summary = initialized.snapshot({ success: false, now: 1 });
+  assert.equal(summary.stableCaptures, 0);
+  assert.equal(summary.unstableCaptures, 0);
+  assert.equal(summary.stabilityWarmupCaptures, 0);
+  assert.equal(summary.visionSubmissions, 0);
+  assert.equal(summary.skippedUnstable, 0);
+  assert.equal(summary.skippedRedundantStable, 0);
+  assert.equal(summary.stabilityScore?.count, 0);
+  assert.deepEqual(summary.qualityClassCounts, {
+    UNKNOWN: 0,
+    UNUSABLE: 0,
+    BORDERLINE: 0,
+    GOOD: 0,
   });
 });
 

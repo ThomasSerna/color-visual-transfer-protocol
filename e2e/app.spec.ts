@@ -354,17 +354,48 @@ test("a consumed COLOR_4 camera debug snapshot survives camera teardown", async 
   await page.locator("#cfg-debug-prefilter").selectOption("enabled");
   await page.locator("#cfg-debug-distance").selectOption("0.5");
   await page.locator("#cfg-debug-angle").selectOption("0");
+  // Keep this lifecycle test in one deterministic stability interval. Only
+  // the dedicated 64x48 fingerprint read is flattened; the full camera RGBA
+  // used by the worker and exported snapshot remains the real fake-camera
+  // frame. Transition behavior has its own active-prefilter E2E coverage.
+  await page.evaluate(() => {
+    const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    Object.defineProperty(CanvasRenderingContext2D.prototype, "getImageData", {
+      configurable: true,
+      value: function(
+        this: CanvasRenderingContext2D,
+        ...args: Parameters<CanvasRenderingContext2D["getImageData"]>
+      ): ImageData {
+        const image = Reflect.apply(originalGetImageData, this, args) as ImageData;
+        if (
+          this.canvas.width === 64 &&
+          this.canvas.height === 48 &&
+          image.width === 64 &&
+          image.height === 48
+        ) {
+          for (let offset = 0; offset < image.data.length; offset += 4) {
+            image.data[offset] = 128;
+            image.data[offset + 1] = 128;
+            image.data[offset + 2] = 128;
+            image.data[offset + 3] = 255;
+          }
+        }
+        return image;
+      },
+    });
+  });
   await page.locator("#start").click();
   await openCvLoaded;
   await expect(page.locator("#capture-debug-snapshot")).toBeEnabled({ timeout: 30_000 });
 
   // Hold the first snapshot hash after the worker result reaches the UI. This
   // makes ZIP encoding observably busy while camera callbacks continue and
-  // while the session is torn down. Count decode posts to prove that encoding
-  // busy no longer bypasses stable-frame dedupe.
+  // while the session is torn down. Since the fingerprint tracker is fixed to
+  // one interval above, no further decode request may bypass its consumed slot.
   await page.evaluate(() => {
     document.documentElement.dataset.snapshotDigestStarted = "false";
     document.documentElement.dataset.snapshotDecodePosts = "0";
+    document.documentElement.dataset.snapshotDecodeRequests = "0";
     const originalDigest = crypto.subtle.digest.bind(crypto.subtle);
     let releaseDigest = (): void => undefined;
     const digestGate = new Promise<void>((resolve) => {
@@ -383,10 +414,19 @@ test("a consumed COLOR_4 camera debug snapshot survives camera teardown", async 
     Object.defineProperty(Worker.prototype, "postMessage", {
       configurable: true,
       value: function(this: Worker, ...args: unknown[]): void {
-        const request = args[0] as { kind?: unknown } | undefined;
+        const request = args[0] as {
+          kind?: unknown;
+          debug?: { snapshot?: unknown };
+        } | undefined;
         if (request?.kind === "decode") {
-          const count = Number(document.documentElement.dataset.snapshotDecodePosts ?? "0");
-          document.documentElement.dataset.snapshotDecodePosts = String(count + 1);
+          const posts = Number(document.documentElement.dataset.snapshotDecodePosts ?? "0");
+          document.documentElement.dataset.snapshotDecodePosts = String(posts + 1);
+          if (request.debug?.snapshot === true) {
+            const snapshots = Number(
+              document.documentElement.dataset.snapshotDecodeRequests ?? "0",
+            );
+            document.documentElement.dataset.snapshotDecodeRequests = String(snapshots + 1);
+          }
         }
         Reflect.apply(originalPostMessage, this, args);
       },
@@ -405,7 +445,13 @@ test("a consumed COLOR_4 camera debug snapshot survives camera teardown", async 
   const postsWhenEncodingStarted = await page.evaluate(
     () => Number(document.documentElement.dataset.snapshotDecodePosts ?? "0"),
   );
+  expect(await page.evaluate(
+    () => Number(document.documentElement.dataset.snapshotDecodeRequests ?? "0"),
+  )).toBe(1);
   await page.waitForTimeout(1_000);
+  expect(await page.evaluate(
+    () => Number(document.documentElement.dataset.snapshotDecodeRequests ?? "0"),
+  )).toBe(1);
   expect(await page.evaluate(
     () => Number(document.documentElement.dataset.snapshotDecodePosts ?? "0"),
   )).toBe(postsWhenEncodingStarted);

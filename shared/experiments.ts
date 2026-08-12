@@ -203,6 +203,7 @@ export class ExperimentMetrics {
     BORDERLINE: 0,
     GOOD: 0,
   };
+  private captureTelemetrySeen = false;
   private visionSeen = false;
   private visionDebugEnabled = false;
   private visionConfiguration: VisionExperimentSummary["configuration"];
@@ -279,32 +280,39 @@ export class ExperimentMetrics {
   }
 
   recordStableCapture(stabilityScore?: number): void {
+    this.captureTelemetrySeen = true;
     this.stableCaptures++;
     this.recordStabilityScore(stabilityScore);
   }
 
   recordUnstableCapture(stabilityScore?: number): void {
+    this.captureTelemetrySeen = true;
     this.unstableCaptures++;
     this.recordStabilityScore(stabilityScore);
   }
 
   recordStabilityWarmupCapture(): void {
+    this.captureTelemetrySeen = true;
     this.stabilityWarmupCaptures++;
   }
 
   recordVisionSubmission(): void {
+    this.captureTelemetrySeen = true;
     this.visionSubmissions++;
   }
 
   recordSkippedUnstable(): void {
+    this.captureTelemetrySeen = true;
     this.skippedUnstable++;
   }
 
   recordSkippedRedundantStable(): void {
+    this.captureTelemetrySeen = true;
     this.skippedRedundantStable++;
   }
 
   recordQualityClass(qualityClass: CaptureQualityClass): void {
+    this.captureTelemetrySeen = true;
     this.qualityClassCounts[qualityClass]++;
   }
 
@@ -327,6 +335,7 @@ export class ExperimentMetrics {
     detectionDimension: 960 | 1280 | "source";
     conditions?: VisionExperimentConditions;
   }): void {
+    this.captureTelemetrySeen = true;
     this.visionSeen = true;
     this.visionDebugEnabled ||= input.debugEnabled;
     this.visionConfiguration = {
@@ -485,9 +494,8 @@ export class ExperimentMetrics {
     const now = input.now ?? Date.now();
     const elapsedMs = Math.max(0, now - this.startedAtMs);
     const decodeLatencyMs = distribution(this.latencySamples);
-    const color4CaptureTelemetry = this.carrier !== "COLOR_4"
-      ? {}
-      : {
+    const captureTelemetry = this.captureTelemetrySeen
+      ? {
           stableCaptures: this.stableCaptures,
           unstableCaptures: this.unstableCaptures,
           stabilityWarmupCaptures: this.stabilityWarmupCaptures,
@@ -496,7 +504,8 @@ export class ExperimentMetrics {
           skippedRedundantStable: this.skippedRedundantStable,
           stabilityScore: distribution(this.stabilityScoreSamples),
           qualityClassCounts: { ...this.qualityClassCounts },
-        };
+        }
+      : {};
     return {
       schemaVersion: 1,
       startedAt: this.startedAt,
@@ -511,7 +520,7 @@ export class ExperimentMetrics {
       cameraHeight: input.cameraHeight,
       cameraFps: input.cameraFps,
       captures: this.captures,
-      ...color4CaptureTelemetry,
+      ...captureTelemetry,
       skippedWhileBusy: this.skippedWhileBusy,
       carrierAttempts: this.carrierAttempts,
       candidates: this.candidates,
