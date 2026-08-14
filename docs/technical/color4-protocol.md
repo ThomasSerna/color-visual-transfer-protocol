@@ -353,11 +353,13 @@ establish physical acquisition success. See
 [benchmarking](benchmarking.md) and the [Debug Vision capture protocol](../user/debug-vision.md).
 
 A canonical-warp replay may pin bootstrap, timing, phase, classification and RS
-behavior without preserving a privacy-sensitive raw frame. Such a replay does
-not exercise acquisition, OpenCV detection or homography. In particular, a
-canonical fixture that reaches classification and then rejects as
-`fec-uncorrectable` proves only the photometric phase of a staged repair; it is
-not evidence of a successful COLOR_4 transfer.
+behavior independently of acquisition, OpenCV detection and homography. The
+`capture-000017` canonical fixture deliberately proves both contracts: a direct
+core unwrap with all 195 classifier erasures remains `fec-uncorrectable`, while
+the bounded receiver policy selects 55 FEC-feasible erasures and reaches valid
+RS, CRC32C and wire validation. Its recovered inner hash is a CRC-derived
+regression oracle, not independent transmitter ground truth or evidence of a
+successful physical end-to-end transfer.
 
 ## Security and resource limits
 

@@ -7,10 +7,14 @@ import { fileURLToPath } from "node:url";
 import { PNG } from "pngjs";
 import {
   decodeCanonicalColor4Raster,
-  unwrapColor4Frame,
+  shardPosition,
   type CanonicalRasterObservation,
-  type Color4UnwrapObservation,
 } from "../shared/color4/index.ts";
+import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
+import {
+  runColor4ErasurePolicy,
+  type Color4ErasurePolicy,
+} from "../receive/color4-erasure-policy.ts";
 import {
   canonicalDiagnosticReason,
   fecDiagnosticReason,
@@ -26,10 +30,23 @@ const FIXTURE_ROOT = fileURLToPath(
   new URL("./fixtures/color4/physical/", import.meta.url),
 );
 const REQUIRE_PHYSICAL_FIXTURES = process.env.CVTP_REQUIRE_PHYSICAL_FIXTURES === "1";
+const REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE =
+  process.env.CVTP_REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE === "1";
 const SHA256 = /^[0-9a-f]{64}$/;
 
 type ProfileName = "ROBUST" | "EXPERIMENTAL";
 type PaletteName = "KCMY" | "KRGB";
+type OracleBasisKind = "crc-derived-regression" | "independent-tx-ground-truth";
+
+interface OracleBasis {
+  readonly kind: OracleBasisKind;
+  readonly description: string;
+}
+
+interface ErasureDistributionOracle {
+  readonly total: number;
+  readonly byShard: readonly number[];
+}
 
 interface PhysicalCaptureConfiguration {
   readonly carrier: "COLOR_4";
@@ -37,6 +54,8 @@ interface PhysicalCaptureConfiguration {
   readonly palette: PaletteName;
   readonly paletteId: 0 | 1;
   readonly txFps: 1 | 2 | 5 | 10;
+  readonly prefilterMode: "observe" | "enabled";
+  readonly brightness: "high" | "maximum";
   readonly canonicalScale: VisionCanonicalScale;
   readonly maxDetectionDimension: VisionDetectionLimit;
 }
@@ -51,6 +70,8 @@ type ClassifierOracle =
       readonly profile: ProfileName;
       readonly paletteId: 0 | 1;
       readonly sequencePhase: 0 | 1 | 2 | 3;
+      readonly uncertainCells: number;
+      readonly candidateErasures: ErasureDistributionOracle;
       readonly codedBytesSha256: string;
     }
   | { readonly status: "rejected"; readonly reason: string };
@@ -58,12 +79,20 @@ type ClassifierOracle =
 type UnwrapOracle =
   | {
       readonly status: "valid";
+      readonly sessionId: number;
       readonly sequence: number;
+      readonly selectedPolicy: Color4ErasurePolicy;
+      readonly attempts: number;
+      readonly selectedErasures: ErasureDistributionOracle;
+      readonly correctedErrors: number;
+      readonly correctedBytes: number;
+      readonly correctedShards: number;
       readonly innerFrameSha256: string;
     }
   | { readonly status: "rejected"; readonly reason: string };
 
 interface PhysicalCaptureOracle {
+  readonly basis: OracleBasis;
   readonly vision: VisionOracle;
   readonly classifier?: ClassifierOracle;
   readonly unwrap?: UnwrapOracle;
@@ -97,7 +126,10 @@ interface PhysicalCaptureMetadata {
   readonly rawFrame: Readonly<{
     width: number;
     height: number;
+    pngSha256: string;
     rgbaSha256: string;
+    preparation: "unaltered-export" | "privacy-crop" | "privacy-redacted";
+    scope: "full-camera-frame" | "limited-evidence";
   }>;
   readonly configuration: PhysicalCaptureConfiguration;
   readonly oracle: PhysicalCaptureOracle;
@@ -164,6 +196,39 @@ function diagnosticReasonValue(value: unknown, label: string): string | null {
   return value === null ? null : stringValue(value, label);
 }
 
+function parseOracleBasis(value: unknown, label: string): OracleBasis {
+  const parsed = record(value, label);
+  assertKeys(parsed, ["kind", "description"], [], label);
+  return {
+    kind: choice(
+      parsed.kind,
+      ["crc-derived-regression", "independent-tx-ground-truth"],
+      `${label}.kind`,
+    ),
+    description: stringValue(parsed.description, `${label}.description`),
+  };
+}
+
+function parseErasureDistribution(
+  value: unknown,
+  label: string,
+): ErasureDistributionOracle {
+  const parsed = record(value, label);
+  assertKeys(parsed, ["total", "byShard"], [], label);
+  const total = integerValue(parsed.total, `${label}.total`, 0, 65_535);
+  assert.ok(Array.isArray(parsed.byShard), `${label}.byShard must be an array`);
+  assert.ok(parsed.byShard.length > 0, `${label}.byShard must not be empty`);
+  const byShard = parsed.byShard.map((entry, index) =>
+    integerValue(entry, `${label}.byShard[${index}]`, 0, 255)
+  );
+  assert.equal(
+    byShard.reduce((sum, count) => sum + count, 0),
+    total,
+    `${label}.total must equal the sum of byShard`,
+  );
+  return { total, byShard };
+}
+
 function parseCaptureSettings(value: unknown, label: string): CaptureSettings {
   const parsed = record(value, label);
   assertKeys(parsed, ["width", "height", "frameRate"], [], label);
@@ -219,7 +284,15 @@ function parseClassifierOracle(value: unknown, label: string): ClassifierOracle 
   assert.equal(parsed.status, "valid", `${label}.status must be valid or rejected`);
   assertKeys(
     parsed,
-    ["status", "profile", "paletteId", "sequencePhase", "codedBytesSha256"],
+    [
+      "status",
+      "profile",
+      "paletteId",
+      "sequencePhase",
+      "uncertainCells",
+      "candidateErasures",
+      "codedBytesSha256",
+    ],
     [],
     label,
   );
@@ -228,6 +301,11 @@ function parseClassifierOracle(value: unknown, label: string): ClassifierOracle 
     profile: choice(parsed.profile, ["ROBUST", "EXPERIMENTAL"], `${label}.profile`),
     paletteId: choice(parsed.paletteId, [0, 1], `${label}.paletteId`),
     sequencePhase: choice(parsed.sequencePhase, [0, 1, 2, 3], `${label}.sequencePhase`),
+    uncertainCells: integerValue(parsed.uncertainCells, `${label}.uncertainCells`, 0, 65_535),
+    candidateErasures: parseErasureDistribution(
+      parsed.candidateErasures,
+      `${label}.candidateErasures`,
+    ),
     codedBytesSha256: sha256Value(parsed.codedBytesSha256, `${label}.codedBytesSha256`),
   };
 }
@@ -239,10 +317,40 @@ function parseUnwrapOracle(value: unknown, label: string): UnwrapOracle {
     return { status: "rejected", reason: stringValue(parsed.reason, `${label}.reason`) };
   }
   assert.equal(parsed.status, "valid", `${label}.status must be valid or rejected`);
-  assertKeys(parsed, ["status", "sequence", "innerFrameSha256"], [], label);
+  assertKeys(
+    parsed,
+    [
+      "status",
+      "sessionId",
+      "sequence",
+      "selectedPolicy",
+      "attempts",
+      "selectedErasures",
+      "correctedErrors",
+      "correctedBytes",
+      "correctedShards",
+      "innerFrameSha256",
+    ],
+    [],
+    label,
+  );
   return {
     status: "valid",
+    sessionId: integerValue(parsed.sessionId, `${label}.sessionId`, 0, 0xffff),
     sequence: integerValue(parsed.sequence, `${label}.sequence`, 0, 0xffff_ffff),
+    selectedPolicy: choice(
+      parsed.selectedPolicy,
+      ["classifier-budgeted", "hard-decision"],
+      `${label}.selectedPolicy`,
+    ),
+    attempts: integerValue(parsed.attempts, `${label}.attempts`, 1, 2),
+    selectedErasures: parseErasureDistribution(
+      parsed.selectedErasures,
+      `${label}.selectedErasures`,
+    ),
+    correctedErrors: integerValue(parsed.correctedErrors, `${label}.correctedErrors`, 0, 65_535),
+    correctedBytes: integerValue(parsed.correctedBytes, `${label}.correctedBytes`, 0, 65_535),
+    correctedShards: integerValue(parsed.correctedShards, `${label}.correctedShards`, 0, 255),
     innerFrameSha256: sha256Value(parsed.innerFrameSha256, `${label}.innerFrameSha256`),
   };
 }
@@ -286,13 +394,14 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
   const rawFrame = record(parsed.rawFrame, `${label}.rawFrame`);
   assertKeys(
     rawFrame,
-    ["width", "height", "rgbaSha256", "preparation", "scope"],
+    ["width", "height", "pngSha256", "rgbaSha256", "preparation", "scope"],
     [],
     `${label}.rawFrame`,
   );
-  const parsedRawFrame = {
+  const parsedRawFrameBase = {
     width: integerValue(rawFrame.width, `${label}.rawFrame.width`, 1, 32_768),
     height: integerValue(rawFrame.height, `${label}.rawFrame.height`, 1, 32_768),
+    pngSha256: sha256Value(rawFrame.pngSha256, `${label}.rawFrame.pngSha256`),
     rgbaSha256: sha256Value(rawFrame.rgbaSha256, `${label}.rawFrame.rgbaSha256`),
   };
   const preparation = choice(
@@ -310,6 +419,7 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
     preparation === "unaltered-export" ? "full-camera-frame" : "limited-evidence",
     `${label}.rawFrame: cropped or redacted pixels must have limited-evidence scope`,
   );
+  const parsedRawFrame = { ...parsedRawFrameBase, preparation, scope } as const;
 
   const camera = record(parsed.camera, `${label}.camera`);
   assertKeys(
@@ -345,6 +455,8 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
       "palette",
       "paletteId",
       "txFps",
+      "prefilterMode",
+      "brightness",
       "canonicalScale",
       "maxDetectionDimension",
     ],
@@ -366,6 +478,16 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
     palette,
     paletteId,
     txFps: choice(configuration.txFps, [1, 2, 5, 10], `${label}.configuration.txFps`),
+    prefilterMode: choice(
+      configuration.prefilterMode,
+      ["observe", "enabled"],
+      `${label}.configuration.prefilterMode`,
+    ),
+    brightness: choice(
+      configuration.brightness,
+      ["high", "maximum"],
+      `${label}.configuration.brightness`,
+    ),
     canonicalScale: choice(
       configuration.canonicalScale,
       [4, 6, 8],
@@ -379,10 +501,11 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
   };
 
   const oracleRecord = record(parsed.oracle, `${label}.oracle`);
+  const basis = parseOracleBasis(oracleRecord.basis, `${label}.oracle.basis`);
   const vision = parseVisionOracle(oracleRecord.vision, `${label}.oracle.vision`);
   let oracle: PhysicalCaptureOracle;
   if (vision.status === "rejected") {
-    assertKeys(oracleRecord, ["vision", "rejection"], [], `${label}.oracle`);
+    assertKeys(oracleRecord, ["basis", "vision", "rejection"], [], `${label}.oracle`);
     const rejection = parseRejectionOracle(
       oracleRecord.rejection,
       `${label}.oracle.rejection`,
@@ -392,7 +515,7 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
       vision.reason,
       `${label}.oracle rejection/internal vision reasons disagree`,
     );
-    oracle = { vision, rejection };
+    oracle = { basis, vision, rejection };
   } else {
     const classifier = parseClassifierOracle(
       oracleRecord.classifier,
@@ -401,7 +524,7 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
     if (classifier.status === "rejected") {
       assertKeys(
         oracleRecord,
-        ["vision", "classifier", "rejection"],
+        ["basis", "vision", "classifier", "rejection"],
         [],
         `${label}.oracle`,
       );
@@ -414,13 +537,13 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
         classifier.reason,
         `${label}.oracle rejection/internal classifier reasons disagree`,
       );
-      oracle = { vision, classifier, rejection };
+      oracle = { basis, vision, classifier, rejection };
     } else {
       const unwrap = parseUnwrapOracle(oracleRecord.unwrap, `${label}.oracle.unwrap`);
       if (unwrap.status === "rejected") {
         assertKeys(
           oracleRecord,
-          ["vision", "classifier", "unwrap", "rejection"],
+          ["basis", "vision", "classifier", "unwrap", "rejection"],
           [],
           `${label}.oracle`,
         );
@@ -433,10 +556,15 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
           unwrap.reason,
           `${label}.oracle rejection/internal unwrap reasons disagree`,
         );
-        oracle = { vision, classifier, unwrap, rejection };
+        oracle = { basis, vision, classifier, unwrap, rejection };
       } else {
-        assertKeys(oracleRecord, ["vision", "classifier", "unwrap"], [], `${label}.oracle`);
-        oracle = { vision, classifier, unwrap };
+        assertKeys(
+          oracleRecord,
+          ["basis", "vision", "classifier", "unwrap"],
+          [],
+          `${label}.oracle`,
+        );
+        oracle = { basis, vision, classifier, unwrap };
       }
     }
   }
@@ -448,12 +576,31 @@ function parseMetadata(value: unknown, fixtureName: string): PhysicalCaptureMeta
       `${label}: cropped or redacted pixels cannot serve as a candidate-budget oracle`,
     );
   }
+  if (basis.kind === "crc-derived-regression") {
+    assert.equal(
+      oracle.unwrap?.status,
+      "valid",
+      `${label}: a CRC-derived regression oracle must pin a CRC-valid unwrap`,
+    );
+  }
 
   return { rawFrame: parsedRawFrame, configuration: parsedConfiguration, oracle };
 }
 
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function erasureDistribution(
+  erasures: ArrayLike<number>,
+  shards: number,
+): ErasureDistributionOracle {
+  const byShard = Array.from({ length: shards }, () => 0);
+  for (const index of Array.from(erasures)) {
+    const shard = shardPosition(index, shards).shard;
+    byShard[shard] = (byShard[shard] ?? 0) + 1;
+  }
+  return { total: erasures.length, byShard };
 }
 
 function classifierRejectionStage(reason: string): RejectionStage {
@@ -526,6 +673,11 @@ async function replayFixture(
     readFile(join(directory, "metadata.json")),
   ]);
   const metadata = parseMetadata(JSON.parse(metadataBytes.toString("utf8")), fixtureName);
+  assert.equal(
+    sha256(pngBytes),
+    metadata.rawFrame.pngSha256,
+    `${fixtureName}: compressed PNG SHA-256 differs from metadata`,
+  );
   const png = PNG.sync.read(pngBytes, { checkCRC: true });
   assert.equal(png.width, metadata.rawFrame.width, `${fixtureName}: PNG width differs from metadata`);
   assert.equal(png.height, metadata.rawFrame.height, `${fixtureName}: PNG height differs from metadata`);
@@ -610,18 +762,34 @@ async function replayFixture(
   assert.equal(classified.paletteId, classifierOracle.paletteId, `${fixtureName}: palette differs from oracle`);
   assert.equal(classified.sequencePhase, classifierOracle.sequencePhase, `${fixtureName}: phase changed`);
   assert.equal(
+    classified.diagnostics.uncertainCells,
+    classifierOracle.uncertainCells,
+    `${fixtureName}: uncertain cell count changed`,
+  );
+  assert.deepEqual(
+    erasureDistribution(classified.byteErasures, classified.profile.shards),
+    classifierOracle.candidateErasures,
+    `${fixtureName}: classifier candidate erasures changed`,
+  );
+  assert.equal(
+    classifierOracle.candidateErasures.byShard.length,
+    classified.profile.shards,
+    `${fixtureName}: candidate erasure shard count differs from the profile`,
+  );
+  assert.equal(
     sha256(classified.codedBytes),
     classifierOracle.codedBytesSha256,
     `${fixtureName}: classified coded bytes changed`,
   );
 
-  const unwrapObservations: Color4UnwrapObservation[] = [];
-  const unwrapped = unwrapColor4Frame(classified.codedBytes, {
-    profileId: classified.profile.id,
+  const coordinated = runColor4ErasurePolicy({
+    codedBytes: classified.codedBytes,
+    profile: classified.profile,
     paletteId: classified.paletteId,
     erasures: classified.byteErasures,
-    observer: (observation) => unwrapObservations.push(observation),
   });
+  const unwrapped = coordinated.result;
+  const unwrapObservations = coordinated.selectedObservations;
   const unwrapOracle = metadata.oracle.unwrap;
   assert.ok(unwrapOracle, `${fixtureName}: a valid classifier oracle requires an unwrap oracle`);
   assert.equal(unwrapped.status, unwrapOracle.status, `${fixtureName}: unwrap outcome changed`);
@@ -635,6 +803,7 @@ async function replayFixture(
           ? observation.shards.map((shard) => shard.reason)
           : [],
       ),
+      coordinated.saturatedErasureShards.length > 0,
     ) ?? null;
     assertRejection(fixtureName, metadata.oracle.rejection, {
       stage: unwrapped.reason === "fec-uncorrectable"
@@ -649,14 +818,68 @@ async function replayFixture(
     return;
   }
   assert.equal(unwrapOracle.status, "valid");
+  assert.equal(
+    coordinated.selectedPolicy,
+    unwrapOracle.selectedPolicy,
+    `${fixtureName}: selected erasure policy changed`,
+  );
+  assert.equal(
+    coordinated.attempts.length,
+    unwrapOracle.attempts,
+    `${fixtureName}: erasure-policy attempt count changed`,
+  );
+  assert.deepEqual(
+    erasureDistribution(coordinated.selectedErasures, classified.profile.shards),
+    unwrapOracle.selectedErasures,
+    `${fixtureName}: selected erasures changed`,
+  );
+  assert.equal(
+    unwrapOracle.selectedErasures.byShard.length,
+    classified.profile.shards,
+    `${fixtureName}: selected erasure shard count differs from the profile`,
+  );
+  assert.equal(unwrapped.header.sessionId, unwrapOracle.sessionId, `${fixtureName}: session changed`);
   assert.equal(unwrapped.header.sequence, unwrapOracle.sequence, `${fixtureName}: sequence changed`);
+  assert.equal(
+    color4SequencePhaseMatches(unwrapped.header.sequence, classified.sequencePhase),
+    true,
+    `${fixtureName}: unwrapped sequence no longer matches the physical Gray phase`,
+  );
+  assert.equal(
+    unwrapped.diagnostics.correctedErrors,
+    unwrapOracle.correctedErrors,
+    `${fixtureName}: corrected error count changed`,
+  );
+  assert.equal(
+    unwrapped.diagnostics.correctedBytes,
+    unwrapOracle.correctedBytes,
+    `${fixtureName}: corrected byte count changed`,
+  );
+  assert.equal(
+    unwrapped.diagnostics.correctedShards,
+    unwrapOracle.correctedShards,
+    `${fixtureName}: corrected shard count changed`,
+  );
+  const crc = unwrapObservations.find((observation) => observation.stage === "crc");
+  assert.equal(crc?.stage, "crc", `${fixtureName}: CRC observation is missing`);
+  if (crc?.stage === "crc") {
+    assert.equal(crc.valid, true, `${fixtureName}: CRC32C must validate`);
+    assert.equal(crc.outcome, "completed", `${fixtureName}: CRC stage must complete`);
+  }
+  const wire = unwrapObservations.find((observation) => observation.stage === "wire");
+  assert.equal(wire?.stage, "wire", `${fixtureName}: wire observation is missing`);
+  if (wire?.stage === "wire") {
+    assert.equal(wire.outerHeaderValid, true, `${fixtureName}: outer header must validate`);
+    assert.equal(wire.innerFrameValid, true, `${fixtureName}: inner frame must validate`);
+    assert.equal(wire.identityValid, true, `${fixtureName}: frame identity must validate`);
+  }
   assert.equal(
     sha256(unwrapped.innerFrame),
     unwrapOracle.innerFrameSha256,
     `${fixtureName}: unwrapped inner frame changed`,
   );
   context.diagnostic(
-    `${fixtureName}: ${png.width}x${png.height}, ${classified.profile.name}/${metadata.configuration.palette}`,
+    `${fixtureName}: ${png.width}x${png.height}, ${classified.profile.name}/${metadata.configuration.palette}, oracle=${metadata.oracle.basis.kind}`,
   );
 }
 
@@ -671,9 +894,30 @@ test("real COLOR_4 camera captures replay through OpenCV and the carrier", {
     const message =
       `No physical COLOR_4 fixtures found in ${FIXTURE_ROOT}. ` +
       "Add <case>/raw-frame.png + metadata.json; synthetic images must stay in the synthetic corpus.";
-    if (REQUIRE_PHYSICAL_FIXTURES) assert.fail(message);
+    if (REQUIRE_PHYSICAL_FIXTURES || REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE) {
+      assert.fail(message);
+    }
     context.skip(`${message} Set CVTP_REQUIRE_PHYSICAL_FIXTURES=1 to make this an acceptance failure.`);
     return;
+  }
+
+  if (REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE) {
+    const fixtureMetadata = await Promise.all(fixtureDirectories.map(async (fixtureName) => {
+      const metadataBytes = await readFile(join(FIXTURE_ROOT, fixtureName, "metadata.json"));
+      return parseMetadata(
+        JSON.parse(metadataBytes.toString("utf8")),
+        fixtureName,
+      );
+    }));
+    assert.ok(
+      fixtureMetadata.some((metadata) =>
+        metadata.oracle.basis.kind === "independent-tx-ground-truth" &&
+        metadata.oracle.unwrap?.status === "valid" &&
+        metadata.rawFrame.scope === "full-camera-frame"
+      ),
+      "Release acceptance requires at least one valid, full-camera-frame physical " +
+        "COLOR_4 unwrap with oracle.basis.kind=independent-tx-ground-truth.",
+    );
   }
 
   installImageData();

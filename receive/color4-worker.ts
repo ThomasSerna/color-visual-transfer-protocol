@@ -1,6 +1,5 @@
 import {
   decodeCanonicalColor4Raster,
-  unwrapColor4Frame,
   type CanonicalRasterObservation,
   type CanonicalRasterResult,
   type RejectReason,
@@ -19,6 +18,10 @@ import {
 } from "./color4-vision";
 import { color4SequencePhaseMatches } from "./color4-binding";
 import { canonicalDiagnosticReason, fecDiagnosticReason } from "./color4-diagnostic-reason";
+import {
+  runColor4ErasurePolicy,
+  type Color4ErasurePolicyResult,
+} from "./color4-erasure-policy";
 import type {
   Color4WorkerDebugFrame,
   Color4WorkerDecodeRequest,
@@ -81,12 +84,12 @@ function actionableDiagnosticReason(
   classifier: readonly CanonicalRasterObservation[],
   unwrap: readonly Color4UnwrapObservation[],
   rejectReason: string | undefined,
+  saturatedErasureShards: readonly number[] = [],
 ): Color4DiagnosticReason | undefined {
-  const fec = fecDiagnosticReason(
+  const fec = color4FecDiagnosticReason(
     rejectReason ?? "",
-    unwrap.flatMap((observation) =>
-      observation.stage === "rs" ? observation.shards.map((shard) => shard.reason) : []
-    ),
+    unwrap,
+    saturatedErasureShards,
   );
   if (fec !== undefined) return fec;
   const rejectedStage = classifier.find((observation) => observation.outcome === "rejected")?.stage;
@@ -95,6 +98,38 @@ function actionableDiagnosticReason(
     raster?.diagnostics,
     rejectedStage,
   );
+}
+
+export function color4FecDiagnosticReason(
+  reason: string,
+  unwrap: readonly Color4UnwrapObservation[],
+  saturatedErasureShards: readonly number[] = [],
+): Color4DiagnosticReason | undefined {
+  const shardReasons = unwrap.flatMap((observation) =>
+    observation.stage === "rs" ? observation.shards.map((shard) => shard.reason) : []
+  );
+  return fecDiagnosticReason(reason, shardReasons, saturatedErasureShards.length > 0);
+}
+
+export function color4ErasurePolicyDiagnostics(policy: Color4ErasurePolicyResult): Pick<
+  Color4WorkerDiagnostics,
+  | "erasurePolicy"
+  | "suggestedErasuresByShard"
+  | "saturatedErasureShards"
+  | "unwrapAttempts"
+> {
+  return Object.freeze({
+    erasurePolicy: policy.selectedPolicy,
+    suggestedErasuresByShard: policy.suggestedErasuresByShard,
+    saturatedErasureShards: policy.saturatedErasureShards,
+    unwrapAttempts: Object.freeze(policy.attempts.map((attempt) => Object.freeze({
+      policy: attempt.policy,
+      erasures: attempt.erasures.length,
+      erasuresByShard: attempt.erasuresByShard,
+      status: attempt.result.status,
+      ...(attempt.result.status === "rejected" ? { reason: attempt.result.reason } : {}),
+    }))),
+  });
 }
 
 function stageTimings(
@@ -132,6 +167,7 @@ export function canonicalVisionDiagnostics(
 ): NonNullable<BrowserVisionDiagnostics["canonical"]> {
   const bootstrap = diagnostics.bootstrapSampling;
   const rails = diagnostics.timingRails;
+  const classificationCompleted = diagnostics.bestDeltaE.count > 0;
   return {
     fiducialErrors: diagnostics.fiducialErrors,
     fiducialErrorsById: diagnostics.fiducialErrorsById,
@@ -169,6 +205,22 @@ export function canonicalVisionDiagnostics(
     minimumPaletteDistance: diagnostics.minimumPaletteDistance,
     uncertainCells: diagnostics.uncertainCells,
     erasureBytes: diagnostics.erasureBytes,
+    ...(classificationCompleted
+      ? {
+          distanceRejectedCells: diagnostics.distanceRejectedCells,
+          gapRejectedCells: diagnostics.gapRejectedCells,
+          bothRejectedCells: diagnostics.bothRejectedCells,
+          erasuresByShard: [...diagnostics.erasuresByShard],
+          parityByShard: diagnostics.parityByShard,
+          remainingErasureBudgetByShard: [...diagnostics.remainingErasureBudgetByShard],
+          uncertainCellsByRow: [...diagnostics.uncertainCellsByRow],
+          uncertainCellsByColumn: [...diagnostics.uncertainCellsByColumn],
+          effectiveMaximumDeltaE: diagnostics.effectiveMaximumDeltaE,
+          effectiveMinimumDeltaEGap: diagnostics.effectiveMinimumDeltaEGap,
+          bestDeltaE: { ...diagnostics.bestDeltaE },
+          deltaEGap: { ...diagnostics.deltaEGap },
+        }
+      : {}),
     meanBestDeltaE: diagnostics.meanBestDeltaE,
     maximumBestDeltaE: diagnostics.maximumBestDeltaE,
   };
@@ -182,10 +234,18 @@ function visionDiagnostics(
   unwrap: readonly Color4UnwrapObservation[],
   workerTotal: number,
   rejectReason?: string,
+  diagnosticUnwrap: readonly Color4UnwrapObservation[] = unwrap,
+  saturatedErasureShards: readonly number[] = [],
 ): BrowserVisionDiagnostics {
   const geometry = normalized?.diagnostics;
   const fiducials = geometry?.fiducials;
-  const diagnosticReason = actionableDiagnosticReason(raster, classifier, unwrap, rejectReason);
+  const diagnosticReason = actionableDiagnosticReason(
+    raster,
+    classifier,
+    diagnosticUnwrap,
+    rejectReason,
+    saturatedErasureShards,
+  );
   return {
     debugEnabled: request.debug.enabled,
     canonicalScale: request.debug.canonicalScale,
@@ -254,6 +314,8 @@ function baseDiagnostics(
   unwrap: readonly Color4UnwrapObservation[],
   started: number,
   rejectReason?: string,
+  diagnosticUnwrap: readonly Color4UnwrapObservation[] = unwrap,
+  saturatedErasureShards: readonly number[] = [],
 ): MutableDiagnostics {
   const elapsed = Math.max(0, performance.now() - started);
   return {
@@ -267,7 +329,10 @@ function baseDiagnostics(
     crcFailures: 0,
     decodeMs: elapsed,
     ...(rejectReason === undefined ? {} : { rejectReason }),
-    erasures: raster?.diagnostics.erasureBytes ?? 0,
+    // No erasures have been consumed until an unwrap attempt is selected.
+    // Successful classification overwrites this with that attempt's decoder
+    // diagnostics; erasureBytes above always retains the optical hint count.
+    erasures: 0,
     correctedErrors: 0,
     correctedBytes: 0,
     correctedShards: 0,
@@ -279,6 +344,8 @@ function baseDiagnostics(
       unwrap,
       elapsed,
       rejectReason,
+      diagnosticUnwrap,
+      saturatedErasureShards,
     ),
   };
 }
@@ -436,12 +503,16 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
       );
       return;
     }
-    const unwrapped = unwrapColor4Frame(raster.codedBytes, {
-      profileId: raster.profile.id,
+    const erasurePolicy = runColor4ErasurePolicy({
+      codedBytes: raster.codedBytes,
+      profile: raster.profile,
       paletteId: request.paletteId,
       erasures: raster.byteErasures,
-      observer: (observation) => unwrapObservations.push(observation),
     });
+    for (const attempt of erasurePolicy.attempts) {
+      unwrapObservations.push(...attempt.observations);
+    }
+    const unwrapped = erasurePolicy.result;
     const diagnostics = baseDiagnostics(
       request,
       raster,
@@ -450,21 +521,30 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
       unwrapObservations,
       started,
       unwrapped.status === "rejected" ? unwrapped.reason : undefined,
+      erasurePolicy.selectedObservations,
+      erasurePolicy.saturatedErasureShards,
     );
-    diagnostics.erasures = Math.max(raster.diagnostics.erasureBytes, unwrapped.diagnostics.erasures);
-    diagnostics.erasureBytes = diagnostics.erasures;
+    diagnostics.erasures = unwrapped.diagnostics.erasures;
+    diagnostics.erasureBytes = raster.diagnostics.erasureBytes;
     diagnostics.correctedErrors = unwrapped.diagnostics.correctedErrors;
     diagnostics.correctedBytes = unwrapped.diagnostics.correctedBytes;
     diagnostics.correctedShards = unwrapped.diagnostics.correctedShards;
     diagnostics.rsCorrectedSymbols = unwrapped.diagnostics.correctedBytes;
     diagnostics.profile = raster.profile.name;
+    Object.assign(diagnostics, color4ErasurePolicyDiagnostics(erasurePolicy));
     if (unwrapped.status === "rejected") {
       if (unwrapped.reason === "fec-uncorrectable") {
         updateReject(
           diagnostics,
           "rs",
           unwrapped.reason,
-          actionableDiagnosticReason(raster, classifierObservations, unwrapObservations, unwrapped.reason),
+          actionableDiagnosticReason(
+            raster,
+            classifierObservations,
+            erasurePolicy.selectedObservations,
+            unwrapped.reason,
+            erasurePolicy.saturatedErasureShards,
+          ),
         );
         diagnostics.rsFailures = 1;
       } else if (unwrapped.reason === "crc-mismatch") {

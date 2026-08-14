@@ -4,6 +4,7 @@ import type {
   CarrierId,
   VisionBootstrapSamplingDiagnostics,
   VisionDetectionDiagnostics,
+  VisionClassifierDistributionDiagnostics,
   VisionTimingRailDiagnostics,
   VisionTimingRailName,
   VisionTimingKey,
@@ -34,6 +35,23 @@ const TIMING_RAIL_METRICS = [
   "uncertainModules",
   "modules",
 ] as const satisfies readonly (keyof VisionTimingRailDiagnostics)[];
+const CLASSIFICATION_SCALAR_METRICS = [
+  "distanceRejectedCells",
+  "gapRejectedCells",
+  "bothRejectedCells",
+  "parityByShard",
+  "effectiveMaximumDeltaE",
+  "effectiveMinimumDeltaEGap",
+] as const satisfies readonly (keyof NonNullable<BrowserVisionDiagnostics["canonical"]>)[];
+const CLASSIFIER_DISTRIBUTION_METRICS = [
+  "count",
+  "min",
+  "p50",
+  "p95",
+  "max",
+] as const satisfies readonly (keyof VisionClassifierDistributionDiagnostics)[];
+const MAX_CLASSIFIER_AGGREGATE_BUCKETS = 256;
+type VisionClassificationScalarMetric = typeof CLASSIFICATION_SCALAR_METRICS[number];
 
 export type ExperimentDirection = "send" | "receive";
 
@@ -59,6 +77,30 @@ export interface VisionExperimentCanonicalSummary {
     VisionTimingRailName,
     Readonly<Partial<Record<keyof VisionTimingRailDiagnostics, TimingDistribution>>>
   >>>;
+  /** Optional schema-v1 extension containing aggregate confidence metrics only. */
+  readonly classification?: VisionExperimentClassificationSummary;
+}
+
+export interface VisionExperimentClassificationSummary {
+  readonly distanceRejectedCells?: TimingDistribution;
+  readonly gapRejectedCells?: TimingDistribution;
+  readonly bothRejectedCells?: TimingDistribution;
+  readonly parityByShard?: TimingDistribution;
+  readonly effectiveMaximumDeltaE?: TimingDistribution;
+  readonly effectiveMinimumDeltaEGap?: TimingDistribution;
+  readonly bestDeltaE?: Readonly<Partial<Record<
+    keyof VisionClassifierDistributionDiagnostics,
+    TimingDistribution
+  >>>;
+  readonly deltaEGap?: Readonly<Partial<Record<
+    keyof VisionClassifierDistributionDiagnostics,
+    TimingDistribution
+  >>>;
+  /** Per-position distributions; never raw erased-byte or cell-index arrays. */
+  readonly erasuresByShard?: readonly TimingDistribution[];
+  readonly remainingErasureBudgetByShard?: readonly TimingDistribution[];
+  readonly uncertainCellsByRow?: readonly TimingDistribution[];
+  readonly uncertainCellsByColumn?: readonly TimingDistribution[];
 }
 
 export interface VisionExperimentConditions {
@@ -262,6 +304,24 @@ export class ExperimentMetrics {
     VisionTimingRailName,
     Map<keyof VisionTimingRailDiagnostics, number[]>
   >();
+  private readonly visionClassificationScalars = new Map<
+    VisionClassificationScalarMetric,
+    number[]
+  >();
+  private readonly visionBestDeltaE = new Map<
+    keyof VisionClassifierDistributionDiagnostics,
+    number[]
+  >();
+  private readonly visionDeltaEGap = new Map<
+    keyof VisionClassifierDistributionDiagnostics,
+    number[]
+  >();
+  private readonly visionErasuresByShard: number[][] = [];
+  private readonly visionRemainingErasureBudgetByShard: number[][] = [];
+  private readonly visionUncertainCellsByRow: number[][] = [];
+  private readonly visionUncertainCellsByColumn: number[][] = [];
+  /** Prevent positional/profile-specific classifier metrics from being mixed. */
+  private visionClassificationProfile: string | undefined;
   private readonly visionDetection: Record<
     | "contours"
     | "areaTooSmall"
@@ -477,7 +537,7 @@ export class ExperimentMetrics {
       }
     }
     const canonicalFiducialErrors = vision.canonical?.fiducialErrorsById;
-    this.addCanonicalPhotometry(vision.canonical);
+    this.addCanonicalPhotometry(vision.canonical, diagnostics.profile ?? this.profile);
     for (const id of ["TL", "TR", "BR", "BL"] as const) {
       const observed = canonicalFiducialErrors === undefined
         ? vision.fiducials?.[id]
@@ -527,8 +587,10 @@ export class ExperimentMetrics {
 
   private addCanonicalPhotometry(
     canonical: NonNullable<BrowserVisionDiagnostics["canonical"]> | undefined,
+    profile: string | undefined,
   ): void {
     if (canonical === undefined) return;
+    this.addCanonicalClassification(canonical, profile);
     if (canonical.bootstrapSampling !== undefined) {
       for (const key of BOOTSTRAP_SAMPLING_METRICS) {
         const raw = canonical.bootstrapSampling[key];
@@ -567,6 +629,91 @@ export class ExperimentMetrics {
         }
         this.pushBounded(samples, key === "contrastLuma" ? value : Math.max(0, value));
       }
+    }
+  }
+
+  private addCanonicalClassification(
+    canonical: NonNullable<BrowserVisionDiagnostics["canonical"]>,
+    profile: string | undefined,
+  ): void {
+    if (canonical.bestDeltaE !== undefined && profile !== undefined) {
+      if (this.visionClassificationProfile !== undefined &&
+          this.visionClassificationProfile !== profile) {
+        this.resetCanonicalClassification();
+      }
+      this.visionClassificationProfile = profile;
+    }
+    for (const key of CLASSIFICATION_SCALAR_METRICS) {
+      const raw = canonical[key];
+      if (raw === undefined || !Number.isFinite(raw)) continue;
+      let samples = this.visionClassificationScalars.get(key);
+      if (samples === undefined) {
+        samples = [];
+        this.visionClassificationScalars.set(key, samples);
+      }
+      this.pushBounded(samples, Math.max(0, raw));
+    }
+    this.addClassifierDistribution(this.visionBestDeltaE, canonical.bestDeltaE);
+    this.addClassifierDistribution(this.visionDeltaEGap, canonical.deltaEGap);
+    this.addIndexedClassifierMetric(
+      this.visionErasuresByShard,
+      canonical.erasuresByShard,
+      false,
+    );
+    this.addIndexedClassifierMetric(
+      this.visionRemainingErasureBudgetByShard,
+      canonical.remainingErasureBudgetByShard,
+      true,
+    );
+    this.addIndexedClassifierMetric(
+      this.visionUncertainCellsByRow,
+      canonical.uncertainCellsByRow,
+      false,
+    );
+    this.addIndexedClassifierMetric(
+      this.visionUncertainCellsByColumn,
+      canonical.uncertainCellsByColumn,
+      false,
+    );
+  }
+
+  private resetCanonicalClassification(): void {
+    this.visionClassificationScalars.clear();
+    this.visionBestDeltaE.clear();
+    this.visionDeltaEGap.clear();
+    this.visionErasuresByShard.length = 0;
+    this.visionRemainingErasureBudgetByShard.length = 0;
+    this.visionUncertainCellsByRow.length = 0;
+    this.visionUncertainCellsByColumn.length = 0;
+  }
+
+  private addClassifierDistribution(
+    samplesByMetric: Map<keyof VisionClassifierDistributionDiagnostics, number[]>,
+    summary: Readonly<VisionClassifierDistributionDiagnostics> | undefined,
+  ): void {
+    if (summary === undefined || !validClassifierDistribution(summary)) return;
+    for (const key of CLASSIFIER_DISTRIBUTION_METRICS) {
+      let samples = samplesByMetric.get(key);
+      if (samples === undefined) {
+        samples = [];
+        samplesByMetric.set(key, samples);
+      }
+      this.pushBounded(samples, summary[key]);
+    }
+  }
+
+  private addIndexedClassifierMetric(
+    samplesByPosition: number[][],
+    values: readonly number[] | undefined,
+    signed: boolean,
+  ): void {
+    if (values === undefined || values.length > MAX_CLASSIFIER_AGGREGATE_BUCKETS ||
+        values.some((raw) => !Number.isInteger(raw) || (!signed && raw < 0))) return;
+    for (let position = 0; position < values.length; position++) {
+      const raw = values[position]!;
+      const samples = samplesByPosition[position] ?? [];
+      if (samplesByPosition[position] === undefined) samplesByPosition[position] = samples;
+      this.pushBounded(samples, raw);
     }
   }
 
@@ -678,15 +825,49 @@ export class ExperimentMetrics {
         ),
       ]),
     ) as NonNullable<VisionExperimentCanonicalSummary["timingRails"]>;
+    const classificationScalars = Object.fromEntries(
+      [...this.visionClassificationScalars].map(([key, samples]) => [key, distribution(samples)]),
+    ) as Partial<Record<VisionClassificationScalarMetric, TimingDistribution>>;
+    const bestDeltaE = Object.fromEntries(
+      [...this.visionBestDeltaE].map(([key, samples]) => [key, distribution(samples)]),
+    ) as NonNullable<VisionExperimentClassificationSummary["bestDeltaE"]>;
+    const deltaEGap = Object.fromEntries(
+      [...this.visionDeltaEGap].map(([key, samples]) => [key, distribution(samples)]),
+    ) as NonNullable<VisionExperimentClassificationSummary["deltaEGap"]>;
+    const erasuresByShard = this.visionErasuresByShard.map(distribution);
+    const remainingErasureBudgetByShard =
+      this.visionRemainingErasureBudgetByShard.map(distribution);
+    const uncertainCellsByRow = this.visionUncertainCellsByRow.map(distribution);
+    const uncertainCellsByColumn = this.visionUncertainCellsByColumn.map(distribution);
+    const hasClassification = this.visionClassificationScalars.size > 0 ||
+      this.visionBestDeltaE.size > 0 ||
+      this.visionDeltaEGap.size > 0 ||
+      erasuresByShard.length > 0 ||
+      remainingErasureBudgetByShard.length > 0 ||
+      uncertainCellsByRow.length > 0 ||
+      uncertainCellsByColumn.length > 0;
+    const classification: VisionExperimentClassificationSummary = {
+      ...classificationScalars,
+      ...(this.visionBestDeltaE.size === 0 ? {} : { bestDeltaE }),
+      ...(this.visionDeltaEGap.size === 0 ? {} : { deltaEGap }),
+      ...(erasuresByShard.length === 0 ? {} : { erasuresByShard }),
+      ...(remainingErasureBudgetByShard.length === 0
+        ? {}
+        : { remainingErasureBudgetByShard }),
+      ...(uncertainCellsByRow.length === 0 ? {} : { uncertainCellsByRow }),
+      ...(uncertainCellsByColumn.length === 0 ? {} : { uncertainCellsByColumn }),
+    };
     const hasCanonicalPhotometry = this.visionBootstrapSampling.size > 0 ||
       this.visionTimingUncertainModules.length > 0 ||
-      this.visionTimingRails.size > 0;
+      this.visionTimingRails.size > 0 ||
+      hasClassification;
     const canonical: VisionExperimentCanonicalSummary = {
       ...(this.visionBootstrapSampling.size === 0 ? {} : { bootstrapSampling }),
       ...(this.visionTimingUncertainModules.length === 0
         ? {}
         : { timingUncertainModules: distribution(this.visionTimingUncertainModules) }),
       ...(this.visionTimingRails.size === 0 ? {} : { timingRails }),
+      ...(hasClassification ? { classification } : {}),
     };
     return {
       debugEnabled: this.visionDebugEnabled,
@@ -719,6 +900,19 @@ export class ExperimentMetrics {
       },
     };
   }
+}
+
+function validClassifierDistribution(
+  summary: Readonly<VisionClassifierDistributionDiagnostics>,
+): boolean {
+  if (!Number.isInteger(summary.count) || summary.count < 0 ||
+      ![summary.min, summary.p50, summary.p95, summary.max].every(Number.isFinite) ||
+      summary.min < 0 ||
+      summary.min > summary.p50 ||
+      summary.p50 > summary.p95 ||
+      summary.p95 > summary.max) return false;
+  return summary.count !== 0 ||
+    (summary.min === 0 && summary.p50 === 0 && summary.p95 === 0 && summary.max === 0);
 }
 
 function distribution(values: readonly number[]): TimingDistribution {

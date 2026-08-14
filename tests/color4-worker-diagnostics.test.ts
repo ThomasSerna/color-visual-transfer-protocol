@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { CanonicalRasterDiagnostics } from "../shared/color4/classifier.ts";
+import type { Color4UnwrapObservation } from "../shared/color4/envelope.ts";
 
 test("worker maps photometric canonical diagnostics without debug bootstrap bytes", async () => {
   const previousSelf = Object.getOwnPropertyDescriptor(globalThis, "self");
@@ -43,6 +44,18 @@ test("worker maps photometric canonical diagnostics without debug bootstrap byte
       minimumPaletteDistance: 30,
       uncertainCells: 219,
       erasureBytes: 195,
+      distanceRejectedCells: 40,
+      gapRejectedCells: 196,
+      bothRejectedCells: 17,
+      erasuresByShard: [26, 35, 29, 34, 34, 37],
+      parityByShard: 32,
+      remainingErasureBudgetByShard: [6, -3, 3, -2, -2, -5],
+      uncertainCellsByRow: [1, 2, 3],
+      uncertainCellsByColumn: [4, 5, 6],
+      effectiveMaximumDeltaE: 45,
+      effectiveMinimumDeltaEGap: 17.5,
+      bestDeltaE: { count: 6_120, min: 1, p50: 10, p95: 30, max: 40 },
+      deltaEGap: { count: 6_120, min: 0.5, p50: 25, p95: 60, max: 80 },
       meanBestDeltaE: 12,
       maximumBestDeltaE: 40,
     } as unknown as CanonicalRasterDiagnostics;
@@ -51,6 +64,13 @@ test("worker maps photometric canonical diagnostics without debug bootstrap byte
 
     assert.equal(mapped.timingUncertainModules, 0);
     assert.equal(mapped.timingRails?.right.modules, 78);
+    assert.deepEqual(mapped.erasuresByShard, [26, 35, 29, 34, 34, 37]);
+    assert.deepEqual(mapped.remainingErasureBudgetByShard, [6, -3, 3, -2, -2, -5]);
+    assert.deepEqual(mapped.bestDeltaE, diagnostics.bestDeltaE);
+    assert.deepEqual(mapped.deltaEGap, diagnostics.deltaEGap);
+    assert.notStrictEqual(mapped.erasuresByShard, diagnostics.erasuresByShard);
+    assert.notStrictEqual(mapped.uncertainCellsByRow, diagnostics.uncertainCellsByRow);
+    assert.notStrictEqual(mapped.bestDeltaE, diagnostics.bestDeltaE);
     assert.deepEqual(mapped.bootstrapSampling, {
       doubleVoteColumns: 20,
       singleVoteColumns: 4,
@@ -70,6 +90,25 @@ test("worker maps photometric canonical diagnostics without debug bootstrap byte
     });
     assert.equal("timingUncertainModules" in preTiming, false);
     assert.equal("timingRails" in preTiming, false);
+
+    const preClassification = canonicalVisionDiagnostics({
+      ...diagnostics,
+      distanceRejectedCells: 0,
+      gapRejectedCells: 0,
+      bothRejectedCells: 0,
+      erasuresByShard: [],
+      parityByShard: 0,
+      remainingErasureBudgetByShard: [],
+      uncertainCellsByRow: [],
+      uncertainCellsByColumn: [],
+      effectiveMaximumDeltaE: 0,
+      effectiveMinimumDeltaEGap: 0,
+      bestDeltaE: { count: 0, min: 0, p50: 0, p95: 0, max: 0 },
+      deltaEGap: { count: 0, min: 0, p50: 0, p95: 0, max: 0 },
+    });
+    assert.equal("distanceRejectedCells" in preClassification, false);
+    assert.equal("erasuresByShard" in preClassification, false);
+    assert.equal("bestDeltaE" in preClassification, false);
   } finally {
     if (previousSelf === undefined) delete (globalThis as { self?: unknown }).self;
     else Object.defineProperty(globalThis, "self", previousSelf);
@@ -88,3 +127,82 @@ function rail(modules: number) {
     modules,
   };
 }
+
+test("worker exposes bounded erasure attempts and retains original saturation diagnosis", async () => {
+  const previousSelf = Object.getOwnPropertyDescriptor(globalThis, "self");
+  Object.defineProperty(globalThis, "self", {
+    configurable: true,
+    value: { onmessage: null, postMessage: () => undefined },
+  });
+  try {
+    const {
+      color4ErasurePolicyDiagnostics,
+      color4FecDiagnosticReason,
+    } = await import("../receive/color4-worker.ts");
+    const rejected = { status: "rejected", reason: "fec-uncorrectable" };
+    const valid = { status: "valid" };
+    const policy = {
+      result: valid,
+      selectedPolicy: "hard-decision",
+      selectedErasures: new Uint16Array(),
+      selectedObservations: [],
+      suggestedErasuresByShard: [26, 35, 29, 34, 34, 37],
+      saturatedErasureShards: [1, 3, 4, 5],
+      attempts: [
+        {
+          policy: "classifier-budgeted",
+          erasures: new Uint16Array(55),
+          erasuresByShard: [26, 0, 29, 0, 0, 0],
+          observations: [],
+          result: rejected,
+        },
+        {
+          policy: "hard-decision",
+          erasures: new Uint16Array(),
+          erasuresByShard: [0, 0, 0, 0, 0, 0],
+          observations: [],
+          result: valid,
+        },
+      ],
+    } as unknown as Parameters<typeof color4ErasurePolicyDiagnostics>[0];
+
+    const diagnostics = color4ErasurePolicyDiagnostics(policy);
+    assert.deepEqual(diagnostics, {
+      erasurePolicy: "hard-decision",
+      suggestedErasuresByShard: [26, 35, 29, 34, 34, 37],
+      saturatedErasureShards: [1, 3, 4, 5],
+      unwrapAttempts: [
+        {
+          policy: "classifier-budgeted",
+          erasures: 55,
+          erasuresByShard: [26, 0, 29, 0, 0, 0],
+          status: "rejected",
+          reason: "fec-uncorrectable",
+        },
+        {
+          policy: "hard-decision",
+          erasures: 0,
+          erasuresByShard: [0, 0, 0, 0, 0, 0],
+          status: "valid",
+        },
+      ],
+    });
+    assert.deepEqual(structuredClone(diagnostics), diagnostics);
+
+    const locatorObservation = [{
+      stage: "rs",
+      shards: [{ reason: "locator" }],
+    }] as unknown as readonly Color4UnwrapObservation[];
+    assert.equal(
+      color4FecDiagnosticReason("fec-uncorrectable", locatorObservation),
+      "RS_FAILED",
+    );
+    assert.equal(
+      color4FecDiagnosticReason("fec-uncorrectable", locatorObservation, [1, 3, 4, 5]),
+      "COLOR_CLASSIFICATION_TOO_UNCERTAIN",
+    );
+  } finally {
+    if (previousSelf === undefined) delete (globalThis as { self?: unknown }).self;
+    else Object.defineProperty(globalThis, "self", previousSelf);
+  }
+});

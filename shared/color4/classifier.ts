@@ -25,6 +25,7 @@ import {
   type LocalBinaryRailModel,
 } from "./binary-photometry";
 import { crc8Atm } from "./crc";
+import { shardPosition } from "./interleave";
 import {
   ACTIVE_MODULES,
   BOOTSTRAP_COLUMNS,
@@ -103,6 +104,15 @@ export type CanonicalRasterRejectReason =
   | "phase_mismatch"
   | "calibration_failed";
 
+/** Bounded, persistence-safe summary of one classifier confidence metric. */
+export interface ClassifierDistributionSummary {
+  readonly count: number;
+  readonly min: number;
+  readonly p50: number;
+  readonly p95: number;
+  readonly max: number;
+}
+
 export interface CanonicalRasterDiagnostics {
   readonly moduleScale: number;
   /** Sum across all four fiducials, retained for schema compatibility. */
@@ -123,6 +133,23 @@ export interface CanonicalRasterDiagnostics {
   readonly minimumPaletteDistance: number;
   readonly uncertainCells: number;
   readonly erasureBytes: number;
+  /** Cells rejected by the distance predicate, including cells rejected by both predicates. */
+  readonly distanceRejectedCells: number;
+  /** Cells rejected by the gap predicate, including cells rejected by both predicates. */
+  readonly gapRejectedCells: number;
+  readonly bothRejectedCells: number;
+  /** Erased bytes per interleaved Reed-Solomon shard. */
+  readonly erasuresByShard: readonly number[];
+  readonly parityByShard: number;
+  /** May be negative when a shard already exceeds its erasure-only FEC budget. */
+  readonly remainingErasureBudgetByShard: readonly number[];
+  /** Uncertain cells (not byte or payload indices) aggregated by raster row and column. */
+  readonly uncertainCellsByRow: readonly number[];
+  readonly uncertainCellsByColumn: readonly number[];
+  readonly effectiveMaximumDeltaE: number;
+  readonly effectiveMinimumDeltaEGap: number;
+  readonly bestDeltaE: ClassifierDistributionSummary;
+  readonly deltaEGap: ClassifierDistributionSummary;
   readonly meanBestDeltaE: number;
   readonly maximumBestDeltaE: number;
 }
@@ -307,6 +334,18 @@ interface MutableDiagnostics {
   minimumPaletteDistance: number;
   uncertainCells: number;
   erasureBytes: number;
+  distanceRejectedCells: number;
+  gapRejectedCells: number;
+  bothRejectedCells: number;
+  erasuresByShard: readonly number[];
+  parityByShard: number;
+  remainingErasureBudgetByShard: readonly number[];
+  uncertainCellsByRow: readonly number[];
+  uncertainCellsByColumn: readonly number[];
+  effectiveMaximumDeltaE: number;
+  effectiveMinimumDeltaEGap: number;
+  bestDeltaE: ClassifierDistributionSummary;
+  deltaEGap: ClassifierDistributionSummary;
   meanBestDeltaE: number;
   maximumBestDeltaE: number;
 }
@@ -331,6 +370,69 @@ interface CalibrationModel {
   readonly minimumPaletteDistance: number;
 }
 
+function emptyClassifierDistribution(): ClassifierDistributionSummary {
+  return Object.freeze({ count: 0, min: 0, p50: 0, p95: 0, max: 0 });
+}
+
+function classifierDistribution(values: readonly number[]): ClassifierDistributionSummary {
+  if (values.length === 0) return emptyClassifierDistribution();
+  const sorted = [...values].sort((left, right) => left - right);
+  const percentile = (position: number): number =>
+    sorted[Math.floor((sorted.length - 1) * position)]!;
+  return Object.freeze({
+    count: sorted.length,
+    min: sorted[0]!,
+    p50: percentile(0.5),
+    p95: percentile(0.95),
+    max: sorted.at(-1)!,
+  });
+}
+
+function assertClassifierDistribution(
+  name: string,
+  summary: ClassifierDistributionSummary,
+  expectedCount: number,
+): void {
+  const ordered = summary.min <= summary.p50 &&
+    summary.p50 <= summary.p95 &&
+    summary.p95 <= summary.max;
+  if (summary.count !== expectedCount ||
+      !Number.isInteger(summary.count) ||
+      ![summary.min, summary.p50, summary.p95, summary.max].every(Number.isFinite) ||
+      !ordered) {
+    throw new Error(`Invalid COLOR_4 ${name} distribution invariant.`);
+  }
+}
+
+function assertCompletedClassificationDiagnostics(
+  value: MutableDiagnostics,
+  profile: Color4Profile,
+): void {
+  const cells = profile.columns * profile.rows;
+  const sum = (entries: readonly number[]): number =>
+    entries.reduce((total, entry) => total + entry, 0);
+  assertClassifierDistribution("bestDeltaE", value.bestDeltaE, cells);
+  assertClassifierDistribution("deltaEGap", value.deltaEGap, cells);
+  if (value.uncertainCells !==
+      value.distanceRejectedCells + value.gapRejectedCells - value.bothRejectedCells ||
+      value.bothRejectedCells > value.distanceRejectedCells ||
+      value.bothRejectedCells > value.gapRejectedCells ||
+      value.uncertainCellsByRow.length !== profile.rows ||
+      value.uncertainCellsByColumn.length !== profile.columns ||
+      sum(value.uncertainCellsByRow) !== value.uncertainCells ||
+      sum(value.uncertainCellsByColumn) !== value.uncertainCells ||
+      value.erasuresByShard.length !== profile.shards ||
+      value.remainingErasureBudgetByShard.length !== profile.shards ||
+      sum(value.erasuresByShard) !== value.erasureBytes ||
+      value.parityByShard !== profile.rsN - profile.rsK ||
+      value.remainingErasureBudgetByShard.some(
+        (remaining, shard) => remaining !== value.parityByShard - value.erasuresByShard[shard]!,
+      ) ||
+      value.maximumBestDeltaE !== value.bestDeltaE.max) {
+    throw new Error("Invalid COLOR_4 classification diagnostics invariant.");
+  }
+}
+
 function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics {
   return {
     moduleScale: 0,
@@ -348,6 +450,18 @@ function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics 
     minimumPaletteDistance: 0,
     uncertainCells: 0,
     erasureBytes: 0,
+    distanceRejectedCells: 0,
+    gapRejectedCells: 0,
+    bothRejectedCells: 0,
+    erasuresByShard: [],
+    parityByShard: 0,
+    remainingErasureBudgetByShard: [],
+    uncertainCellsByRow: [],
+    uncertainCellsByColumn: [],
+    effectiveMaximumDeltaE: 0,
+    effectiveMinimumDeltaEGap: 0,
+    bestDeltaE: emptyClassifierDistribution(),
+    deltaEGap: emptyClassifierDistribution(),
     meanBestDeltaE: 0,
     maximumBestDeltaE: 0,
     ...initial,
@@ -358,6 +472,12 @@ function freezeDiagnostics(value: MutableDiagnostics): CanonicalRasterDiagnostic
   return Object.freeze({
     ...value,
     fiducialErrorsById: Object.freeze({ ...value.fiducialErrorsById }),
+    erasuresByShard: Object.freeze([...value.erasuresByShard]),
+    remainingErasureBudgetByShard: Object.freeze([...value.remainingErasureBudgetByShard]),
+    uncertainCellsByRow: Object.freeze([...value.uncertainCellsByRow]),
+    uncertainCellsByColumn: Object.freeze([...value.uncertainCellsByColumn]),
+    bestDeltaE: Object.freeze({ ...value.bestDeltaE }),
+    deltaEGap: Object.freeze({ ...value.deltaEGap }),
     ...(value.bootstrapSampling === undefined
       ? {}
       : { bootstrapSampling: Object.freeze({ ...value.bootstrapSampling }) }),
@@ -1277,8 +1397,15 @@ export function decodeCanonicalColor4Raster(
     Math.max(thresholds.maximumDeltaE, thresholds.maximumDeltaE + model.mad * 6),
   );
   const dynamicMinimumGap = Math.max(thresholds.minimumDeltaEGap, model.mad * 2 + 4);
+  values.effectiveMaximumDeltaE = dynamicMaximumDeltaE;
+  values.effectiveMinimumDeltaEGap = dynamicMinimumGap;
   const codedBytes = new Uint8Array(profile.codedBytes);
   const erasures: number[] = [];
+  const erasuresByShard = Array<number>(profile.shards).fill(0);
+  const uncertainCellsByRow = Array<number>(profile.rows).fill(0);
+  const uncertainCellsByColumn = Array<number>(profile.columns).fill(0);
+  const bestDeltaEValues: number[] = [];
+  const deltaEGapValues: number[] = [];
   const observedCells: RankedCellBuffer | undefined = !observingDetail
     ? undefined
     : { entries: [], leastIndex: 0, leastScore: Number.POSITIVE_INFINITY };
@@ -1305,16 +1432,23 @@ export function decodeCanonicalColor4Raster(
         dynamicMaximumDeltaE,
         dynamicMinimumGap,
       );
+      const deltaEGap = classified.secondDeltaE - classified.bestDeltaE;
+      const distanceRejected = classified.bestDeltaE > dynamicMaximumDeltaE;
+      const gapRejected = deltaEGap < dynamicMinimumGap;
       byte = (byte << 2) | classified.dibit;
       if (classified.erased) {
         byteErased = true;
         values.uncertainCells++;
+        uncertainCellsByRow[row] = (uncertainCellsByRow[row] ?? 0) + 1;
+        uncertainCellsByColumn[column] = (uncertainCellsByColumn[column] ?? 0) + 1;
       }
+      if (distanceRejected) values.distanceRejectedCells++;
+      if (gapRejected) values.gapRejectedCells++;
+      if (distanceRejected && gapRejected) values.bothRejectedCells++;
       if (observing) {
         const clipped = rawClippedChannels(raw);
         clippedChannels += clipped;
         if (observedCells !== undefined) {
-          const deltaEGap = classified.secondDeltaE - classified.bestDeltaE;
           const score = cellObservationScore(
             classified.erased,
             classified.bestDeltaE,
@@ -1339,15 +1473,31 @@ export function decodeCanonicalColor4Raster(
         }
       }
       totalBestDeltaE += classified.bestDeltaE;
+      bestDeltaEValues.push(classified.bestDeltaE);
+      deltaEGapValues.push(deltaEGap);
       values.maximumBestDeltaE = Math.max(values.maximumBestDeltaE, classified.bestDeltaE);
       cell++;
     }
     codedBytes[byteIndex] = byte;
-    if (byteErased) erasures.push(byteIndex);
+    if (byteErased) {
+      erasures.push(byteIndex);
+      const shard = shardPosition(byteIndex, profile.shards).shard;
+      erasuresByShard[shard] = (erasuresByShard[shard] ?? 0) + 1;
+    }
   }
 
   values.erasureBytes = erasures.length;
-  values.meanBestDeltaE = totalBestDeltaE / (profile.columns * profile.rows);
+  values.erasuresByShard = erasuresByShard;
+  values.parityByShard = profile.rsN - profile.rsK;
+  values.remainingErasureBudgetByShard = erasuresByShard.map(
+    (count) => values.parityByShard - count,
+  );
+  values.uncertainCellsByRow = uncertainCellsByRow;
+  values.uncertainCellsByColumn = uncertainCellsByColumn;
+  values.bestDeltaE = classifierDistribution(bestDeltaEValues);
+  values.deltaEGap = classifierDistribution(deltaEGapValues);
+  values.meanBestDeltaE = totalBestDeltaE / bestDeltaEValues.length;
+  assertCompletedClassificationDiagnostics(values, profile);
   const classificationTiming = observing
     ? elapsedSince(options.clock, stageStartedAt)
     : { endedAt: 0, durationMs: 0 };

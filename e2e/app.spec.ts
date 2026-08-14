@@ -256,6 +256,7 @@ test("the COLOR_4 camera Debug Vision exports a private snapshot and stops clean
   const snapshot = JSON.parse(new TextDecoder().decode(jsonEntry!.data)) as {
     schema: string;
     version: number;
+    build: string;
     configuration: {
       carrier: string;
       canonicalScale: number;
@@ -303,6 +304,10 @@ test("the COLOR_4 camera Debug Vision exports a private snapshot and stops clean
       warped: { available: true },
     },
   });
+  expect(snapshot.build).toMatch(
+    /^v\d+\.\d+\.\d+(?:-[^ ]+)? · build [0-9a-f]{7,40}(?:-dirty)? ·/,
+  );
+  expect(snapshot.build).not.toContain("build 054ecdb");
   expect(snapshot.vision.traces.length).toBeGreaterThanOrEqual(4);
   const rawEntry = snapshotEntries.find((entry) => entry.name.endsWith("-raw.png"));
   expect(rawEntry).toBeDefined();

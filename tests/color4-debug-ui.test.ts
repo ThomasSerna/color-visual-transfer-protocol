@@ -61,18 +61,37 @@ test("object-fit cover returns a safe identity for unavailable dimensions", () =
   }
 });
 
-test("snapshot JSON omits bootstrap bytes and CRC without mutating in-memory diagnostics", () => {
+test("snapshot JSON preserves aggregate classifier diagnostics and omits bootstrap bytes", () => {
   const record = {
     diagnostics: {
       classifier: [{
-        stage: "bootstrapPhase",
+        stage: "classification",
         bootstrapBytes: [0xd5, 0x24, 0x07],
         bootstrapCrc: { expected: 0x07, observed: 0x07 },
+        cells: [{
+          cellIndex: 16,
+          byteIndex: 4,
+          dibitIndex: 0,
+          dibit: 3,
+          bestDeltaE: 22,
+        }],
         diagnostics: {
           bootstrapSampling: {
             doubleVoteColumns: 24,
             minimumDifferentialLuma: 47.7157,
           },
+          distanceRejectedCells: 124,
+          gapRejectedCells: 196,
+          bothRejectedCells: 101,
+          erasuresByShard: [26, 35, 29, 34, 34, 37],
+          parityByShard: 32,
+          remainingErasureBudgetByShard: [6, -3, 3, -2, -2, -5],
+          uncertainCellsByRow: [1, 2, 3],
+          uncertainCellsByColumn: [3, 3],
+          effectiveMaximumDeltaE: 45,
+          effectiveMinimumDeltaEGap: 18.02,
+          bestDeltaE: { count: 6_120, min: 0, p50: 8, p95: 44, max: 79 },
+          deltaEGap: { count: 6_120, min: 0, p50: 31, p95: 65, max: 90 },
         },
       }],
       nested: {
@@ -91,6 +110,22 @@ test("snapshot JSON omits bootstrap bytes and CRC without mutating in-memory dia
   assert.deepEqual(
     persisted.diagnostics.classifier[0]?.diagnostics.bootstrapSampling,
     record.diagnostics.classifier[0]?.diagnostics.bootstrapSampling,
+  );
+  assert.deepEqual(
+    persisted.diagnostics.classifier[0]?.diagnostics.erasuresByShard,
+    record.diagnostics.classifier[0]?.diagnostics.erasuresByShard,
+  );
+  assert.deepEqual(
+    persisted.diagnostics.classifier[0]?.diagnostics.uncertainCellsByRow,
+    record.diagnostics.classifier[0]?.diagnostics.uncertainCellsByRow,
+  );
+  assert.deepEqual(
+    persisted.diagnostics.classifier[0]?.diagnostics.bestDeltaE,
+    record.diagnostics.classifier[0]?.diagnostics.bestDeltaE,
+  );
+  assert.deepEqual(
+    persisted.diagnostics.classifier[0]?.cells,
+    record.diagnostics.classifier[0]?.cells,
   );
   assert.deepEqual(record, before);
   assert.deepEqual(record.diagnostics.classifier[0]?.bootstrapBytes, [0xd5, 0x24, 0x07]);

@@ -26,6 +26,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+        env:
+          CVTP_REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE: "1"
       - run: npm run build:all
 
       - name: Package artifacts

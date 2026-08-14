@@ -61,6 +61,17 @@ function incrementingClock(step = 1): () => number {
   };
 }
 
+function assertDistributionInvariant(
+  summary: Readonly<{ count: number; min: number; p50: number; p95: number; max: number }>,
+  expectedCount: number,
+): void {
+  assert.equal(summary.count, expectedCount);
+  assert.ok(Number.isFinite(summary.min));
+  assert.ok(summary.min <= summary.p50);
+  assert.ok(summary.p50 <= summary.p95);
+  assert.ok(summary.p95 <= summary.max);
+}
+
 test("canonical classifier observations separate stages without changing deterministic output", () => {
   const coded = deterministicBytes(ROBUST_PROFILE.codedBytes);
   const raster = rasterizeColor4(coded, {
@@ -134,6 +145,53 @@ test("canonical classifier observations separate stages without changing determi
     assert.equal(classification.diagnostics.erasureBytes, 1);
     assert.ok(classification.clippedChannels > 0);
     assert.ok((classification.effectiveThresholds?.maximumDeltaE ?? 0) >= 24);
+    const diagnostics = classification.diagnostics;
+    const expectedCells = ROBUST_PROFILE.columns * ROBUST_PROFILE.rows;
+    assert.equal(
+      diagnostics.uncertainCells,
+      diagnostics.distanceRejectedCells + diagnostics.gapRejectedCells -
+        diagnostics.bothRejectedCells,
+    );
+    assert.equal(
+      diagnostics.uncertainCellsByRow.reduce((sum, count) => sum + count, 0),
+      diagnostics.uncertainCells,
+    );
+    assert.equal(
+      diagnostics.uncertainCellsByColumn.reduce((sum, count) => sum + count, 0),
+      diagnostics.uncertainCells,
+    );
+    assert.equal(diagnostics.uncertainCellsByRow.length, ROBUST_PROFILE.rows);
+    assert.equal(diagnostics.uncertainCellsByColumn.length, ROBUST_PROFILE.columns);
+    assert.equal(
+      diagnostics.erasuresByShard.reduce((sum, count) => sum + count, 0),
+      diagnostics.erasureBytes,
+    );
+    assert.equal(diagnostics.erasuresByShard.length, ROBUST_PROFILE.shards);
+    assert.equal(diagnostics.parityByShard, ROBUST_PROFILE.rsN - ROBUST_PROFILE.rsK);
+    assert.deepEqual(
+      diagnostics.remainingErasureBudgetByShard,
+      diagnostics.erasuresByShard.map((count) => diagnostics.parityByShard - count),
+    );
+    assert.equal(
+      diagnostics.effectiveMaximumDeltaE,
+      classification.effectiveThresholds.maximumDeltaE,
+    );
+    assert.equal(
+      diagnostics.effectiveMinimumDeltaEGap,
+      classification.effectiveThresholds.minimumDeltaEGap,
+    );
+    assertDistributionInvariant(diagnostics.bestDeltaE, expectedCells);
+    assertDistributionInvariant(diagnostics.deltaEGap, expectedCells);
+    assert.equal(diagnostics.bestDeltaE.max, diagnostics.maximumBestDeltaE);
+    for (const frozen of [
+      diagnostics.uncertainCellsByRow,
+      diagnostics.uncertainCellsByColumn,
+      diagnostics.erasuresByShard,
+      diagnostics.remainingErasureBudgetByShard,
+      diagnostics.bestDeltaE,
+      diagnostics.deltaEGap,
+    ]) assert.equal(Object.isFrozen(frozen), true);
+    assert.deepEqual(structuredClone(diagnostics), diagnostics);
   }
 });
 

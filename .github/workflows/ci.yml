@@ -24,6 +24,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+        env:
+          CVTP_REQUIRE_PHYSICAL_FIXTURES: "1"
       - run: npm run build:all
       # A regression here means the inlined worker or wasm leaked into the
       # served bundle — see build/use-inline-variants.ts.

@@ -6,10 +6,10 @@ but they do not replay camera acquisition, contour detection, fiducial search or
 homography estimation. Do not use them as evidence that the OpenCV path or a
 physical transfer works end to end.
 
-Only the privacy-reviewed warped artifact is stored here. The corresponding raw
-camera frame is deliberately excluded because it contains browser and room
-context. Physical full-frame captures, when safe to retain, belong under
-`../physical/` and have a different evidence contract.
+Only the privacy-reviewed warped artifact is stored in this canonical fixture.
+After a separate privacy review, the corresponding full camera frame was
+retained under `../physical/capture-000017/`, where it follows the physical
+acquisition evidence contract.
 
 ## `capture-000017`
 
@@ -24,11 +24,16 @@ re-encoding the PNG.
 - decoded RGBA SHA-256: `86ebacb71a5bb9268848c3c478cdc51452ad4671d30bd38dc0d20e03a1402554`
 - expected classifier result: PHY 1, ROBUST, KCMY, phase 3
 - expected timing result: 0 errors across 314 modules
-- expected classification result: 219 uncertain cells and 195 erased bytes
+- expected classification result: 219 uncertain cells and 195 candidate erased
+  bytes, distributed `[26, 35, 29, 34, 34, 37]` across the six shards
 - coded-byte SHA-256: `fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df`
-- expected unwrap result: `fec-uncorrectable`, localized as
-  `COLOR_CLASSIFICATION_TOO_UNCERTAIN`
+- expected bounded-policy selection: `classifier-budgeted`, one attempt, with
+  55 selected erasures distributed `[26, 0, 29, 0, 0, 0]`
+- expected unwrap result: valid session 31926, sequence 23 (phase 3), with 31
+  corrected errors, 47 corrected bytes and all six shards corrected
+- inner-frame SHA-256: `a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84`
 
-The expected FEC rejection is intentional. This fixture pins the phase-1
-photometric fix through classification/RS; it is not a successful-transfer
-fixture.
+This is a `crc-derived-regression` oracle: the recovered bytes are pinned only
+after Reed-Solomon, CRC32C and wire validation. The original transmitter bytes
+are unavailable, so this fixture is not independent transmitter ground truth
+and does not by itself prove a successful physical end-to-end transfer.

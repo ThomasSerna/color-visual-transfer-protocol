@@ -34,10 +34,11 @@ export function canonicalDiagnosticReason(
 export function fecDiagnosticReason(
   reason: string,
   shardReasons: readonly (string | undefined)[] = [],
+  classifierHintsSaturated = false,
 ): Color4DiagnosticReason | undefined {
   if (reason === "crc-mismatch") return "CRC_FAILED";
   if (reason !== "fec-uncorrectable") return undefined;
-  return shardReasons.includes("too-many-erasures")
+  return classifierHintsSaturated || shardReasons.includes("too-many-erasures")
     ? "COLOR_CLASSIFICATION_TOO_UNCERTAIN"
     : "RS_FAILED";
 }

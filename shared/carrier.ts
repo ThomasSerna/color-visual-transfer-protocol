@@ -100,6 +100,15 @@ export interface VisionTimingRailDiagnostics {
   readonly modules: number;
 }
 
+/** Persistence-safe classifier summary; it never contains samples, payload bytes or indices. */
+export interface VisionClassifierDistributionDiagnostics {
+  readonly count: number;
+  readonly min: number;
+  readonly p50: number;
+  readonly p95: number;
+  readonly max: number;
+}
+
 /**
  * Small, persistence-safe COLOR_4 diagnostics. Pixel planes, quads, cell
  * traces and camera imagery deliberately stay in the receiver's ephemeral
@@ -155,6 +164,19 @@ export interface BrowserVisionDiagnostics {
     minimumPaletteDistance?: number;
     uncertainCells?: number;
     erasureBytes?: number;
+    distanceRejectedCells?: number;
+    gapRejectedCells?: number;
+    bothRejectedCells?: number;
+    /** Aggregate counts only; no erased-byte positions are exposed. */
+    erasuresByShard?: readonly number[];
+    parityByShard?: number;
+    remainingErasureBudgetByShard?: readonly number[];
+    uncertainCellsByRow?: readonly number[];
+    uncertainCellsByColumn?: readonly number[];
+    effectiveMaximumDeltaE?: number;
+    effectiveMinimumDeltaEGap?: number;
+    bestDeltaE?: Readonly<VisionClassifierDistributionDiagnostics>;
+    deltaEGap?: Readonly<VisionClassifierDistributionDiagnostics>;
     meanBestDeltaE?: number;
     maximumBestDeltaE?: number;
   }>;

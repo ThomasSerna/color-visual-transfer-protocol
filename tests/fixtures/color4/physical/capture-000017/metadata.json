@@ -1,0 +1,71 @@
+{
+  "$schema": "../metadata.schema.json",
+  "schema": "cvtp-color4-physical-capture",
+  "version": 1,
+  "provenance": {
+    "kind": "physical-camera",
+    "device": "Android camera; device model was not recorded by the snapshot",
+    "browser": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36",
+    "operatingSystem": "Android 10 (from the recorded browser user agent)",
+    "notes": "Privacy-reviewed unaltered Debug Vision export produced by build 054ecdb."
+  },
+  "rawFrame": {
+    "width": 1440,
+    "height": 1920,
+    "pngSha256": "de367892a2480dc7dde46f5b4f5b88f1942b8a9cadd85402f497f5f45d548907",
+    "rgbaSha256": "503e0e73bd746bc6f95c0968ae3ee170721e44dc59d1ad222f81d248170dffdf",
+    "preparation": "unaltered-export",
+    "scope": "full-camera-frame"
+  },
+  "camera": {
+    "requested": { "width": 1920, "height": 1440, "frameRate": 30 },
+    "actual": { "width": 1440, "height": 1920, "frameRate": 30 },
+    "distanceM": 0.5,
+    "angleDeg": 0
+  },
+  "configuration": {
+    "carrier": "COLOR_4",
+    "expectedProfile": "ROBUST",
+    "palette": "KCMY",
+    "paletteId": 0,
+    "txFps": 5,
+    "prefilterMode": "observe",
+    "brightness": "maximum",
+    "canonicalScale": 6,
+    "maxDetectionDimension": 1280
+  },
+  "oracle": {
+    "basis": {
+      "kind": "crc-derived-regression",
+      "description": "The decoded frame is pinned only after Reed-Solomon correction, CRC32C, outer-header identity, and inner-frame parsing succeeded; the original transmitter bytes were not retained independently."
+    },
+    "vision": { "status": "valid" },
+    "classifier": {
+      "status": "valid",
+      "profile": "ROBUST",
+      "paletteId": 0,
+      "sequencePhase": 3,
+      "uncertainCells": 219,
+      "candidateErasures": {
+        "total": 195,
+        "byShard": [26, 35, 29, 34, 34, 37]
+      },
+      "codedBytesSha256": "fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df"
+    },
+    "unwrap": {
+      "status": "valid",
+      "sessionId": 31926,
+      "sequence": 23,
+      "selectedPolicy": "classifier-budgeted",
+      "attempts": 1,
+      "selectedErasures": {
+        "total": 55,
+        "byShard": [26, 0, 29, 0, 0, 0]
+      },
+      "correctedErrors": 31,
+      "correctedBytes": 47,
+      "correctedShards": 6,
+      "innerFrameSha256": "a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84"
+    }
+  }
+}

@@ -16,11 +16,18 @@
     "paletteId": 0
   },
   "oracle": {
+    "basis": {
+      "kind": "crc-derived-regression",
+      "description": "Recovered from the retained capture and accepted only after Reed-Solomon correction, CRC32C validation, outer-header validation, inner-frame validation and identity validation; the original transmitter bytes are unavailable."
+    },
     "stages": [
       "canonicalGeometry",
       "bootstrapPhase",
       "calibration",
-      "classification"
+      "classification",
+      "rs",
+      "crc",
+      "wire"
     ],
     "bootstrap": {
       "version": 1,
@@ -34,13 +41,26 @@
     },
     "classification": {
       "uncertainCells": 219,
-      "erasureBytes": 195,
+      "candidateErasures": {
+        "total": 195,
+        "byShard": [26, 35, 29, 34, 34, 37]
+      },
       "codedBytesSha256": "fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df"
     },
     "unwrap": {
-      "status": "rejected",
-      "reason": "fec-uncorrectable",
-      "diagnosticReason": "COLOR_CLASSIFICATION_TOO_UNCERTAIN"
+      "status": "valid",
+      "sessionId": 31926,
+      "sequence": 23,
+      "selectedPolicy": "classifier-budgeted",
+      "attempts": 1,
+      "selectedErasures": {
+        "total": 55,
+        "byShard": [26, 0, 29, 0, 0, 0]
+      },
+      "correctedErrors": 31,
+      "correctedBytes": 47,
+      "correctedShards": 6,
+      "innerFrameSha256": "a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84"
     }
   },
   "evidenceBoundary": {
@@ -49,14 +69,17 @@
       "bootstrap and phase",
       "calibration",
       "colour classification",
-      "Reed-Solomon rejection localization"
+      "bounded FEC erasure policy",
+      "Reed-Solomon correction",
+      "CRC32C and wire validation"
     ],
     "excludes": [
       "raw camera acquisition",
       "OpenCV detection",
       "fiducial search",
       "homography estimation",
-      "successful end-to-end transfer"
+      "independent transmitter ground truth",
+      "successful physical end-to-end transfer"
     ]
   }
 }

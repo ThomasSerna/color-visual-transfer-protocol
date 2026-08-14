@@ -6,11 +6,14 @@ import { fileURLToPath } from "node:url";
 import { PNG } from "pngjs";
 import {
   decodeCanonicalColor4Raster,
+  shardPosition,
   unwrapColor4Frame,
   type CanonicalRasterObservation,
   type Color4UnwrapObservation,
 } from "../shared/color4/index.ts";
+import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
 import { fecDiagnosticReason } from "../receive/color4-diagnostic-reason.ts";
+import { runColor4ErasurePolicy } from "../receive/color4-erasure-policy.ts";
 
 const FIXTURE_DIRECTORY = fileURLToPath(
   new URL("./fixtures/color4/canonical/capture-000017/", import.meta.url),
@@ -18,14 +21,62 @@ const FIXTURE_DIRECTORY = fileURLToPath(
 const PNG_SHA256 = "3af7b4dd41ef15447fc54f7ef99e2d150a3f8a754b5c6a8a900003ae8e864bcc";
 const RGBA_SHA256 = "86ebacb71a5bb9268848c3c478cdc51452ad4671d30bd38dc0d20e03a1402554";
 const CODED_BYTES_SHA256 = "fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df";
+const INNER_FRAME_SHA256 = "a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84";
+
+interface CanonicalFixtureMetadata {
+  readonly oracle: {
+    readonly basis: {
+      readonly kind: string;
+    };
+    readonly classification: {
+      readonly uncertainCells: number;
+      readonly candidateErasures: {
+        readonly total: number;
+        readonly byShard: readonly number[];
+      };
+      readonly codedBytesSha256: string;
+    };
+    readonly unwrap: {
+      readonly status: string;
+      readonly sessionId: number;
+      readonly sequence: number;
+      readonly selectedPolicy: string;
+      readonly attempts: number;
+      readonly selectedErasures: {
+        readonly total: number;
+        readonly byShard: readonly number[];
+      };
+      readonly correctedErrors: number;
+      readonly correctedBytes: number;
+      readonly correctedShards: number;
+      readonly innerFrameSha256: string;
+    };
+  };
+}
 
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-test("canonical capture 000017 reaches classification and preserves its phase-1 oracle", async () => {
+function erasureDistribution(
+  erasures: ArrayLike<number>,
+  shards: number,
+): { readonly total: number; readonly byShard: readonly number[] } {
+  const byShard = Array.from({ length: shards }, () => 0);
+  for (const index of Array.from(erasures)) {
+    const shard = shardPosition(index, shards).shard;
+    byShard[shard] = (byShard[shard] ?? 0) + 1;
+  }
+  return { total: erasures.length, byShard };
+}
+
+test("canonical capture 000017 reaches a CRC-valid unwrap through the bounded erasure policy", async () => {
   const pngBytes = await readFile(`${FIXTURE_DIRECTORY}/capture-000017-warped.png`);
+  const metadata = JSON.parse(
+    await readFile(`${FIXTURE_DIRECTORY}/metadata.json`, "utf8"),
+  ) as CanonicalFixtureMetadata;
   assert.equal(sha256(pngBytes), PNG_SHA256, "canonical PNG bytes changed");
+  assert.equal(metadata.oracle.basis.kind, "crc-derived-regression");
 
   const png = PNG.sync.read(pngBytes);
   assert.deepEqual(
@@ -80,28 +131,123 @@ test("canonical capture 000017 reaches classification and preserves its phase-1 
   assert.equal(classified.diagnostics.timingModules, 314);
   assert.equal(classified.diagnostics.uncertainCells, 219);
   assert.equal(classified.diagnostics.erasureBytes, 195);
+  assert.equal(classified.diagnostics.distanceRejectedCells, 124);
+  assert.equal(classified.diagnostics.gapRejectedCells, 196);
+  assert.equal(classified.diagnostics.bothRejectedCells, 101);
+  assert.deepEqual(classified.diagnostics.erasuresByShard, [26, 35, 29, 34, 34, 37]);
+  assert.equal(classified.diagnostics.parityByShard, 32);
+  assert.deepEqual(
+    classified.diagnostics.remainingErasureBudgetByShard,
+    [6, -3, 3, -2, -2, -5],
+  );
+  assert.equal(classified.diagnostics.uncertainCellsByRow.length, classified.profile.rows);
+  assert.equal(classified.diagnostics.uncertainCellsByColumn.length, classified.profile.columns);
+  assert.equal(
+    classified.diagnostics.uncertainCellsByRow.reduce((sum, count) => sum + count, 0),
+    219,
+  );
+  assert.equal(
+    classified.diagnostics.uncertainCellsByColumn.reduce((sum, count) => sum + count, 0),
+    219,
+  );
+  assert.deepEqual([
+    classified.diagnostics.uncertainCellsByRow.slice(0, 28).reduce((sum, count) => sum + count, 0),
+    classified.diagnostics.uncertainCellsByRow.slice(28, 57).reduce((sum, count) => sum + count, 0),
+    classified.diagnostics.uncertainCellsByRow.slice(57).reduce((sum, count) => sum + count, 0),
+  ], [14, 31, 174]);
+  assert.equal(classified.diagnostics.effectiveMaximumDeltaE, 45);
+  assert.ok(classified.diagnostics.effectiveMinimumDeltaEGap > 18);
+  for (const summary of [
+    classified.diagnostics.bestDeltaE,
+    classified.diagnostics.deltaEGap,
+  ]) {
+    assert.equal(summary.count, classified.profile.columns * classified.profile.rows);
+    assert.ok(summary.min <= summary.p50);
+    assert.ok(summary.p50 <= summary.p95);
+    assert.ok(summary.p95 <= summary.max);
+  }
+  assert.deepEqual(structuredClone(classified.diagnostics), classified.diagnostics);
   assert.equal(classified.byteErasures.length, 195);
+  assert.deepEqual(
+    erasureDistribution(classified.byteErasures, classified.profile.shards),
+    { total: 195, byShard: [26, 35, 29, 34, 34, 37] },
+  );
   assert.equal(sha256(classified.codedBytes), CODED_BYTES_SHA256);
+  assert.deepEqual(metadata.oracle.classification, {
+    uncertainCells: 219,
+    candidateErasures: { total: 195, byShard: [26, 35, 29, 34, 34, 37] },
+    codedBytesSha256: CODED_BYTES_SHA256,
+  });
 
-  const unwrapObservations: Color4UnwrapObservation[] = [];
-  const unwrapped = unwrapColor4Frame(classified.codedBytes, {
+  const directObservations: Color4UnwrapObservation[] = [];
+  const direct = unwrapColor4Frame(classified.codedBytes, {
     profileId: classified.profile.id,
     paletteId: classified.paletteId,
     erasures: classified.byteErasures,
-    observer: (observation) => unwrapObservations.push(observation),
+    observer: (observation) => directObservations.push(observation),
   });
-  assert.equal(unwrapped.status, "rejected");
-  if (unwrapped.status !== "rejected") return;
-  assert.equal(unwrapped.reason, "fec-uncorrectable");
-  assert.equal(unwrapped.diagnostics.erasures, 195);
-
-  const shardReasons = unwrapObservations.flatMap((observation) =>
+  assert.equal(direct.status, "rejected");
+  if (direct.status !== "rejected") return;
+  assert.equal(direct.reason, "fec-uncorrectable");
+  assert.equal(direct.diagnostics.erasures, 195);
+  const directShardReasons = directObservations.flatMap((observation) =>
     observation.stage === "rs"
       ? observation.shards.map((shard) => shard.reason)
       : [],
   );
+  assert.ok(directShardReasons.includes("too-many-erasures"));
   assert.equal(
-    fecDiagnosticReason(unwrapped.reason, shardReasons),
+    fecDiagnosticReason(direct.reason, directShardReasons),
     "COLOR_CLASSIFICATION_TOO_UNCERTAIN",
   );
+
+  const coordinated = runColor4ErasurePolicy({
+    codedBytes: classified.codedBytes,
+    profile: classified.profile,
+    paletteId: classified.paletteId,
+    erasures: classified.byteErasures,
+  });
+  assert.equal(coordinated.selectedPolicy, "classifier-budgeted");
+  assert.equal(coordinated.attempts.length, 1);
+  assert.deepEqual(
+    erasureDistribution(coordinated.selectedErasures, classified.profile.shards),
+    { total: 55, byShard: [26, 0, 29, 0, 0, 0] },
+  );
+
+  const unwrapped = coordinated.result;
+  assert.equal(unwrapped.status, "valid");
+  if (unwrapped.status !== "valid") return;
+  assert.equal(unwrapped.header.sessionId, 31926);
+  assert.equal(unwrapped.header.sequence, 23);
+  assert.equal(
+    color4SequencePhaseMatches(unwrapped.header.sequence, classified.sequencePhase),
+    true,
+  );
+  assert.equal(unwrapped.diagnostics.correctedErrors, 31);
+  assert.equal(unwrapped.diagnostics.correctedBytes, 47);
+  assert.equal(unwrapped.diagnostics.correctedShards, 6);
+  assert.equal(sha256(unwrapped.innerFrame), INNER_FRAME_SHA256);
+
+  const crc = coordinated.selectedObservations.find((observation) => observation.stage === "crc");
+  assert.ok(crc?.stage === "crc");
+  assert.equal(crc.valid, true);
+  assert.equal(crc.outcome, "completed");
+  const wire = coordinated.selectedObservations.find((observation) => observation.stage === "wire");
+  assert.ok(wire?.stage === "wire");
+  assert.equal(wire.outerHeaderValid, true);
+  assert.equal(wire.innerFrameValid, true);
+  assert.equal(wire.identityValid, true);
+
+  assert.deepEqual(metadata.oracle.unwrap, {
+    status: "valid",
+    sessionId: 31926,
+    sequence: 23,
+    selectedPolicy: "classifier-budgeted",
+    attempts: 1,
+    selectedErasures: { total: 55, byShard: [26, 0, 29, 0, 0, 0] },
+    correctedErrors: 31,
+    correctedBytes: 47,
+    correctedShards: 6,
+    innerFrameSha256: INNER_FRAME_SHA256,
+  });
 });

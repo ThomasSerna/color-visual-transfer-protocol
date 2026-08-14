@@ -27,8 +27,10 @@
   "allOf": [
     {
       "if": {
+        "type": "object",
         "properties": {
           "rawFrame": {
+            "type": "object",
             "properties": { "scope": { "const": "limited-evidence" } },
             "required": ["scope"]
           }
@@ -36,11 +38,15 @@
         "required": ["rawFrame"]
       },
       "then": {
+        "type": "object",
         "not": {
+          "type": "object",
           "properties": {
             "oracle": {
+              "type": "object",
               "properties": {
                 "vision": {
+                  "type": "object",
                   "properties": {
                     "reason": { "const": "CANDIDATE_BUDGET_EXCEEDED" }
                   },
@@ -53,12 +59,71 @@
           "required": ["oracle"]
         }
       }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "oracle": {
+            "type": "object",
+            "properties": {
+              "basis": {
+                "type": "object",
+                "properties": { "kind": { "const": "crc-derived-regression" } },
+                "required": ["kind"]
+              }
+            },
+            "required": ["basis"]
+          }
+        },
+        "required": ["oracle"]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "oracle": {
+            "type": "object",
+            "required": ["vision", "classifier", "unwrap"],
+            "properties": {
+              "vision": { "$ref": "#/$defs/visionValid" },
+              "classifier": { "$ref": "#/$defs/classifierValid" },
+              "unwrap": { "$ref": "#/$defs/unwrapValid" }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "oracleBasis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "description"],
+      "properties": {
+        "kind": {
+          "enum": ["crc-derived-regression", "independent-tx-ground-truth"]
+        },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "erasureDistribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "byShard"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "byShard": {
+          "type": "array",
+          "description": "Replay validation enforces profile length and total=sum(byShard).",
+          "minItems": 6,
+          "maxItems": 14,
+          "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+        }
+      }
     },
     "provenance": {
       "type": "object",
@@ -76,10 +141,11 @@
     "rawFrame": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["width", "height", "rgbaSha256", "preparation", "scope"],
+      "required": ["width", "height", "pngSha256", "rgbaSha256", "preparation", "scope"],
       "properties": {
         "width": { "type": "integer", "minimum": 1, "maximum": 32768 },
         "height": { "type": "integer", "minimum": 1, "maximum": 32768 },
+        "pngSha256": { "$ref": "#/$defs/sha256" },
         "rgbaSha256": { "$ref": "#/$defs/sha256" },
         "preparation": {
           "enum": ["unaltered-export", "privacy-crop", "privacy-redacted"]
@@ -91,9 +157,18 @@
       },
       "allOf": [
         {
-          "if": { "properties": { "preparation": { "const": "unaltered-export" } } },
-          "then": { "properties": { "scope": { "const": "full-camera-frame" } } },
-          "else": { "properties": { "scope": { "const": "limited-evidence" } } }
+          "if": {
+            "type": "object",
+            "properties": { "preparation": { "const": "unaltered-export" } }
+          },
+          "then": {
+            "type": "object",
+            "properties": { "scope": { "const": "full-camera-frame" } }
+          },
+          "else": {
+            "type": "object",
+            "properties": { "scope": { "const": "limited-evidence" } }
+          }
         }
       ]
     },
@@ -127,6 +202,8 @@
         "palette",
         "paletteId",
         "txFps",
+        "prefilterMode",
+        "brightness",
         "canonicalScale",
         "maxDetectionDimension"
       ],
@@ -136,14 +213,25 @@
         "palette": { "enum": ["KCMY", "KRGB"] },
         "paletteId": { "enum": [0, 1] },
         "txFps": { "enum": [1, 2, 5, 10] },
+        "prefilterMode": { "enum": ["observe", "enabled"] },
+        "brightness": { "enum": ["high", "maximum"] },
         "canonicalScale": { "enum": [4, 6, 8] },
         "maxDetectionDimension": { "enum": [960, 1280, "source"] }
       },
       "allOf": [
         {
-          "if": { "properties": { "palette": { "const": "KCMY" } } },
-          "then": { "properties": { "paletteId": { "const": 0 } } },
-          "else": { "properties": { "paletteId": { "const": 1 } } }
+          "if": {
+            "type": "object",
+            "properties": { "palette": { "const": "KCMY" } }
+          },
+          "then": {
+            "type": "object",
+            "properties": { "paletteId": { "const": 0 } }
+          },
+          "else": {
+            "type": "object",
+            "properties": { "paletteId": { "const": 1 } }
+          }
         }
       ]
     },
@@ -170,6 +258,8 @@
         "profile",
         "paletteId",
         "sequencePhase",
+        "uncertainCells",
+        "candidateErasures",
         "codedBytesSha256"
       ],
       "properties": {
@@ -177,6 +267,8 @@
         "profile": { "enum": ["ROBUST", "EXPERIMENTAL"] },
         "paletteId": { "enum": [0, 1] },
         "sequencePhase": { "enum": [0, 1, 2, 3] },
+        "uncertainCells": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "candidateErasures": { "$ref": "#/$defs/erasureDistribution" },
         "codedBytesSha256": { "$ref": "#/$defs/sha256" }
       }
     },
@@ -192,10 +284,28 @@
     "unwrapValid": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "sequence", "innerFrameSha256"],
+      "required": [
+        "status",
+        "sessionId",
+        "sequence",
+        "selectedPolicy",
+        "attempts",
+        "selectedErasures",
+        "correctedErrors",
+        "correctedBytes",
+        "correctedShards",
+        "innerFrameSha256"
+      ],
       "properties": {
         "status": { "const": "valid" },
+        "sessionId": { "type": "integer", "minimum": 0, "maximum": 65535 },
         "sequence": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "selectedPolicy": { "enum": ["classifier-budgeted", "hard-decision"] },
+        "attempts": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "selectedErasures": { "$ref": "#/$defs/erasureDistribution" },
+        "correctedErrors": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "correctedBytes": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "correctedShards": { "type": "integer", "minimum": 0, "maximum": 255 },
         "innerFrameSha256": { "$ref": "#/$defs/sha256" }
       }
     },
@@ -237,8 +347,9 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["vision", "rejection"],
+          "required": ["basis", "vision", "rejection"],
           "properties": {
+            "basis": { "$ref": "#/$defs/oracleBasis" },
             "vision": { "$ref": "#/$defs/visionRejected" },
             "rejection": { "$ref": "#/$defs/rejection" }
           }
@@ -246,8 +357,9 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["vision", "classifier", "rejection"],
+          "required": ["basis", "vision", "classifier", "rejection"],
           "properties": {
+            "basis": { "$ref": "#/$defs/oracleBasis" },
             "vision": { "$ref": "#/$defs/visionValid" },
             "classifier": { "$ref": "#/$defs/classifierRejected" },
             "rejection": { "$ref": "#/$defs/rejection" }
@@ -256,8 +368,9 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["vision", "classifier", "unwrap"],
+          "required": ["basis", "vision", "classifier", "unwrap"],
           "properties": {
+            "basis": { "$ref": "#/$defs/oracleBasis" },
             "vision": { "$ref": "#/$defs/visionValid" },
             "classifier": { "$ref": "#/$defs/classifierValid" },
             "unwrap": { "$ref": "#/$defs/unwrapValid" }
@@ -266,8 +379,9 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["vision", "classifier", "unwrap", "rejection"],
+          "required": ["basis", "vision", "classifier", "unwrap", "rejection"],
           "properties": {
+            "basis": { "$ref": "#/$defs/oracleBasis" },
             "vision": { "$ref": "#/$defs/visionValid" },
             "classifier": { "$ref": "#/$defs/classifierValid" },
             "unwrap": { "$ref": "#/$defs/unwrapRejected" },

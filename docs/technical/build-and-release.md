@@ -54,11 +54,18 @@ attribute rather than duplicating the SVG inside the build plugin.
 
 - **`ci.yml`** runs tests and builds for pushes and pull requests, executes the
   Chromium/WebKit PWA and standalone matrix, enforces the receive-chunk budget
-  and verifies manifest/service-worker references.
+  and verifies manifest/service-worker references. Its test step sets
+  `CVTP_REQUIRE_PHYSICAL_FIXTURES=1`, so at least one real-camera replay must be
+  present and pass.
 - **`pages.yml`** deploys the hosted build to GitHub Pages from `main`.
 - **`release.yml`** runs on `v*` tags and attaches
   `cvtp-<tag>-site.zip`, `cvtp-<tag>-sender.html`,
-  `cvtp-<tag>-receiver.html` and `SHA256SUMS.txt`.
+  `cvtp-<tag>-receiver.html` and `SHA256SUMS.txt`. Its test step sets
+  `CVTP_REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE=1`, which blocks publication until
+  at least one passing, unaltered full-camera fixture pins transmitter bytes
+  captured before the optical transfer
+  (`oracle.basis.kind=independent-tx-ground-truth`). A
+  CRC-derived regression fixture alone cannot satisfy the release gate.
 
 The hosted site builds with `base: "./"`, so it works below a project subpath.
 

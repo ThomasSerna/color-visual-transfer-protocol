@@ -34,6 +34,7 @@ test("canonical rejection causes remain separate without changing public reasons
 
 test("classification uncertainty is reserved for RS too-many-erasures", () => {
   assert.equal(fecDiagnosticReason("fec-uncorrectable", ["too-many-erasures"]), "COLOR_CLASSIFICATION_TOO_UNCERTAIN");
+  assert.equal(fecDiagnosticReason("fec-uncorrectable", ["locator"], true), "COLOR_CLASSIFICATION_TOO_UNCERTAIN");
   assert.equal(fecDiagnosticReason("fec-uncorrectable", ["locator"]), "RS_FAILED");
   assert.equal(fecDiagnosticReason("crc-mismatch"), "CRC_FAILED");
   assert.equal(fecDiagnosticReason("invalid-inner-frame"), undefined);

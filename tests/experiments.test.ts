@@ -7,6 +7,7 @@ import {
   type ExperimentSummary,
   type VisionExperimentSummary,
 } from "../shared/experiments.ts";
+import type { BrowserCarrierDiagnostics } from "../shared/carrier.ts";
 
 test("experiment summaries contain measurements but no payload identity", () => {
   const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 1_000);
@@ -274,6 +275,17 @@ test("photometric canonical diagnostics aggregate as optional schema-v1 distribu
       },
     },
   });
+  metrics.recordAttempt("rejected", {
+    stage: "classification",
+    vision: {
+      canonical: {
+        bestDeltaE: { count: 12, min: 5, p50: 4, p95: 3, max: 2 },
+        deltaEGap: { count: 0, min: 1, p50: 1, p95: 1, max: 1 },
+        erasuresByShard: Array.from({ length: 257 }, () => 0),
+        uncertainCellsByRow: Array.from({ length: 257 }, () => 0),
+      },
+    },
+  });
 
   const summary = metrics.snapshot({ success: false, now: 1 });
   const canonical = summary.vision?.canonical;
@@ -291,6 +303,138 @@ test("photometric canonical diagnostics aggregate as optional schema-v1 distribu
   assert.equal(JSON.stringify(summary).includes("bootstrapBytes"), false);
   assert.equal(JSON.stringify(summary).includes("expectedCrc"), false);
   assert.deepEqual(structuredClone(summary), summary);
+});
+
+test("classifier confidence telemetry persists bounded aggregates without payload traces", () => {
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  const firstVision = {
+    canonical: {
+      distanceRejectedCells: 10,
+      gapRejectedCells: 12,
+      bothRejectedCells: 4,
+      erasuresByShard: [2, 3],
+      parityByShard: 4,
+      remainingErasureBudgetByShard: [2, 1],
+      uncertainCellsByRow: [1, 2, 0],
+      uncertainCellsByColumn: [1, 2],
+      effectiveMaximumDeltaE: 45,
+      effectiveMinimumDeltaEGap: 18,
+      bestDeltaE: { count: 12, min: 1, p50: 2, p95: 3, max: 4 },
+      deltaEGap: { count: 12, min: 0.5, p50: 5, p95: 8, max: 9 },
+      // Unknown fields model an accidental rich diagnostic object crossing the
+      // browser boundary. ExperimentMetrics must only select its safe contract.
+      codedBytes: [0xde, 0xad],
+      byteErasures: [1, 7],
+      cellIndices: [4, 8],
+      payload: [0xbe, 0xef],
+      cells: [{ cellIndex: 4, byteIndex: 1, dibit: 3 }],
+    },
+  } as unknown as NonNullable<BrowserCarrierDiagnostics["vision"]>;
+  metrics.recordAttempt("rejected", { stage: "classification", vision: firstVision });
+  metrics.recordAttempt("rejected", {
+    stage: "classification",
+    vision: {
+      canonical: {
+        distanceRejectedCells: 6,
+        gapRejectedCells: 8,
+        bothRejectedCells: 2,
+        erasuresByShard: [1, 5],
+        parityByShard: 4,
+        remainingErasureBudgetByShard: [3, -1],
+        uncertainCellsByRow: [0, 3, 1],
+        uncertainCellsByColumn: [2, 2],
+        effectiveMaximumDeltaE: 40,
+        effectiveMinimumDeltaEGap: 12,
+        bestDeltaE: { count: 12, min: 0.5, p50: 3, p95: 5, max: 6 },
+        deltaEGap: { count: 12, min: 1, p50: 6, p95: 9, max: 10 },
+      },
+    },
+  });
+
+  const summary = metrics.snapshot({ success: false, now: 1 });
+  const classification = summary.vision?.canonical?.classification;
+  assert.equal(summary.schemaVersion, 1);
+  assert.deepEqual(classification?.distanceRejectedCells, {
+    count: 2,
+    average: 8,
+    min: 6,
+    max: 10,
+    p50: 6,
+    p95: 6,
+  });
+  assert.equal(classification?.gapRejectedCells?.average, 10);
+  assert.equal(classification?.bothRejectedCells?.max, 4);
+  assert.equal(classification?.effectiveMaximumDeltaE?.min, 40);
+  assert.equal(classification?.effectiveMinimumDeltaEGap?.max, 18);
+  assert.equal(classification?.bestDeltaE?.count?.average, 12);
+  assert.equal(classification?.bestDeltaE?.p50?.p50, 2);
+  assert.equal(classification?.deltaEGap?.max?.p95, 9);
+  assert.equal(classification?.erasuresByShard?.length, 2);
+  assert.deepEqual(classification?.erasuresByShard?.[0], {
+    count: 2,
+    average: 1.5,
+    min: 1,
+    max: 2,
+    p50: 1,
+    p95: 1,
+  });
+  assert.equal(classification?.erasuresByShard?.[1]?.max, 5);
+  assert.equal(classification?.remainingErasureBudgetByShard?.[1]?.min, -1);
+  assert.equal(classification?.uncertainCellsByRow?.[1]?.average, 2.5);
+  assert.equal(classification?.uncertainCellsByColumn?.[0]?.max, 2);
+  const serialized = JSON.stringify(summary);
+  for (const forbidden of ["codedBytes", "byteErasures", "cellIndices", "payload", "cells"]) {
+    assert.equal(serialized.includes(`\"${forbidden}\"`), false);
+  }
+  assert.deepEqual(structuredClone(summary), summary);
+});
+
+test("classifier confidence aggregates reset when the observed profile changes", () => {
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", undefined, 0);
+  const classification = (
+    parityByShard: number,
+    erasuresByShard: readonly number[],
+    rows: number,
+  ): NonNullable<BrowserCarrierDiagnostics["vision"]> => ({
+    canonical: {
+      parityByShard,
+      erasuresByShard,
+      remainingErasureBudgetByShard: erasuresByShard.map(
+        (count) => parityByShard - count,
+      ),
+      uncertainCellsByRow: Array.from({ length: rows }, () => 0),
+      uncertainCellsByColumn: [0],
+      bestDeltaE: { count: rows, min: 1, p50: 2, p95: 3, max: 4 },
+      deltaEGap: { count: rows, min: 1, p50: 2, p95: 3, max: 4 },
+    },
+  });
+
+  metrics.setProfile("ROBUST");
+  metrics.recordAttempt("valid", {
+    profile: "ROBUST",
+    vision: classification(32, [1, 2, 3, 4, 5, 6], 85),
+  });
+  metrics.setProfile("EXPERIMENTAL");
+  metrics.recordAttempt("valid", {
+    profile: "EXPERIMENTAL",
+    vision: classification(16, Array.from({ length: 14 }, () => 1), 119),
+  });
+
+  const summary = metrics.snapshot({ success: false, now: 1 });
+  const observed = summary.vision?.canonical?.classification;
+  assert.equal(summary.profile, "EXPERIMENTAL");
+  assert.deepEqual(observed?.parityByShard, {
+    count: 1,
+    average: 16,
+    min: 16,
+    max: 16,
+    p50: 16,
+    p95: 16,
+  });
+  assert.equal(observed?.erasuresByShard?.length, 14);
+  assert.equal(observed?.erasuresByShard?.every((entry) => entry.count === 1), true);
+  assert.equal(observed?.uncertainCellsByRow?.length, 119);
+  assert.equal(observed?.uncertainCellsByRow?.every((entry) => entry.count === 1), true);
 });
 
 test("capture stability telemetry is bounded and normalized", () => {

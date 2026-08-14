@@ -56,6 +56,23 @@ bounded numeric distributions for these values, but never the decoded bootstrap
 bytes. Detailed bytes, when requested, exist only in the per-frame in-memory
 debug observation after all 24 bootstrap columns were decided.
 
+After colour classification completes, its optional aggregate diagnostics split
+uncertain cells into distance, nearest-colour gap and overlapping causes. They
+also report erasure hints per Reed-Solomon shard, parity and remaining budget,
+uncertainty counts by canonical row and column, the effective thresholds, and
+`count/min/p50/p95/max` summaries for best-colour distance and colour gap. The
+arrays contain only counts; erased-byte positions and payload bytes are not
+included. Persisted experiments keep a bounded whitelist of these aggregates
+and reset profile-shaped series if the detected COLOR_4 profile changes.
+
+Receiver diagnostics can additionally include the selected `erasurePolicy`,
+the original `suggestedErasuresByShard`, saturated shards and at most two
+ordered `unwrapAttempts`. `erasureBytes` remains the number of optical hints,
+while `erasures` and correction counters describe the selected attempt. Stage
+timings include every attempted unwrap; RS/CRC failure counters describe the
+final selected outcome, so a frame rescued by hard decision is not reported as
+failed. These fields are optional so older snapshots remain readable.
+
 ## Capture a diagnostic ZIP
 
 While a COLOR_4 reception is active, select **Capture raw camera frame +
@@ -187,12 +204,14 @@ variable at a time. Never relax CRC or the Reed-Solomon correction bound to make
 a frame appear valid. A proposed change is kept only when the exact baseline
 produces more valid frames without CRC failures or incorrect inner frames.
 
-For the phase-1 photometric check, run three additional controlled captures
+For the bounded-policy receiver check, run three additional controlled captures
 with ROBUST, KCMY, 5 fps, canonical scale 6, detection limit 1280 and prefilter
 `observe`. Each run must contain at least one frame that completes bootstrap,
-timing and phase and reaches colour classification/RS. Reaching RS is only the
-acceptance boundary for this phase; an RS rejection caused by colour
-classification remains follow-up work and is not a successful transfer.
+timing and phase and then passes RS, CRC32C, outer/inner validation and identity
+through the receiver's bounded erasure policy. A direct decode with all optical
+erasure hints may still reject; that preserves the core decoder contract and is
+not the receiver outcome. A frame that merely reaches RS but fails the remaining
+gates is not successful.
 
 ## Real-capture gate and fixture privacy
 
@@ -202,8 +221,11 @@ camera fixture may enter `tests/fixtures/color4/physical/` only after privacy
 review, with controlled or anonymized imagery, its metadata and an explicit
 expected result. Cropping changes apparent resolution and candidate load, so a
 crop is not interchangeable with the original full-camera replay and must be
-identified as such. Until reviewed fixtures exist, preserve the originals
-outside the repository and report the physical run separately.
+identified as such. Before a capture passes that review, preserve its original
+outside the repository and report the physical run separately. The reviewed
+`capture-000017` full frame is now retained as a CRC-derived physical regression,
+but release acceptance still requires a new controlled fixture whose expected
+inner bytes were recorded independently at the transmitter.
 
 A privacy-reviewed `warped.png` may instead enter
 `tests/fixtures/color4/canonical/` without its raw camera counterpart. It must
