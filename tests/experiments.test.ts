@@ -194,6 +194,30 @@ test("vision timing reservoirs stay bounded and legacy summaries remain optional
   assert.equal("color4ErasurePolicy" in legacy, false);
 });
 
+test("QR experiments reject policy-shaped optional-carrier diagnostics", () => {
+  const metrics = new ExperimentMetrics("receive", "QR_LEGACY", undefined, 0);
+  metrics.recordAttempt("valid", {
+    erasurePolicy: "hard-decision",
+    selectedBudgetFraction: 0,
+    selectedMaxErasuresPerShard: 0,
+    selectedErasuresByShard: [0],
+    unwrapAttempts: [{
+      policy: "hard-decision",
+      budgetFraction: 0,
+      maxErasuresPerShard: 0,
+      erasures: 0,
+      erasuresByShard: [0],
+      phaseMatched: true,
+      durationMs: 1,
+      status: "valid",
+    }],
+  });
+
+  const summary = metrics.snapshot({ success: true, now: 1 });
+  assert.equal(summary.color4ErasurePolicy, undefined);
+  assert.equal(JSON.stringify(summary).includes("hard-decision"), false);
+});
+
 test("aggregated optical diagnostics permit a genuinely partial metric set", () => {
   const sample = {
     count: 1,

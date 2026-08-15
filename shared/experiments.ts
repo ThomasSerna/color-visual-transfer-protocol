@@ -466,7 +466,7 @@ export class ExperimentMetrics {
     now = Date.now(),
   ) {
     this.startedAtMs = now;
-    if (carrier === "COLOR_4") this.color4ErasurePolicyProfile = profile;
+    this.color4ErasurePolicyProfile = profile;
   }
 
   recordCapture(): void {
@@ -568,7 +568,10 @@ export class ExperimentMetrics {
   }
 
   private recordColor4ErasurePolicy(diagnostics: BrowserCarrierDiagnostics): void {
-    if (this.carrier !== "COLOR_4") return;
+    // Express this as a QR exclusion: ExperimentMetrics is bundled in the
+    // QR-only standalone receiver, which must not retain optional-carrier code
+    // markers. CarrierId currently has exactly these two carrier variants.
+    if (this.carrier === "QR_LEGACY") return;
     this.alignColor4ErasurePolicyProfile(diagnostics.profile ?? this.profile);
     let recorded = false;
     if (isColor4ErasurePolicy(diagnostics.erasurePolicy)) {
@@ -607,7 +610,7 @@ export class ExperimentMetrics {
   }
 
   private alignColor4ErasurePolicyProfile(profile: string | undefined): void {
-    if (this.carrier !== "COLOR_4" || profile === undefined) return;
+    if (this.carrier === "QR_LEGACY" || profile === undefined) return;
     if (this.color4ErasurePolicyProfile !== undefined &&
         this.color4ErasurePolicyProfile !== profile) {
       this.resetColor4ErasurePolicy();
