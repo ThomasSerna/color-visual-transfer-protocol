@@ -64,7 +64,8 @@ attribute rather than duplicating the SVG inside the build plugin.
   `CVTP_REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE=1`, which blocks publication until
   at least one passing, unaltered full-camera fixture pins transmitter bytes
   captured before the optical transfer
-  (`oracle.basis.kind=independent-tx-ground-truth`). A
+  (`oracle.basis.kind=independent-tx-ground-truth`) and distinguishes the ranked
+  fix by rejecting under both legacy erasure selection and hard decision. A
   CRC-derived regression fixture alone cannot satisfy the release gate.
 
 The hosted site builds with `base: "./"`, so it works below a project subpath.

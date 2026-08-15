@@ -34,6 +34,13 @@ interface CanonicalFixtureMetadata {
         readonly total: number;
         readonly byShard: readonly number[];
       };
+      readonly erasureCandidateScore: {
+        readonly count: number;
+        readonly min: number;
+        readonly p50: number;
+        readonly p95: number;
+        readonly max: number;
+      };
       readonly codedBytesSha256: string;
     };
     readonly unwrap: {
@@ -41,6 +48,8 @@ interface CanonicalFixtureMetadata {
       readonly sessionId: number;
       readonly sequence: number;
       readonly selectedPolicy: string;
+      readonly selectedBudgetFraction: number;
+      readonly selectedMaxErasuresPerShard: number;
       readonly attempts: number;
       readonly selectedErasures: {
         readonly total: number;
@@ -70,7 +79,7 @@ function erasureDistribution(
   return { total: erasures.length, byShard };
 }
 
-test("canonical capture 000017 reaches a CRC-valid unwrap through the bounded erasure policy", async () => {
+test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked erasure policy", async () => {
   const pngBytes = await readFile(`${FIXTURE_DIRECTORY}/capture-000017-warped.png`);
   const metadata = JSON.parse(
     await readFile(`${FIXTURE_DIRECTORY}/metadata.json`, "utf8"),
@@ -172,10 +181,24 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the bounded er
     erasureDistribution(classified.byteErasures, classified.profile.shards),
     { total: 195, byShard: [26, 35, 29, 34, 34, 37] },
   );
+  assert.deepEqual(classified.diagnostics.erasureCandidateScore, {
+    count: 195,
+    min: 1.0014599635981696,
+    p50: 1.6220608388842113,
+    p95: 12.534467124400843,
+    max: 62.854022931804224,
+  });
   assert.equal(sha256(classified.codedBytes), CODED_BYTES_SHA256);
   assert.deepEqual(metadata.oracle.classification, {
     uncertainCells: 219,
     candidateErasures: { total: 195, byShard: [26, 35, 29, 34, 34, 37] },
+    erasureCandidateScore: {
+      count: 195,
+      min: 1.0014599635981696,
+      p50: 1.6220608388842113,
+      p95: 12.534467124400843,
+      max: 62.854022931804224,
+    },
     codedBytesSha256: CODED_BYTES_SHA256,
   });
 
@@ -205,13 +228,16 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the bounded er
     codedBytes: classified.codedBytes,
     profile: classified.profile,
     paletteId: classified.paletteId,
-    erasures: classified.byteErasures,
+    erasureCandidates: classified.byteErasureCandidates,
+    expectedSequencePhase: classified.sequencePhase,
   });
   assert.equal(coordinated.selectedPolicy, "classifier-budgeted");
+  assert.equal(coordinated.selectedBudgetFraction, 1);
+  assert.equal(coordinated.selectedMaxErasuresPerShard, 32);
   assert.equal(coordinated.attempts.length, 1);
   assert.deepEqual(
     erasureDistribution(coordinated.selectedErasures, classified.profile.shards),
-    { total: 55, byShard: [26, 0, 29, 0, 0, 0] },
+    { total: 183, byShard: [26, 32, 29, 32, 32, 32] },
   );
 
   const unwrapped = coordinated.result;
@@ -223,7 +249,7 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the bounded er
     color4SequencePhaseMatches(unwrapped.header.sequence, classified.sequencePhase),
     true,
   );
-  assert.equal(unwrapped.diagnostics.correctedErrors, 31);
+  assert.equal(unwrapped.diagnostics.correctedErrors, 0);
   assert.equal(unwrapped.diagnostics.correctedBytes, 47);
   assert.equal(unwrapped.diagnostics.correctedShards, 6);
   assert.equal(sha256(unwrapped.innerFrame), INNER_FRAME_SHA256);
@@ -243,9 +269,11 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the bounded er
     sessionId: 31926,
     sequence: 23,
     selectedPolicy: "classifier-budgeted",
+    selectedBudgetFraction: 1,
+    selectedMaxErasuresPerShard: 32,
     attempts: 1,
-    selectedErasures: { total: 55, byShard: [26, 0, 29, 0, 0, 0] },
-    correctedErrors: 31,
+    selectedErasures: { total: 183, byShard: [26, 32, 29, 32, 32, 32] },
+    correctedErrors: 0,
     correctedBytes: 47,
     correctedShards: 6,
     innerFrameSha256: INNER_FRAME_SHA256,

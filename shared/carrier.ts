@@ -3,7 +3,7 @@
  * COLOR_4 must return the exact same legacy packFrame bytes. This module is the
  * browser-facing entry point and adds only UI/worker diagnostics.
  */
-import type { CarrierId } from "./color4/types";
+import type { CarrierId, RejectReason } from "./color4/types";
 
 export type {
   CarrierId,
@@ -19,6 +19,26 @@ export type {
 } from "./color4/types";
 
 export type CarrierChoice = "qr" | "color4";
+
+/** Persistence-safe names used by the bounded COLOR_4 unwrap-policy telemetry. */
+export type BrowserColor4ErasurePolicy = "classifier-budgeted" | "hard-decision";
+export type BrowserColor4ErasureBudgetFraction = 1 | 0.75 | 0.5 | 0;
+
+/**
+ * Aggregate-only worker contract. It deliberately exposes counts by shard,
+ * never erased-byte positions, ranked candidates, coded bytes or payload data.
+ */
+export interface BrowserColor4UnwrapAttemptDiagnostics {
+  readonly policy: BrowserColor4ErasurePolicy;
+  readonly budgetFraction: BrowserColor4ErasureBudgetFraction;
+  readonly maxErasuresPerShard: number;
+  readonly erasures: number;
+  readonly erasuresByShard: readonly number[];
+  readonly phaseMatched?: boolean;
+  readonly durationMs: number;
+  readonly status: "valid" | "rejected";
+  readonly reason?: RejectReason;
+}
 
 export type VisionTimingKey =
   | "capture"
@@ -177,6 +197,8 @@ export interface BrowserVisionDiagnostics {
     effectiveMinimumDeltaEGap?: number;
     bestDeltaE?: Readonly<VisionClassifierDistributionDiagnostics>;
     deltaEGap?: Readonly<VisionClassifierDistributionDiagnostics>;
+    /** Aggregate heuristic severity for erased-byte candidates; never positions or samples. */
+    erasureCandidateScore?: Readonly<VisionClassifierDistributionDiagnostics>;
     meanBestDeltaE?: number;
     maximumBestDeltaE?: number;
   }>;
@@ -220,5 +242,13 @@ export interface BrowserCarrierDiagnostics {
   confidence?: number;
   rejectReason?: string;
   decodeMs?: number;
+  /** Optional aggregate-only COLOR_4 unwrap-policy telemetry. */
+  erasurePolicy?: BrowserColor4ErasurePolicy;
+  selectedBudgetFraction?: BrowserColor4ErasureBudgetFraction;
+  selectedMaxErasuresPerShard?: number;
+  /** Counts by shard only; never erased-byte positions. */
+  selectedErasuresByShard?: readonly number[];
+  /** At most four ordered attempts; consumers must validate this boundary. */
+  unwrapAttempts?: readonly BrowserColor4UnwrapAttemptDiagnostics[];
   vision?: BrowserVisionDiagnostics;
 }

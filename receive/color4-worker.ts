@@ -114,18 +114,34 @@ export function color4FecDiagnosticReason(
 export function color4ErasurePolicyDiagnostics(policy: Color4ErasurePolicyResult): Pick<
   Color4WorkerDiagnostics,
   | "erasurePolicy"
+  | "selectedBudgetFraction"
+  | "selectedMaxErasuresPerShard"
+  | "selectedErasuresByShard"
   | "suggestedErasuresByShard"
   | "saturatedErasureShards"
   | "unwrapAttempts"
 > {
   return Object.freeze({
     erasurePolicy: policy.selectedPolicy,
+    selectedBudgetFraction: policy.selectedBudgetFraction,
+    selectedMaxErasuresPerShard: policy.selectedMaxErasuresPerShard,
+    selectedErasuresByShard: policy.attempts.find((attempt) =>
+      attempt.policy === policy.selectedPolicy &&
+      attempt.budgetFraction === policy.selectedBudgetFraction &&
+      attempt.maxErasuresPerShard === policy.selectedMaxErasuresPerShard &&
+      attempt.erasures.length === policy.selectedErasures.length &&
+      attempt.erasures.every((index, position) => index === policy.selectedErasures[position])
+    )?.erasuresByShard ?? Object.freeze([]),
     suggestedErasuresByShard: policy.suggestedErasuresByShard,
     saturatedErasureShards: policy.saturatedErasureShards,
     unwrapAttempts: Object.freeze(policy.attempts.map((attempt) => Object.freeze({
       policy: attempt.policy,
+      budgetFraction: attempt.budgetFraction,
+      maxErasuresPerShard: attempt.maxErasuresPerShard,
       erasures: attempt.erasures.length,
       erasuresByShard: attempt.erasuresByShard,
+      ...(attempt.phaseMatched === undefined ? {} : { phaseMatched: attempt.phaseMatched }),
+      durationMs: attempt.durationMs,
       status: attempt.result.status,
       ...(attempt.result.status === "rejected" ? { reason: attempt.result.reason } : {}),
     }))),
@@ -219,6 +235,7 @@ export function canonicalVisionDiagnostics(
           effectiveMinimumDeltaEGap: diagnostics.effectiveMinimumDeltaEGap,
           bestDeltaE: { ...diagnostics.bestDeltaE },
           deltaEGap: { ...diagnostics.deltaEGap },
+          erasureCandidateScore: { ...diagnostics.erasureCandidateScore },
         }
       : {}),
     meanBestDeltaE: diagnostics.meanBestDeltaE,
@@ -506,8 +523,9 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
     const erasurePolicy = runColor4ErasurePolicy({
       codedBytes: raster.codedBytes,
       profile: raster.profile,
-      paletteId: request.paletteId,
-      erasures: raster.byteErasures,
+      paletteId: raster.paletteId,
+      erasureCandidates: raster.byteErasureCandidates,
+      expectedSequencePhase: raster.sequencePhase,
     });
     for (const attempt of erasurePolicy.attempts) {
       unwrapObservations.push(...attempt.observations);

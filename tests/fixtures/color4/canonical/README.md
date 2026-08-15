@@ -25,11 +25,15 @@ re-encoding the PNG.
 - expected classifier result: PHY 1, ROBUST, KCMY, phase 3
 - expected timing result: 0 errors across 314 modules
 - expected classification result: 219 uncertain cells and 195 candidate erased
-  bytes, distributed `[26, 35, 29, 34, 34, 37]` across the six shards
+  bytes, distributed `[26, 35, 29, 34, 34, 37]` across the six shards; score
+  distribution `count=195`, `min=1.0014599635981696`,
+  `p50=1.6220608388842113`, `p95=12.534467124400843`,
+  `max=62.854022931804224`
 - coded-byte SHA-256: `fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df`
-- expected bounded-policy selection: `classifier-budgeted`, one attempt, with
-  55 selected erasures distributed `[26, 0, 29, 0, 0, 0]`
-- expected unwrap result: valid session 31926, sequence 23 (phase 3), with 31
+- expected ranked-policy selection: `classifier-budgeted`, 100% budget (32 per
+  shard), one attempt, with 183 selected erasures distributed
+  `[26, 32, 29, 32, 32, 32]`
+- expected unwrap result: valid session 31926, sequence 23 (phase 3), with 0
   corrected errors, 47 corrected bytes and all six shards corrected
 - inner-frame SHA-256: `a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84`
 

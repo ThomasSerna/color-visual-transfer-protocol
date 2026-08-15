@@ -191,6 +191,7 @@ test("vision timing reservoirs stay bounded and legacy summaries remain optional
   assert.equal(legacy.stableCaptures, undefined);
   assert.equal(legacy.stabilityScore, undefined);
   assert.equal(legacy.qualityClassCounts, undefined);
+  assert.equal("color4ErasurePolicy" in legacy, false);
 });
 
 test("aggregated optical diagnostics permit a genuinely partial metric set", () => {
@@ -281,6 +282,7 @@ test("photometric canonical diagnostics aggregate as optional schema-v1 distribu
       canonical: {
         bestDeltaE: { count: 12, min: 5, p50: 4, p95: 3, max: 2 },
         deltaEGap: { count: 0, min: 1, p50: 1, p95: 1, max: 1 },
+        erasureCandidateScore: { count: 2, min: 2, p50: 1, p95: 3, max: 4 },
         erasuresByShard: Array.from({ length: 257 }, () => 0),
         uncertainCellsByRow: Array.from({ length: 257 }, () => 0),
       },
@@ -321,10 +323,13 @@ test("classifier confidence telemetry persists bounded aggregates without payloa
       effectiveMinimumDeltaEGap: 18,
       bestDeltaE: { count: 12, min: 1, p50: 2, p95: 3, max: 4 },
       deltaEGap: { count: 12, min: 0.5, p50: 5, p95: 8, max: 9 },
+      erasureCandidateScore: { count: 5, min: 1, p50: 1.2, p95: 2, max: 2.5 },
       // Unknown fields model an accidental rich diagnostic object crossing the
       // browser boundary. ExperimentMetrics must only select its safe contract.
       codedBytes: [0xde, 0xad],
       byteErasures: [1, 7],
+      byteErasureCandidates: [{ index: 1, score: 2.5 }],
+      erasureCandidates: [{ index: 7, score: 2 }],
       cellIndices: [4, 8],
       payload: [0xbe, 0xef],
       cells: [{ cellIndex: 4, byteIndex: 1, dibit: 3 }],
@@ -347,6 +352,7 @@ test("classifier confidence telemetry persists bounded aggregates without payloa
         effectiveMinimumDeltaEGap: 12,
         bestDeltaE: { count: 12, min: 0.5, p50: 3, p95: 5, max: 6 },
         deltaEGap: { count: 12, min: 1, p50: 6, p95: 9, max: 10 },
+        erasureCandidateScore: { count: 3, min: 0.8, p50: 1.4, p95: 2.4, max: 3 },
       },
     },
   });
@@ -369,6 +375,15 @@ test("classifier confidence telemetry persists bounded aggregates without payloa
   assert.equal(classification?.bestDeltaE?.count?.average, 12);
   assert.equal(classification?.bestDeltaE?.p50?.p50, 2);
   assert.equal(classification?.deltaEGap?.max?.p95, 9);
+  assert.deepEqual(classification?.erasureCandidateScore?.count, {
+    count: 2,
+    average: 4,
+    min: 3,
+    max: 5,
+    p50: 3,
+    p95: 3,
+  });
+  assert.equal(classification?.erasureCandidateScore?.max?.p95, 2.5);
   assert.equal(classification?.erasuresByShard?.length, 2);
   assert.deepEqual(classification?.erasuresByShard?.[0], {
     count: 2,
@@ -383,7 +398,15 @@ test("classifier confidence telemetry persists bounded aggregates without payloa
   assert.equal(classification?.uncertainCellsByRow?.[1]?.average, 2.5);
   assert.equal(classification?.uncertainCellsByColumn?.[0]?.max, 2);
   const serialized = JSON.stringify(summary);
-  for (const forbidden of ["codedBytes", "byteErasures", "cellIndices", "payload", "cells"]) {
+  for (const forbidden of [
+    "codedBytes",
+    "byteErasures",
+    "byteErasureCandidates",
+    "erasureCandidates",
+    "cellIndices",
+    "payload",
+    "cells",
+  ]) {
     assert.equal(serialized.includes(`\"${forbidden}\"`), false);
   }
   assert.deepEqual(structuredClone(summary), summary);
@@ -406,6 +429,7 @@ test("classifier confidence aggregates reset when the observed profile changes",
       uncertainCellsByColumn: [0],
       bestDeltaE: { count: rows, min: 1, p50: 2, p95: 3, max: 4 },
       deltaEGap: { count: rows, min: 1, p50: 2, p95: 3, max: 4 },
+      erasureCandidateScore: { count: 1, min: 1, p50: 1, p95: 1, max: 1 },
     },
   });
 
@@ -435,6 +459,283 @@ test("classifier confidence aggregates reset when the observed profile changes",
   assert.equal(observed?.erasuresByShard?.every((entry) => entry.count === 1), true);
   assert.equal(observed?.uncertainCellsByRow?.length, 119);
   assert.equal(observed?.uncertainCellsByRow?.every((entry) => entry.count === 1), true);
+  assert.equal(observed?.erasureCandidateScore?.count?.count, 1);
+});
+
+test("COLOR_4 erasure-policy telemetry persists only bounded aggregate counts", () => {
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  metrics.recordAttempt("valid", {
+    erasurePolicy: "classifier-budgeted",
+    selectedBudgetFraction: 0.75,
+    selectedMaxErasuresPerShard: 24,
+    selectedErasuresByShard: [24, 0, 1, 2, 3, 4],
+    unwrapAttempts: [
+      {
+        policy: "classifier-budgeted",
+        budgetFraction: 1,
+        maxErasuresPerShard: 32,
+        erasures: 32,
+        erasuresByShard: [32, 0, 0, 0, 0, 0],
+        phaseMatched: false,
+        durationMs: 4,
+        status: "valid",
+      },
+      {
+        policy: "classifier-budgeted",
+        budgetFraction: 0.75,
+        maxErasuresPerShard: 24,
+        erasures: 24,
+        erasuresByShard: [24, 0, 0, 0, 0, 0],
+        durationMs: 3,
+        status: "valid",
+      },
+      {
+        policy: "classifier-budgeted",
+        budgetFraction: 0.5,
+        maxErasuresPerShard: 16,
+        erasures: 16,
+        erasuresByShard: [16, 0, 0, 0, 0, 0],
+        durationMs: 1,
+        status: "rejected",
+        reason: "fec-uncorrectable",
+      },
+      {
+        policy: "hard-decision",
+        budgetFraction: 0,
+        maxErasuresPerShard: 0,
+        erasures: 0,
+        erasuresByShard: [0, 0, 0, 0, 0, 0],
+        durationMs: 0,
+        status: "rejected",
+        reason: "crc-mismatch",
+      },
+    ],
+    // Model accidental worker-private fields crossing the browser boundary.
+    erasureCandidates: [{ index: 7, score: 9 }],
+    suggestedErasuresByShard: [26, 33, 29, 34, 40, 33],
+    selectedErasureIndices: [7],
+    codedBytes: [0xde, 0xad],
+    payload: "policy-private-payload",
+  } as unknown as BrowserCarrierDiagnostics);
+  metrics.recordAttempt("rejected", {
+    erasurePolicy: "hard-decision",
+    selectedBudgetFraction: 0,
+    selectedMaxErasuresPerShard: 0,
+    selectedErasuresByShard: Array.from({ length: 14 }, () => 0),
+    unwrapAttempts: [
+      {
+        policy: "hard-decision",
+        budgetFraction: 0,
+        maxErasuresPerShard: 0,
+        erasures: 0,
+        erasuresByShard: Array.from({ length: 14 }, () => 0),
+        phaseMatched: true,
+        durationMs: 2,
+        status: "rejected",
+        reason: "crc-mismatch",
+        byteErasures: [11],
+        innerFrame: [0xbe, 0xef],
+      },
+    ],
+  } as unknown as BrowserCarrierDiagnostics);
+
+  const summary = metrics.snapshot({ success: false, now: 1 });
+  const policy = summary.color4ErasurePolicy;
+  assert.equal(summary.schemaVersion, 1);
+  assert.deepEqual(policy?.selectedPolicies, {
+    "classifier-budgeted": 1,
+    "hard-decision": 1,
+  });
+  assert.deepEqual(policy?.selectedBudgetFraction, {
+    count: 2,
+    average: 0.375,
+    min: 0,
+    max: 0.75,
+    p50: 0,
+    p95: 0,
+  });
+  assert.equal(policy?.selectedMaxErasuresPerShard?.average, 12);
+  assert.equal(policy?.selectedErasuresByShard?.length, 14);
+  assert.equal(policy?.selectedErasuresByShard?.[0]?.average, 12);
+  assert.equal(policy?.selectedErasuresByShard?.[6]?.count, 1);
+  assert.equal(policy?.attemptsPerFrame?.average, 2.5);
+  assert.equal(policy?.attempts?.length, 4);
+  assert.deepEqual(policy?.attempts?.[0]?.policies, {
+    "classifier-budgeted": 1,
+    "hard-decision": 1,
+  });
+  assert.deepEqual(policy?.attempts?.[0]?.statuses, { valid: 1, rejected: 1 });
+  assert.deepEqual(policy?.attempts?.[0]?.phases, { mismatched: 1, matched: 1 });
+  assert.equal(policy?.attempts?.[0]?.budgetFraction?.average, 0.5);
+  assert.equal(policy?.attempts?.[0]?.maxErasuresPerShard?.average, 16);
+  assert.equal(policy?.attempts?.[0]?.erasures?.average, 16);
+  assert.equal(policy?.attempts?.[0]?.durationMs?.average, 3);
+  assert.equal(policy?.attempts?.[0]?.erasuresByShard?.length, 14);
+  assert.equal(policy?.attempts?.[0]?.erasuresByShard?.[0]?.average, 16);
+  assert.deepEqual(policy?.attempts?.[0]?.rejectReasons, { "crc-mismatch": 1 });
+  assert.deepEqual(policy?.attempts?.[1]?.policies, { "classifier-budgeted": 1 });
+  assert.deepEqual(policy?.attempts?.[1]?.phases, { unknown: 1 });
+
+  const serialized = JSON.stringify(summary);
+  for (const forbidden of [
+    "erasureCandidates",
+    "suggestedErasuresByShard",
+    "selectedErasureIndices",
+    "byteErasures",
+    "codedBytes",
+    "innerFrame",
+    "policy-private-payload",
+  ]) {
+    assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
+  assert.deepEqual(structuredClone(summary), summary);
+});
+
+test("COLOR_4 erasure-policy telemetry rejects invalid and over-limit detail", () => {
+  const overLimit = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  overLimit.recordAttempt("rejected", {
+    erasurePolicy: "private-policy",
+    selectedBudgetFraction: Number.NaN,
+    selectedMaxErasuresPerShard: -1,
+    selectedErasuresByShard: Array.from({ length: 15 }, () => 0),
+    unwrapAttempts: Array.from({ length: 5 }, () => ({
+      policy: "private-policy",
+      payload: "private-over-limit-payload",
+    })),
+  } as unknown as BrowserCarrierDiagnostics);
+  const ignored = overLimit.snapshot({ success: false, now: 1 });
+  assert.equal(ignored.color4ErasurePolicy, undefined);
+  assert.equal(JSON.stringify(ignored).includes("private-over-limit-payload"), false);
+
+  const invalid = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  invalid.recordAttempt("rejected", {
+    erasurePolicy: "private-policy",
+    selectedBudgetFraction: Number.POSITIVE_INFINITY,
+    selectedMaxErasuresPerShard: -1,
+    selectedErasuresByShard: [0, -1],
+    unwrapAttempts: [{
+      policy: "private-attempt-policy",
+      budgetFraction: Number.NaN,
+      maxErasuresPerShard: -1,
+      erasures: Number.POSITIVE_INFINITY,
+      erasuresByShard: Array.from({ length: 15 }, () => 0),
+      phaseMatched: "private-phase",
+      durationMs: -1,
+      status: "private-status",
+      reason: "private-reject-reason",
+      candidateIndices: [1, 2, 3],
+      payload: "private-attempt-payload",
+    }],
+  } as unknown as BrowserCarrierDiagnostics);
+  const invalidSummary = invalid.snapshot({ success: false, now: 1 });
+  const policy = invalidSummary.color4ErasurePolicy;
+  assert.equal(policy, undefined);
+  const serialized = JSON.stringify(invalidSummary);
+  for (const forbidden of [
+    "private-policy",
+    "private-attempt-policy",
+    "private-phase",
+    "private-status",
+    "private-reject-reason",
+    "candidateIndices",
+    "private-attempt-payload",
+  ]) {
+    assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
+});
+
+test("COLOR_4 erasure-policy numeric reservoirs stay bounded to 256 samples", () => {
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  for (let index = 0; index < 300; index++) {
+    metrics.recordAttempt("valid", {
+      erasurePolicy: "classifier-budgeted",
+      selectedBudgetFraction: 1,
+      selectedMaxErasuresPerShard: index,
+      selectedErasuresByShard: [index],
+      unwrapAttempts: [{
+        policy: "classifier-budgeted",
+        budgetFraction: 1,
+        maxErasuresPerShard: index,
+        erasures: index,
+        erasuresByShard: [index],
+        phaseMatched: true,
+        durationMs: index,
+        status: "valid",
+      }],
+    });
+  }
+
+  const policy = metrics.snapshot({ success: true, now: 1 }).color4ErasurePolicy;
+  assert.equal(policy?.selectedPolicies["classifier-budgeted"], 300);
+  assert.equal(policy?.selectedMaxErasuresPerShard?.count, 256);
+  assert.equal(policy?.selectedMaxErasuresPerShard?.min, 44);
+  assert.equal(policy?.selectedMaxErasuresPerShard?.max, 299);
+  assert.equal(policy?.selectedErasuresByShard?.[0]?.count, 256);
+  assert.equal(policy?.attemptsPerFrame?.count, 256);
+  assert.equal(policy?.attempts?.[0]?.durationMs?.count, 256);
+  assert.equal(policy?.attempts?.[0]?.durationMs?.min, 44);
+  assert.equal(policy?.attempts?.[0]?.durationMs?.max, 299);
+  assert.equal(policy?.attempts?.[0]?.erasuresByShard?.[0]?.count, 256);
+  assert.equal(policy?.attempts?.[0]?.policies["classifier-budgeted"], 300);
+  assert.equal(policy?.attempts?.[0]?.phases.matched, 300);
+});
+
+test("COLOR_4 erasure-policy aggregates reset when the observed profile changes", () => {
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", "ROBUST", 0);
+  const recordPolicy = (
+    profile: "ROBUST" | "EXPERIMENTAL",
+    maxErasuresPerShard: number,
+    shardCount: number,
+  ): void => {
+    metrics.setProfile(profile);
+    metrics.recordAttempt("valid", {
+      profile,
+      erasurePolicy: "classifier-budgeted",
+      selectedBudgetFraction: 1,
+      selectedMaxErasuresPerShard: maxErasuresPerShard,
+      selectedErasuresByShard: Array.from({ length: shardCount }, () => 1),
+      unwrapAttempts: [{
+        policy: "classifier-budgeted",
+        budgetFraction: 1,
+        maxErasuresPerShard,
+        erasures: shardCount,
+        erasuresByShard: Array.from({ length: shardCount }, () => 1),
+        phaseMatched: true,
+        durationMs: 1,
+        status: "valid",
+      }],
+    });
+  };
+
+  recordPolicy("ROBUST", 32, 6);
+  recordPolicy("EXPERIMENTAL", 16, 14);
+  const experimental = metrics.snapshot({ success: true, now: 1 });
+  assert.equal(experimental.profile, "EXPERIMENTAL");
+  assert.deepEqual(experimental.color4ErasurePolicy?.selectedPolicies, {
+    "classifier-budgeted": 1,
+  });
+  assert.deepEqual(experimental.color4ErasurePolicy?.selectedMaxErasuresPerShard, {
+    count: 1,
+    average: 16,
+    min: 16,
+    max: 16,
+    p50: 16,
+    p95: 16,
+  });
+  assert.equal(experimental.color4ErasurePolicy?.selectedErasuresByShard?.length, 14);
+  assert.equal(experimental.color4ErasurePolicy?.attempts?.[0]?.erasures?.average, 14);
+  assert.equal(
+    experimental.color4ErasurePolicy?.attempts?.[0]?.maxErasuresPerShard?.average,
+    16,
+  );
+
+  recordPolicy("ROBUST", 32, 6);
+  const robust = metrics.snapshot({ success: true, now: 2 });
+  assert.equal(robust.profile, "ROBUST");
+  assert.equal(robust.color4ErasurePolicy?.selectedPolicies["classifier-budgeted"], 1);
+  assert.equal(robust.color4ErasurePolicy?.selectedMaxErasuresPerShard?.average, 32);
+  assert.equal(robust.color4ErasurePolicy?.selectedErasuresByShard?.length, 6);
+  assert.equal(robust.color4ErasurePolicy?.attempts?.[0]?.erasures?.average, 6);
 });
 
 test("capture stability telemetry is bounded and normalized", () => {
@@ -602,6 +903,7 @@ test("schema-v1 IndexedDB summaries without vision remain export compatible", ()
   assert.equal("stableCaptures" in exported.history[0]!, false);
   assert.equal("stabilityScore" in exported.history[0]!, false);
   assert.equal("qualityClassCounts" in exported.history[0]!, false);
+  assert.equal("color4ErasurePolicy" in exported.history[0]!, false);
   assert.equal("p95" in exported.history[0]!.decodeLatencyMs, false);
   assert.deepEqual(JSON.parse(JSON.stringify(exported)).history[0], storedLegacyRecord);
 });

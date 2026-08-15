@@ -33,8 +33,12 @@ physical conditions. At minimum report captures, frames skipped while busy,
 stability warmup/stable/unstable captures, stability-score distribution, vision
 submissions, unstable/redundant-stable skips, raw/ranked/merged candidates,
 candidate-budget warnings, configured threshold passes, rejection stage and
-internal `diagnosticReason` when present, uncertain cells/bytes, the per-attempt
-erasure-byte distribution (including p50/p95), RS corrections, CRC failures,
+internal `diagnosticReason` when present, uncertain cells/bytes, aggregate
+candidate-score count/min/p50/p95/max, selected erasure policy/budget/per-shard
+cap and counts, aggregate attempt count, and each positional attempt's
+policy/status/phase, budget, erasure distribution, duration and whitelisted
+rejection reason. Candidate indices, full ranked lists, coded bytes and payload
+must not appear in an experiment export. Also report RS corrections, CRC failures,
 fiducial errors by marker and maximum, homography method and residual,
 refinement attempts/applied, valid/new/duplicate LT frames, resolved blocks,
 decode latency, elapsed time and requested plus negotiated camera settings.
@@ -93,7 +97,10 @@ with metadata and explicit expected outcomes are checked into
 A cropped or anonymized fixture must declare that transformation because it no
 longer preserves full-frame coverage or background candidate load. Passing the
 synthetic corpus, fake-camera E2E or a local replay cannot replace three
-repeatable real-device runs and end-to-end file SHA-256 verification.
+repeatable real-device runs for a 256 KiB pseudo-random file plus three for a
+separate 1 MiB file. All six must reach `Signal recovered`, match bytes and
+SHA-256, progress `newFrames` and `resolvedBlocks` to K, and admit no frame to
+the fountain decoder before every carrier validation passes.
 
 ## Synthetic and soak gates
 

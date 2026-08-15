@@ -1,5 +1,8 @@
 import type {
   BrowserCarrierDiagnostics,
+  BrowserColor4ErasureBudgetFraction,
+  BrowserColor4ErasurePolicy,
+  BrowserColor4UnwrapAttemptDiagnostics,
   BrowserVisionDiagnostics,
   CarrierId,
   VisionBootstrapSamplingDiagnostics,
@@ -9,6 +12,7 @@ import type {
   VisionTimingRailName,
   VisionTimingKey,
 } from "./carrier";
+import type { RejectReason } from "./color4/types";
 
 const DATABASE = "decimen-experiments";
 const VERSION = 1;
@@ -51,7 +55,46 @@ const CLASSIFIER_DISTRIBUTION_METRICS = [
   "max",
 ] as const satisfies readonly (keyof VisionClassifierDistributionDiagnostics)[];
 const MAX_CLASSIFIER_AGGREGATE_BUCKETS = 256;
+const MAX_COLOR4_POLICY_ATTEMPTS = 4;
+const MAX_COLOR4_SHARDS = 14;
+const COLOR4_ERASURE_POLICIES = [
+  "classifier-budgeted",
+  "hard-decision",
+] as const satisfies readonly BrowserColor4ErasurePolicy[];
+const COLOR4_ERASURE_BUDGET_FRACTIONS = [
+  1,
+  0.75,
+  0.5,
+  0,
+] as const satisfies readonly BrowserColor4ErasureBudgetFraction[];
+const COLOR4_UNWRAP_STATUSES = ["valid", "rejected"] as const;
+const COLOR4_UNWRAP_PHASES = ["matched", "mismatched", "unknown"] as const;
+const COLOR4_REJECT_REASONS = [
+  "invalid-length",
+  "unsupported-profile",
+  "unsupported-palette",
+  "fec-uncorrectable",
+  "invalid-outer-header",
+  "crc-mismatch",
+  "invalid-inner-frame",
+  "identity-mismatch",
+  "no-symbol",
+] as const satisfies readonly RejectReason[];
 type VisionClassificationScalarMetric = typeof CLASSIFICATION_SCALAR_METRICS[number];
+type Color4UnwrapStatus = typeof COLOR4_UNWRAP_STATUSES[number];
+type Color4UnwrapPhase = typeof COLOR4_UNWRAP_PHASES[number];
+
+interface Color4ErasurePolicyAttemptSamples {
+  readonly policies: Map<BrowserColor4ErasurePolicy, number>;
+  readonly statuses: Map<Color4UnwrapStatus, number>;
+  readonly phases: Map<Color4UnwrapPhase, number>;
+  readonly budgetFraction: number[];
+  readonly maxErasuresPerShard: number[];
+  readonly erasures: number[];
+  readonly durationMs: number[];
+  readonly erasuresByShard: number[][];
+  readonly rejectReasons: Map<RejectReason, number>;
+}
 
 export type ExperimentDirection = "send" | "receive";
 
@@ -93,6 +136,10 @@ export interface VisionExperimentClassificationSummary {
     TimingDistribution
   >>>;
   readonly deltaEGap?: Readonly<Partial<Record<
+    keyof VisionClassifierDistributionDiagnostics,
+    TimingDistribution
+  >>>;
+  readonly erasureCandidateScore?: Readonly<Partial<Record<
     keyof VisionClassifierDistributionDiagnostics,
     TimingDistribution
   >>>;
@@ -175,6 +222,31 @@ export interface VisionExperimentSummary {
   }>;
 }
 
+export interface Color4ErasurePolicyAttemptExperimentSummary {
+  readonly policies: Readonly<Partial<Record<BrowserColor4ErasurePolicy, number>>>;
+  readonly statuses: Readonly<Partial<Record<Color4UnwrapStatus, number>>>;
+  readonly phases: Readonly<Partial<Record<Color4UnwrapPhase, number>>>;
+  readonly budgetFraction?: TimingDistribution;
+  readonly maxErasuresPerShard?: TimingDistribution;
+  readonly erasures?: TimingDistribution;
+  readonly durationMs?: TimingDistribution;
+  /** Per-shard count distributions; never erased-byte positions. */
+  readonly erasuresByShard?: readonly TimingDistribution[];
+  readonly rejectReasons: Readonly<Partial<Record<RejectReason, number>>>;
+}
+
+/** Optional schema-v1 extension containing aggregate-only COLOR_4 FEC policy telemetry. */
+export interface Color4ErasurePolicyExperimentSummary {
+  readonly selectedPolicies: Readonly<Partial<Record<BrowserColor4ErasurePolicy, number>>>;
+  readonly selectedBudgetFraction?: TimingDistribution;
+  readonly selectedMaxErasuresPerShard?: TimingDistribution;
+  /** Per-shard count distributions; never selected indices. */
+  readonly selectedErasuresByShard?: readonly TimingDistribution[];
+  readonly attemptsPerFrame?: TimingDistribution;
+  /** At most four aggregate slots in deterministic attempt order. */
+  readonly attempts?: readonly Color4ErasurePolicyAttemptExperimentSummary[];
+}
+
 export interface ExperimentSummary {
   schemaVersion: 1;
   startedAt: string;
@@ -218,6 +290,8 @@ export interface ExperimentSummary {
   /** Distribution of erasure bytes per carrier attempt; absent in legacy records. */
   erasureBytesPerAttempt?: TimingDistribution;
   decodeLatencyMs: TimingDistribution;
+  /** Aggregate-only COLOR_4 erasure-policy telemetry; absent in older schema-v1 records. */
+  color4ErasurePolicy?: Color4ErasurePolicyExperimentSummary;
   vision?: VisionExperimentSummary;
   containerBitrateBps?: number;
   fileGoodputBps?: number;
@@ -276,6 +350,15 @@ export class ExperimentMetrics {
   private readonly latencySamples: number[] = [];
   private readonly erasureSamples: number[] = [];
   private readonly stabilityScoreSamples: number[] = [];
+  private color4ErasurePolicySeen = false;
+  private readonly color4SelectedPolicies = new Map<BrowserColor4ErasurePolicy, number>();
+  private readonly color4SelectedBudgetFractions: number[] = [];
+  private readonly color4SelectedMaxErasuresPerShard: number[] = [];
+  private readonly color4SelectedErasuresByShard: number[][] = [];
+  private readonly color4AttemptsPerFrame: number[] = [];
+  private readonly color4Attempts: Color4ErasurePolicyAttemptSamples[] = [];
+  /** Prevent profile-shaped FEC caps and shard positions from being mixed. */
+  private color4ErasurePolicyProfile: string | undefined;
   private readonly qualityClassCounts: Record<CaptureQualityClass, number> = {
     UNKNOWN: 0,
     UNUSABLE: 0,
@@ -313,6 +396,10 @@ export class ExperimentMetrics {
     number[]
   >();
   private readonly visionDeltaEGap = new Map<
+    keyof VisionClassifierDistributionDiagnostics,
+    number[]
+  >();
+  private readonly visionErasureCandidateScore = new Map<
     keyof VisionClassifierDistributionDiagnostics,
     number[]
   >();
@@ -379,6 +466,7 @@ export class ExperimentMetrics {
     now = Date.now(),
   ) {
     this.startedAtMs = now;
+    if (carrier === "COLOR_4") this.color4ErasurePolicyProfile = profile;
   }
 
   recordCapture(): void {
@@ -432,7 +520,9 @@ export class ExperimentMetrics {
   }
 
   setProfile(profile: string | undefined): void {
-    if (profile) this.profile = profile;
+    if (!profile) return;
+    this.alignColor4ErasurePolicyProfile(profile);
+    this.profile = profile;
   }
 
   setVisionContext(input: {
@@ -473,7 +563,109 @@ export class ExperimentMetrics {
       if (this.latencySamples.length === 256) this.latencySamples.shift();
       this.latencySamples.push(Math.max(0, diagnostics.decodeMs));
     }
+    if (diagnostics) this.recordColor4ErasurePolicy(diagnostics);
     if (diagnostics?.vision) this.recordVision(status, diagnostics, diagnostics.vision);
+  }
+
+  private recordColor4ErasurePolicy(diagnostics: BrowserCarrierDiagnostics): void {
+    if (this.carrier !== "COLOR_4") return;
+    this.alignColor4ErasurePolicyProfile(diagnostics.profile ?? this.profile);
+    let recorded = false;
+    if (isColor4ErasurePolicy(diagnostics.erasurePolicy)) {
+      this.increment(this.color4SelectedPolicies, diagnostics.erasurePolicy);
+      recorded = true;
+    }
+    if (isColor4ErasureBudgetFraction(diagnostics.selectedBudgetFraction)) {
+      this.pushBounded(
+        this.color4SelectedBudgetFractions,
+        diagnostics.selectedBudgetFraction,
+      );
+      recorded = true;
+    }
+    if (isNonnegativeInteger(diagnostics.selectedMaxErasuresPerShard)) {
+      this.pushBounded(
+        this.color4SelectedMaxErasuresPerShard,
+        diagnostics.selectedMaxErasuresPerShard,
+      );
+      recorded = true;
+    }
+    if (isBoundedShardCounts(diagnostics.selectedErasuresByShard)) {
+      this.addIndexedNonnegativeMetric(
+        this.color4SelectedErasuresByShard,
+        diagnostics.selectedErasuresByShard,
+      );
+      recorded = true;
+    }
+    if (isBoundedUnwrapAttempts(diagnostics.unwrapAttempts)) {
+      this.pushBounded(this.color4AttemptsPerFrame, diagnostics.unwrapAttempts.length);
+      for (let position = 0; position < diagnostics.unwrapAttempts.length; position++) {
+        this.addColor4UnwrapAttempt(position, diagnostics.unwrapAttempts[position]!);
+      }
+      recorded = true;
+    }
+    this.color4ErasurePolicySeen ||= recorded;
+  }
+
+  private alignColor4ErasurePolicyProfile(profile: string | undefined): void {
+    if (this.carrier !== "COLOR_4" || profile === undefined) return;
+    if (this.color4ErasurePolicyProfile !== undefined &&
+        this.color4ErasurePolicyProfile !== profile) {
+      this.resetColor4ErasurePolicy();
+    }
+    this.color4ErasurePolicyProfile = profile;
+  }
+
+  private resetColor4ErasurePolicy(): void {
+    this.color4ErasurePolicySeen = false;
+    this.color4SelectedPolicies.clear();
+    this.color4SelectedBudgetFractions.length = 0;
+    this.color4SelectedMaxErasuresPerShard.length = 0;
+    this.color4SelectedErasuresByShard.length = 0;
+    this.color4AttemptsPerFrame.length = 0;
+    this.color4Attempts.length = 0;
+  }
+
+  private addColor4UnwrapAttempt(
+    position: number,
+    attempt: BrowserColor4UnwrapAttemptDiagnostics,
+  ): void {
+    let samples = this.color4Attempts[position];
+    if (samples === undefined) {
+      samples = color4ErasurePolicyAttemptSamples();
+      this.color4Attempts[position] = samples;
+    }
+    if (isColor4ErasurePolicy(attempt.policy)) {
+      this.increment(samples.policies, attempt.policy);
+    }
+    if (isColor4UnwrapStatus(attempt.status)) {
+      this.increment(samples.statuses, attempt.status);
+    }
+    this.increment(
+      samples.phases,
+      attempt.phaseMatched === true
+        ? "matched"
+        : attempt.phaseMatched === false
+          ? "mismatched"
+          : "unknown",
+    );
+    if (isColor4ErasureBudgetFraction(attempt.budgetFraction)) {
+      this.pushBounded(samples.budgetFraction, attempt.budgetFraction);
+    }
+    if (isNonnegativeInteger(attempt.maxErasuresPerShard)) {
+      this.pushBounded(samples.maxErasuresPerShard, attempt.maxErasuresPerShard);
+    }
+    if (isNonnegativeInteger(attempt.erasures)) {
+      this.pushBounded(samples.erasures, attempt.erasures);
+    }
+    if (isNonnegativeFinite(attempt.durationMs)) {
+      this.pushBounded(samples.durationMs, attempt.durationMs);
+    }
+    if (isBoundedShardCounts(attempt.erasuresByShard)) {
+      this.addIndexedNonnegativeMetric(samples.erasuresByShard, attempt.erasuresByShard);
+    }
+    if (attempt.status === "rejected" && isColor4RejectReason(attempt.reason)) {
+      this.increment(samples.rejectReasons, attempt.reason);
+    }
   }
 
   private recordVision(
@@ -636,7 +828,10 @@ export class ExperimentMetrics {
     canonical: NonNullable<BrowserVisionDiagnostics["canonical"]>,
     profile: string | undefined,
   ): void {
-    if (canonical.bestDeltaE !== undefined && profile !== undefined) {
+    const hasClassifierDistribution = canonical.bestDeltaE !== undefined ||
+      canonical.deltaEGap !== undefined ||
+      canonical.erasureCandidateScore !== undefined;
+    if (hasClassifierDistribution && profile !== undefined) {
       if (this.visionClassificationProfile !== undefined &&
           this.visionClassificationProfile !== profile) {
         this.resetCanonicalClassification();
@@ -655,6 +850,10 @@ export class ExperimentMetrics {
     }
     this.addClassifierDistribution(this.visionBestDeltaE, canonical.bestDeltaE);
     this.addClassifierDistribution(this.visionDeltaEGap, canonical.deltaEGap);
+    this.addClassifierDistribution(
+      this.visionErasureCandidateScore,
+      canonical.erasureCandidateScore,
+    );
     this.addIndexedClassifierMetric(
       this.visionErasuresByShard,
       canonical.erasuresByShard,
@@ -681,6 +880,7 @@ export class ExperimentMetrics {
     this.visionClassificationScalars.clear();
     this.visionBestDeltaE.clear();
     this.visionDeltaEGap.clear();
+    this.visionErasureCandidateScore.clear();
     this.visionErasuresByShard.length = 0;
     this.visionRemainingErasureBudgetByShard.length = 0;
     this.visionUncertainCellsByRow.length = 0;
@@ -717,6 +917,17 @@ export class ExperimentMetrics {
     }
   }
 
+  private addIndexedNonnegativeMetric(
+    samplesByPosition: number[][],
+    values: readonly number[],
+  ): void {
+    for (let position = 0; position < values.length; position++) {
+      const samples = samplesByPosition[position] ?? [];
+      if (samplesByPosition[position] === undefined) samplesByPosition[position] = samples;
+      this.pushBounded(samples, values[position]!);
+    }
+  }
+
   snapshot(input: {
     success: boolean;
     now?: number;
@@ -733,6 +944,7 @@ export class ExperimentMetrics {
     const now = input.now ?? Date.now();
     const elapsedMs = Math.max(0, now - this.startedAtMs);
     const decodeLatencyMs = distribution(this.latencySamples);
+    const color4ErasurePolicy = this.color4ErasurePolicySnapshot();
     const captureTelemetry = this.captureTelemetrySeen
       ? {
           stableCaptures: this.stableCaptures,
@@ -778,6 +990,7 @@ export class ExperimentMetrics {
       erasureBytes: this.erasureBytes,
       erasureBytesPerAttempt: distribution(this.erasureSamples),
       decodeLatencyMs,
+      ...(color4ErasurePolicy === undefined ? {} : { color4ErasurePolicy }),
       vision: this.visionSnapshot(),
       containerBitrateBps:
         input.payloadBytes === undefined || elapsedMs === 0
@@ -788,6 +1001,53 @@ export class ExperimentMetrics {
           ? undefined
           : (input.fileBytes * 1_000) / elapsedMs,
       failureReason: input.failureReason,
+    };
+  }
+
+  private color4ErasurePolicySnapshot(): Color4ErasurePolicyExperimentSummary | undefined {
+    if (!this.color4ErasurePolicySeen) return undefined;
+    const attempts = this.color4Attempts.map((samples) => ({
+      policies: countRecord(samples.policies),
+      statuses: countRecord(samples.statuses),
+      phases: countRecord(samples.phases),
+      ...(samples.budgetFraction.length === 0
+        ? {}
+        : { budgetFraction: distribution(samples.budgetFraction) }),
+      ...(samples.maxErasuresPerShard.length === 0
+        ? {}
+        : { maxErasuresPerShard: distribution(samples.maxErasuresPerShard) }),
+      ...(samples.erasures.length === 0
+        ? {}
+        : { erasures: distribution(samples.erasures) }),
+      ...(samples.durationMs.length === 0
+        ? {}
+        : { durationMs: distribution(samples.durationMs) }),
+      ...(samples.erasuresByShard.length === 0
+        ? {}
+        : { erasuresByShard: samples.erasuresByShard.map(distribution) }),
+      rejectReasons: countRecord(samples.rejectReasons),
+    }));
+    return {
+      selectedPolicies: countRecord(this.color4SelectedPolicies),
+      ...(this.color4SelectedBudgetFractions.length === 0
+        ? {}
+        : { selectedBudgetFraction: distribution(this.color4SelectedBudgetFractions) }),
+      ...(this.color4SelectedMaxErasuresPerShard.length === 0
+        ? {}
+        : {
+            selectedMaxErasuresPerShard: distribution(
+              this.color4SelectedMaxErasuresPerShard,
+            ),
+          }),
+      ...(this.color4SelectedErasuresByShard.length === 0
+        ? {}
+        : {
+            selectedErasuresByShard: this.color4SelectedErasuresByShard.map(distribution),
+          }),
+      ...(this.color4AttemptsPerFrame.length === 0
+        ? {}
+        : { attemptsPerFrame: distribution(this.color4AttemptsPerFrame) }),
+      ...(attempts.length === 0 ? {} : { attempts }),
     };
   }
 
@@ -834,6 +1094,11 @@ export class ExperimentMetrics {
     const deltaEGap = Object.fromEntries(
       [...this.visionDeltaEGap].map(([key, samples]) => [key, distribution(samples)]),
     ) as NonNullable<VisionExperimentClassificationSummary["deltaEGap"]>;
+    const erasureCandidateScore = Object.fromEntries(
+      [...this.visionErasureCandidateScore].map(
+        ([key, samples]) => [key, distribution(samples)],
+      ),
+    ) as NonNullable<VisionExperimentClassificationSummary["erasureCandidateScore"]>;
     const erasuresByShard = this.visionErasuresByShard.map(distribution);
     const remainingErasureBudgetByShard =
       this.visionRemainingErasureBudgetByShard.map(distribution);
@@ -842,6 +1107,7 @@ export class ExperimentMetrics {
     const hasClassification = this.visionClassificationScalars.size > 0 ||
       this.visionBestDeltaE.size > 0 ||
       this.visionDeltaEGap.size > 0 ||
+      this.visionErasureCandidateScore.size > 0 ||
       erasuresByShard.length > 0 ||
       remainingErasureBudgetByShard.length > 0 ||
       uncertainCellsByRow.length > 0 ||
@@ -850,6 +1116,7 @@ export class ExperimentMetrics {
       ...classificationScalars,
       ...(this.visionBestDeltaE.size === 0 ? {} : { bestDeltaE }),
       ...(this.visionDeltaEGap.size === 0 ? {} : { deltaEGap }),
+      ...(this.visionErasureCandidateScore.size === 0 ? {} : { erasureCandidateScore }),
       ...(erasuresByShard.length === 0 ? {} : { erasuresByShard }),
       ...(remainingErasureBudgetByShard.length === 0
         ? {}
@@ -900,6 +1167,82 @@ export class ExperimentMetrics {
       },
     };
   }
+}
+
+function color4ErasurePolicyAttemptSamples(): Color4ErasurePolicyAttemptSamples {
+  return {
+    policies: new Map(),
+    statuses: new Map(),
+    phases: new Map(),
+    budgetFraction: [],
+    maxErasuresPerShard: [],
+    erasures: [],
+    durationMs: [],
+    erasuresByShard: [],
+    rejectReasons: new Map(),
+  };
+}
+
+function isColor4ErasurePolicy(value: unknown): value is BrowserColor4ErasurePolicy {
+  return COLOR4_ERASURE_POLICIES.some((candidate) => candidate === value);
+}
+
+function isColor4ErasureBudgetFraction(
+  value: unknown,
+): value is BrowserColor4ErasureBudgetFraction {
+  return COLOR4_ERASURE_BUDGET_FRACTIONS.some((candidate) => candidate === value);
+}
+
+function isColor4UnwrapStatus(value: unknown): value is Color4UnwrapStatus {
+  return COLOR4_UNWRAP_STATUSES.some((candidate) => candidate === value);
+}
+
+function isColor4RejectReason(value: unknown): value is RejectReason {
+  return COLOR4_REJECT_REASONS.some((candidate) => candidate === value);
+}
+
+function isNonnegativeFinite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+  return isNonnegativeFinite(value) && Number.isInteger(value);
+}
+
+function isBoundedShardCounts(value: unknown): value is readonly number[] {
+  return Array.isArray(value) &&
+    value.length <= MAX_COLOR4_SHARDS &&
+    value.every(isNonnegativeInteger);
+}
+
+function isBoundedUnwrapAttempts(
+  value: unknown,
+): value is readonly BrowserColor4UnwrapAttemptDiagnostics[] {
+  return Array.isArray(value) &&
+    value.length <= MAX_COLOR4_POLICY_ATTEMPTS &&
+    value.every(isValidColor4UnwrapAttempt);
+}
+
+function isValidColor4UnwrapAttempt(
+  value: unknown,
+): value is BrowserColor4UnwrapAttemptDiagnostics {
+  if (typeof value !== "object" || value === null) return false;
+  const attempt = value as Record<string, unknown>;
+  return isColor4ErasurePolicy(attempt.policy) &&
+    isColor4ErasureBudgetFraction(attempt.budgetFraction) &&
+    isNonnegativeInteger(attempt.maxErasuresPerShard) &&
+    isNonnegativeInteger(attempt.erasures) &&
+    isBoundedShardCounts(attempt.erasuresByShard) &&
+    (attempt.phaseMatched === undefined || typeof attempt.phaseMatched === "boolean") &&
+    isNonnegativeFinite(attempt.durationMs) &&
+    isColor4UnwrapStatus(attempt.status) &&
+    (attempt.reason === undefined || isColor4RejectReason(attempt.reason));
+}
+
+function countRecord<Key extends string>(
+  counts: ReadonlyMap<Key, number>,
+): Readonly<Partial<Record<Key, number>>> {
+  return Object.fromEntries(counts) as Partial<Record<Key, number>>;
 }
 
 function validClassifierDistribution(

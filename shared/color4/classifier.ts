@@ -113,6 +113,12 @@ export interface ClassifierDistributionSummary {
   readonly max: number;
 }
 
+export interface Color4ByteErasureCandidate {
+  readonly index: number;
+  /** Unbounded heuristic severity used for ranking; this is not a probability. */
+  readonly score: number;
+}
+
 export interface CanonicalRasterDiagnostics {
   readonly moduleScale: number;
   /** Sum across all four fiducials, retained for schema compatibility. */
@@ -150,6 +156,7 @@ export interface CanonicalRasterDiagnostics {
   readonly effectiveMinimumDeltaEGap: number;
   readonly bestDeltaE: ClassifierDistributionSummary;
   readonly deltaEGap: ClassifierDistributionSummary;
+  readonly erasureCandidateScore: ClassifierDistributionSummary;
   readonly meanBestDeltaE: number;
   readonly maximumBestDeltaE: number;
 }
@@ -183,6 +190,8 @@ export interface ValidCanonicalRaster {
   readonly codedBytes: Uint8Array;
   /** Global coded-stream byte indices; accepted directly by the core decoder. */
   readonly byteErasures: Uint16Array;
+  /** Ranked-policy inputs; one immutable candidate for every byte erasure. */
+  readonly byteErasureCandidates: readonly Color4ByteErasureCandidate[];
   readonly diagnostics: CanonicalRasterDiagnostics;
 }
 
@@ -315,6 +324,7 @@ export type CanonicalRasterObserver = (observation: CanonicalRasterObservation) 
 export const MAX_CLASSIFIER_CELL_OBSERVATIONS = 128;
 const QUIET_ZONE_SAMPLES_PER_EDGE = 8;
 const MAXIMUM_QUIET_ZONE_ERRORS = 2;
+const ERASURE_SEVERITY_EPSILON = Number.EPSILON;
 
 interface MutableDiagnostics {
   moduleScale: number;
@@ -346,6 +356,7 @@ interface MutableDiagnostics {
   effectiveMinimumDeltaEGap: number;
   bestDeltaE: ClassifierDistributionSummary;
   deltaEGap: ClassifierDistributionSummary;
+  erasureCandidateScore: ClassifierDistributionSummary;
   meanBestDeltaE: number;
   maximumBestDeltaE: number;
 }
@@ -413,6 +424,11 @@ function assertCompletedClassificationDiagnostics(
     entries.reduce((total, entry) => total + entry, 0);
   assertClassifierDistribution("bestDeltaE", value.bestDeltaE, cells);
   assertClassifierDistribution("deltaEGap", value.deltaEGap, cells);
+  assertClassifierDistribution(
+    "erasureCandidateScore",
+    value.erasureCandidateScore,
+    value.erasureBytes,
+  );
   if (value.uncertainCells !==
       value.distanceRejectedCells + value.gapRejectedCells - value.bothRejectedCells ||
       value.bothRejectedCells > value.distanceRejectedCells ||
@@ -462,6 +478,7 @@ function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics 
     effectiveMinimumDeltaEGap: 0,
     bestDeltaE: emptyClassifierDistribution(),
     deltaEGap: emptyClassifierDistribution(),
+    erasureCandidateScore: emptyClassifierDistribution(),
     meanBestDeltaE: 0,
     maximumBestDeltaE: 0,
     ...initial,
@@ -478,6 +495,7 @@ function freezeDiagnostics(value: MutableDiagnostics): CanonicalRasterDiagnostic
     uncertainCellsByColumn: Object.freeze([...value.uncertainCellsByColumn]),
     bestDeltaE: Object.freeze({ ...value.bestDeltaE }),
     deltaEGap: Object.freeze({ ...value.deltaEGap }),
+    erasureCandidateScore: Object.freeze({ ...value.erasureCandidateScore }),
     ...(value.bootstrapSampling === undefined
       ? {}
       : { bootstrapSampling: Object.freeze({ ...value.bootstrapSampling }) }),
@@ -1046,6 +1064,19 @@ function cellObservationScore(
   return (erased ? 1_000_000 : 0) + bestDeltaE + gapPenalty;
 }
 
+function cellErasureCandidateScore(
+  bestDeltaE: number,
+  deltaEGap: number,
+  effectiveMaximumDeltaE: number,
+  effectiveMinimumDeltaEGap: number,
+): number {
+  const distanceSeverity =
+    bestDeltaE / Math.max(effectiveMaximumDeltaE, ERASURE_SEVERITY_EPSILON);
+  const gapSeverity =
+    effectiveMinimumDeltaEGap / Math.max(deltaEGap, ERASURE_SEVERITY_EPSILON);
+  return Math.max(distanceSeverity, gapSeverity);
+}
+
 function retainWorstCell(
   buffer: RankedCellBuffer,
   score: number,
@@ -1401,6 +1432,8 @@ export function decodeCanonicalColor4Raster(
   values.effectiveMinimumDeltaEGap = dynamicMinimumGap;
   const codedBytes = new Uint8Array(profile.codedBytes);
   const erasures: number[] = [];
+  const erasureCandidates: Color4ByteErasureCandidate[] = [];
+  const erasureCandidateScores: number[] = [];
   const erasuresByShard = Array<number>(profile.shards).fill(0);
   const uncertainCellsByRow = Array<number>(profile.rows).fill(0);
   const uncertainCellsByColumn = Array<number>(profile.columns).fill(0);
@@ -1416,6 +1449,7 @@ export function decodeCanonicalColor4Raster(
   for (let byteIndex = 0; byteIndex < codedBytes.length; byteIndex++) {
     let byte = 0;
     let byteErased = false;
+    let byteErasureScore = 0;
     for (let dibitIndex = 0; dibitIndex < 4; dibitIndex++) {
       const column = cell % profile.columns;
       const row = Math.floor(cell / profile.columns);
@@ -1435,6 +1469,13 @@ export function decodeCanonicalColor4Raster(
       const deltaEGap = classified.secondDeltaE - classified.bestDeltaE;
       const distanceRejected = classified.bestDeltaE > dynamicMaximumDeltaE;
       const gapRejected = deltaEGap < dynamicMinimumGap;
+      const erasureScore = cellErasureCandidateScore(
+        classified.bestDeltaE,
+        deltaEGap,
+        dynamicMaximumDeltaE,
+        dynamicMinimumGap,
+      );
+      byteErasureScore = Math.max(byteErasureScore, erasureScore);
       byte = (byte << 2) | classified.dibit;
       if (classified.erased) {
         byteErased = true;
@@ -1481,6 +1522,8 @@ export function decodeCanonicalColor4Raster(
     codedBytes[byteIndex] = byte;
     if (byteErased) {
       erasures.push(byteIndex);
+      erasureCandidates.push(Object.freeze({ index: byteIndex, score: byteErasureScore }));
+      erasureCandidateScores.push(byteErasureScore);
       const shard = shardPosition(byteIndex, profile.shards).shard;
       erasuresByShard[shard] = (erasuresByShard[shard] ?? 0) + 1;
     }
@@ -1496,6 +1539,7 @@ export function decodeCanonicalColor4Raster(
   values.uncertainCellsByColumn = uncertainCellsByColumn;
   values.bestDeltaE = classifierDistribution(bestDeltaEValues);
   values.deltaEGap = classifierDistribution(deltaEGapValues);
+  values.erasureCandidateScore = classifierDistribution(erasureCandidateScores);
   values.meanBestDeltaE = totalBestDeltaE / bestDeltaEValues.length;
   assertCompletedClassificationDiagnostics(values, profile);
   const classificationTiming = observing
@@ -1526,6 +1570,7 @@ export function decodeCanonicalColor4Raster(
     sequencePhase: bootstrap.sequencePhase,
     codedBytes,
     byteErasures: Uint16Array.from(erasures),
+    byteErasureCandidates: Object.freeze(erasureCandidates),
     diagnostics: freezeDiagnostics(values),
   });
 }

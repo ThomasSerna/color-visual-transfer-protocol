@@ -56,6 +56,7 @@ test("worker maps photometric canonical diagnostics without debug bootstrap byte
       effectiveMinimumDeltaEGap: 17.5,
       bestDeltaE: { count: 6_120, min: 1, p50: 10, p95: 30, max: 40 },
       deltaEGap: { count: 6_120, min: 0.5, p50: 25, p95: 60, max: 80 },
+      erasureCandidateScore: { count: 195, min: 1.01, p50: 1.2, p95: 2.1, max: 3 },
       meanBestDeltaE: 12,
       maximumBestDeltaE: 40,
     } as unknown as CanonicalRasterDiagnostics;
@@ -68,9 +69,11 @@ test("worker maps photometric canonical diagnostics without debug bootstrap byte
     assert.deepEqual(mapped.remainingErasureBudgetByShard, [6, -3, 3, -2, -2, -5]);
     assert.deepEqual(mapped.bestDeltaE, diagnostics.bestDeltaE);
     assert.deepEqual(mapped.deltaEGap, diagnostics.deltaEGap);
+    assert.deepEqual(mapped.erasureCandidateScore, diagnostics.erasureCandidateScore);
     assert.notStrictEqual(mapped.erasuresByShard, diagnostics.erasuresByShard);
     assert.notStrictEqual(mapped.uncertainCellsByRow, diagnostics.uncertainCellsByRow);
     assert.notStrictEqual(mapped.bestDeltaE, diagnostics.bestDeltaE);
+    assert.notStrictEqual(mapped.erasureCandidateScore, diagnostics.erasureCandidateScore);
     assert.deepEqual(mapped.bootstrapSampling, {
       doubleVoteColumns: 20,
       singleVoteColumns: 4,
@@ -105,10 +108,12 @@ test("worker maps photometric canonical diagnostics without debug bootstrap byte
       effectiveMinimumDeltaEGap: 0,
       bestDeltaE: { count: 0, min: 0, p50: 0, p95: 0, max: 0 },
       deltaEGap: { count: 0, min: 0, p50: 0, p95: 0, max: 0 },
+      erasureCandidateScore: { count: 0, min: 0, p50: 0, p95: 0, max: 0 },
     });
     assert.equal("distanceRejectedCells" in preClassification, false);
     assert.equal("erasuresByShard" in preClassification, false);
     assert.equal("bestDeltaE" in preClassification, false);
+    assert.equal("erasureCandidateScore" in preClassification, false);
   } finally {
     if (previousSelf === undefined) delete (globalThis as { self?: unknown }).self;
     else Object.defineProperty(globalThis, "self", previousSelf);
@@ -144,6 +149,8 @@ test("worker exposes bounded erasure attempts and retains original saturation di
     const policy = {
       result: valid,
       selectedPolicy: "hard-decision",
+      selectedBudgetFraction: 0,
+      selectedMaxErasuresPerShard: 0,
       selectedErasures: new Uint16Array(),
       selectedObservations: [],
       suggestedErasuresByShard: [26, 35, 29, 34, 34, 37],
@@ -151,15 +158,22 @@ test("worker exposes bounded erasure attempts and retains original saturation di
       attempts: [
         {
           policy: "classifier-budgeted",
-          erasures: new Uint16Array(55),
-          erasuresByShard: [26, 0, 29, 0, 0, 0],
+          budgetFraction: 1,
+          maxErasuresPerShard: 32,
+          erasures: new Uint16Array(183),
+          erasuresByShard: [26, 32, 29, 32, 32, 32],
+          durationMs: 2.5,
           observations: [],
           result: rejected,
         },
         {
           policy: "hard-decision",
+          budgetFraction: 0,
+          maxErasuresPerShard: 0,
           erasures: new Uint16Array(),
           erasuresByShard: [0, 0, 0, 0, 0, 0],
+          phaseMatched: true,
+          durationMs: 1.5,
           observations: [],
           result: valid,
         },
@@ -169,20 +183,30 @@ test("worker exposes bounded erasure attempts and retains original saturation di
     const diagnostics = color4ErasurePolicyDiagnostics(policy);
     assert.deepEqual(diagnostics, {
       erasurePolicy: "hard-decision",
+      selectedBudgetFraction: 0,
+      selectedMaxErasuresPerShard: 0,
+      selectedErasuresByShard: [0, 0, 0, 0, 0, 0],
       suggestedErasuresByShard: [26, 35, 29, 34, 34, 37],
       saturatedErasureShards: [1, 3, 4, 5],
       unwrapAttempts: [
         {
           policy: "classifier-budgeted",
-          erasures: 55,
-          erasuresByShard: [26, 0, 29, 0, 0, 0],
+          budgetFraction: 1,
+          maxErasuresPerShard: 32,
+          erasures: 183,
+          erasuresByShard: [26, 32, 29, 32, 32, 32],
+          durationMs: 2.5,
           status: "rejected",
           reason: "fec-uncorrectable",
         },
         {
           policy: "hard-decision",
+          budgetFraction: 0,
+          maxErasuresPerShard: 0,
           erasures: 0,
           erasuresByShard: [0, 0, 0, 0, 0, 0],
+          phaseMatched: true,
+          durationMs: 1.5,
           status: "valid",
         },
       ],

@@ -45,6 +45,13 @@
         "total": 195,
         "byShard": [26, 35, 29, 34, 34, 37]
       },
+      "erasureCandidateScore": {
+        "count": 195,
+        "min": 1.0014599635981696,
+        "p50": 1.6220608388842113,
+        "p95": 12.534467124400843,
+        "max": 62.854022931804224
+      },
       "codedBytesSha256": "fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df"
     },
     "unwrap": {
@@ -52,12 +59,14 @@
       "sessionId": 31926,
       "sequence": 23,
       "selectedPolicy": "classifier-budgeted",
+      "selectedBudgetFraction": 1,
+      "selectedMaxErasuresPerShard": 32,
       "attempts": 1,
       "selectedErasures": {
-        "total": 55,
-        "byShard": [26, 0, 29, 0, 0, 0]
+        "total": 183,
+        "byShard": [26, 32, 29, 32, 32, 32]
       },
-      "correctedErrors": 31,
+      "correctedErrors": 0,
       "correctedBytes": 47,
       "correctedShards": 6,
       "innerFrameSha256": "a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84"

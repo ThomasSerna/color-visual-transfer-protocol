@@ -66,12 +66,19 @@ included. Persisted experiments keep a bounded whitelist of these aggregates
 and reset profile-shaped series if the detected COLOR_4 profile changes.
 
 Receiver diagnostics can additionally include the selected `erasurePolicy`,
-the original `suggestedErasuresByShard`, saturated shards and at most two
-ordered `unwrapAttempts`. `erasureBytes` remains the number of optical hints,
-while `erasures` and correction counters describe the selected attempt. Stage
-timings include every attempted unwrap; RS/CRC failure counters describe the
-final selected outcome, so a frame rescued by hard decision is not reported as
-failed. These fields are optional so older snapshots remain readable.
+budget fraction and per-shard limit, the original `suggestedErasuresByShard`,
+saturated shards and at most four ordered `unwrapAttempts`. Each attempt records
+its budget, erasure distribution, phase result and duration. `erasureBytes`
+remains the number of optical hints, while `erasures` and correction counters
+describe the selected attempt. Stage timings include every attempted unwrap;
+RS/CRC failure counters describe the final selected outcome, so a frame rescued
+by a later ranked prefix or hard decision is not reported as failed. Persisted
+experiments aggregate the selected policy, budget, per-shard cap and erasure
+counts, plus up to four positional attempt summaries with policy/status/phase
+counts, bounded numeric distributions and whitelisted rejection reasons. Score
+telemetry is likewise aggregate-only. Candidate indices, complete candidate
+lists, coded bytes and payload never enter experiment history. These fields are
+optional so older schema-v1 snapshots remain readable.
 
 ## Capture a diagnostic ZIP
 
@@ -204,11 +211,11 @@ variable at a time. Never relax CRC or the Reed-Solomon correction bound to make
 a frame appear valid. A proposed change is kept only when the exact baseline
 produces more valid frames without CRC failures or incorrect inner frames.
 
-For the bounded-policy receiver check, run three additional controlled captures
+For the ranked-policy receiver check, run three additional controlled captures
 with ROBUST, KCMY, 5 fps, canonical scale 6, detection limit 1280 and prefilter
 `observe`. Each run must contain at least one frame that completes bootstrap,
 timing and phase and then passes RS, CRC32C, outer/inner validation and identity
-through the receiver's bounded erasure policy. A direct decode with all optical
+through the receiver's ranked erasure policy. A direct decode with all optical
 erasure hints may still reject; that preserves the core decoder contract and is
 not the receiver outcome. A frame that merely reaches RS but fails the remaining
 gates is not successful.
@@ -225,7 +232,13 @@ identified as such. Before a capture passes that review, preserve its original
 outside the repository and report the physical run separately. The reviewed
 `capture-000017` full frame is now retained as a CRC-derived physical regression,
 but release acceptance still requires a new controlled fixture whose expected
-inner bytes were recorded independently at the transmitter.
+inner bytes were recorded independently at the transmitter. Record the inner
+bytes, session, sequence and SHA-256 before showing the frame. The differentiating
+fixture must reject under both the legacy saturated-shard policy and its hard-
+decision fallback, then recover the exact independently recorded inner frame
+under the ranked policy. Use the hosted HTTPS/PWA build, requested camera width
+1280 at 30 fps, detection limit 1280, canonical scale 6, `prefilter=observe`,
+ROBUST/KCMY at 5 fps, fullscreen and maximum sender brightness, 0.5 m and 0°.
 
 A privacy-reviewed `warped.png` may instead enter
 `tests/fixtures/color4/canonical/` without its raw camera counterpart. It must
@@ -236,10 +249,14 @@ OpenCV contours/fiducials, homography, or physical end-to-end success.
 
 ## Follow-up matrix
 
-After valid frames are observed repeatedly in the A–E protocol, reconstruct the
-same incompressible pseudo-random 1 MiB file with a verified file SHA-256 in
-three of three runs. Then run every combination below while holding the winning
-baseline conditions fixed:
+After valid frames are observed repeatedly in the A–E protocol, complete six
+transfers under the frozen ROBUST/KCMY baseline: three runs of one
+incompressible pseudo-random 256 KiB file and three runs of a separate 1 MiB
+file. Every run must reach `Signal recovered`; reconstructed bytes and SHA-256
+must match, `newFrames` and `resolvedBlocks` must progress to K, and no frame
+that fails RS, CRC32C, wire, identity or phase validation may enter the fountain
+decoder. Then run every combination below while holding the winning baseline
+conditions fixed:
 
 | Dimension | Values |
 |---|---|

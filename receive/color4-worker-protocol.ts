@@ -1,5 +1,6 @@
 import type {
   BrowserCarrierDiagnostics,
+  BrowserColor4UnwrapAttemptDiagnostics,
 } from "../shared/carrier";
 import type {
   CanonicalRasterObservation,
@@ -14,7 +15,10 @@ import type {
   VisionDebugView,
   VisionDetectionLimit,
 } from "./color4-vision-types";
-import type { Color4ErasurePolicy } from "./color4-erasure-policy";
+import type {
+  Color4ErasureBudgetFraction,
+  Color4ErasurePolicy,
+} from "./color4-erasure-policy";
 
 export interface Color4WorkerDebugOptions {
   readonly enabled: boolean;
@@ -45,10 +49,15 @@ export interface Color4WorkerDecodeRequest {
 
 export type Color4WorkerRequest = Color4WorkerInitRequest | Color4WorkerDecodeRequest;
 
-export interface Color4WorkerUnwrapAttemptDiagnostics {
+export interface Color4WorkerUnwrapAttemptDiagnostics
+  extends BrowserColor4UnwrapAttemptDiagnostics {
   readonly policy: Color4ErasurePolicy;
+  readonly budgetFraction: Color4ErasureBudgetFraction;
+  readonly maxErasuresPerShard: number;
   readonly erasures: number;
   readonly erasuresByShard: readonly number[];
+  readonly phaseMatched?: boolean;
+  readonly durationMs: number;
   readonly status: "valid" | "rejected";
   readonly reason?: RejectReason;
 }
@@ -68,6 +77,12 @@ export interface Color4WorkerDiagnostics extends BrowserCarrierDiagnostics {
   readonly correctedShards: number;
   /** Policy and counts for the selected, protocol-validating unwrap attempt. */
   readonly erasurePolicy?: Color4ErasurePolicy;
+  /** Budget rung used by the selected attempt. Absent before unwrap and in legacy snapshots. */
+  readonly selectedBudgetFraction?: Color4ErasureBudgetFraction;
+  /** Per-shard erasure cap used by the selected attempt. */
+  readonly selectedMaxErasuresPerShard?: number;
+  /** Aggregate selected erasure counts by shard; never erased-byte positions. */
+  readonly selectedErasuresByShard?: readonly number[];
   /** Classifier erasure hints before the per-shard FEC budget is applied. */
   readonly suggestedErasuresByShard?: readonly number[];
   /** Shards whose original hints exceeded their Reed-Solomon parity budget. */

@@ -85,6 +85,21 @@ cell is uncertain, the complete byte is an RS erasure. A shard is correctable
 only when `2 * unknownErrors + erasures <= paritySymbols`. Any uncorrectable
 shard or failed CRC rejects the complete visual frame.
 
+The reference receiver retains a deterministic uncertainty severity for every
+candidate erasure. For every cell it computes
+`max(bestDeltaE / max(effectiveMaximumDeltaE, epsilon), effectiveMinimumDeltaEGap / max(deltaEGap, epsilon))`;
+the byte score is the maximum of its four cells and is retained only when that
+byte is already an erasure. This unbounded score is a ranking heuristic, not a
+probability. The receiver ranks candidates independently in each RS shard and
+tries bounded prefixes at 100%, 75%, 50% and 0% of that shard's parity budget.
+Those caps are `32/24/16/0` for ROBUST and `16/12/8/0` for EXPERIMENTAL.
+The 0% attempt is the hard-decision fallback. Duplicate candidate sets are
+skipped, so a frame performs at most four unwrap attempts. A non-empty attempt
+is accepted only after RS, CRC32C, outer/inner validation, identity validation
+and agreement between the authenticated sequence and the physical phase. This
+ranked retry ladder is receiver policy; it does not change the wire format or
+the Reed-Solomon correction bound.
+
 ## Palettes
 
 Stable palette 0:
@@ -356,8 +371,9 @@ A canonical-warp replay may pin bootstrap, timing, phase, classification and RS
 behavior independently of acquisition, OpenCV detection and homography. The
 `capture-000017` canonical fixture deliberately proves both contracts: a direct
 core unwrap with all 195 classifier erasures remains `fec-uncorrectable`, while
-the bounded receiver policy selects 55 FEC-feasible erasures and reaches valid
-RS, CRC32C and wire validation. Its recovered inner hash is a CRC-derived
+the ranked receiver policy accepts its 100% rung with 183 erasures distributed
+`[26, 32, 29, 32, 32, 32]` and reaches valid RS, CRC32C and wire validation.
+Its recovered inner hash is a CRC-derived
 regression oracle, not independent transmitter ground truth or evidence of a
 successful physical end-to-end transfer.
 

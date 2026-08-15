@@ -8,11 +8,14 @@ import { PNG } from "pngjs";
 import {
   decodeCanonicalColor4Raster,
   shardPosition,
+  unwrapColor4Frame,
   type CanonicalRasterObservation,
+  type Color4Profile,
 } from "../shared/color4/index.ts";
 import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
 import {
   runColor4ErasurePolicy,
+  type Color4ErasureBudgetFraction,
   type Color4ErasurePolicy,
 } from "../receive/color4-erasure-policy.ts";
 import {
@@ -48,6 +51,14 @@ interface ErasureDistributionOracle {
   readonly byShard: readonly number[];
 }
 
+interface ClassifierDistributionOracle {
+  readonly count: number;
+  readonly min: number;
+  readonly p50: number;
+  readonly p95: number;
+  readonly max: number;
+}
+
 interface PhysicalCaptureConfiguration {
   readonly carrier: "COLOR_4";
   readonly expectedProfile: ProfileName;
@@ -72,6 +83,7 @@ type ClassifierOracle =
       readonly sequencePhase: 0 | 1 | 2 | 3;
       readonly uncertainCells: number;
       readonly candidateErasures: ErasureDistributionOracle;
+      readonly erasureCandidateScore: ClassifierDistributionOracle;
       readonly codedBytesSha256: string;
     }
   | { readonly status: "rejected"; readonly reason: string };
@@ -82,6 +94,8 @@ type UnwrapOracle =
       readonly sessionId: number;
       readonly sequence: number;
       readonly selectedPolicy: Color4ErasurePolicy;
+      readonly selectedBudgetFraction: Color4ErasureBudgetFraction;
+      readonly selectedMaxErasuresPerShard: number;
       readonly attempts: number;
       readonly selectedErasures: ErasureDistributionOracle;
       readonly correctedErrors: number;
@@ -229,6 +243,26 @@ function parseErasureDistribution(
   return { total, byShard };
 }
 
+function parseClassifierDistribution(
+  value: unknown,
+  label: string,
+): ClassifierDistributionOracle {
+  const parsed = record(value, label);
+  assertKeys(parsed, ["count", "min", "p50", "p95", "max"], [], label);
+  const distribution = {
+    count: integerValue(parsed.count, `${label}.count`, 0, 65_535),
+    min: numberValue(parsed.min, `${label}.min`),
+    p50: numberValue(parsed.p50, `${label}.p50`),
+    p95: numberValue(parsed.p95, `${label}.p95`),
+    max: numberValue(parsed.max, `${label}.max`),
+  };
+  assert.ok(distribution.min >= 0, `${label}.min must be non-negative`);
+  assert.ok(distribution.min <= distribution.p50, `${label}.min must be <= p50`);
+  assert.ok(distribution.p50 <= distribution.p95, `${label}.p50 must be <= p95`);
+  assert.ok(distribution.p95 <= distribution.max, `${label}.p95 must be <= max`);
+  return distribution;
+}
+
 function parseCaptureSettings(value: unknown, label: string): CaptureSettings {
   const parsed = record(value, label);
   assertKeys(parsed, ["width", "height", "frameRate"], [], label);
@@ -291,6 +325,7 @@ function parseClassifierOracle(value: unknown, label: string): ClassifierOracle 
       "sequencePhase",
       "uncertainCells",
       "candidateErasures",
+      "erasureCandidateScore",
       "codedBytesSha256",
     ],
     [],
@@ -305,6 +340,10 @@ function parseClassifierOracle(value: unknown, label: string): ClassifierOracle 
     candidateErasures: parseErasureDistribution(
       parsed.candidateErasures,
       `${label}.candidateErasures`,
+    ),
+    erasureCandidateScore: parseClassifierDistribution(
+      parsed.erasureCandidateScore,
+      `${label}.erasureCandidateScore`,
     ),
     codedBytesSha256: sha256Value(parsed.codedBytesSha256, `${label}.codedBytesSha256`),
   };
@@ -324,6 +363,8 @@ function parseUnwrapOracle(value: unknown, label: string): UnwrapOracle {
       "sessionId",
       "sequence",
       "selectedPolicy",
+      "selectedBudgetFraction",
+      "selectedMaxErasuresPerShard",
       "attempts",
       "selectedErasures",
       "correctedErrors",
@@ -343,7 +384,18 @@ function parseUnwrapOracle(value: unknown, label: string): UnwrapOracle {
       ["classifier-budgeted", "hard-decision"],
       `${label}.selectedPolicy`,
     ),
-    attempts: integerValue(parsed.attempts, `${label}.attempts`, 1, 2),
+    selectedBudgetFraction: choice(
+      parsed.selectedBudgetFraction,
+      [0, 0.5, 0.75, 1],
+      `${label}.selectedBudgetFraction`,
+    ),
+    selectedMaxErasuresPerShard: integerValue(
+      parsed.selectedMaxErasuresPerShard,
+      `${label}.selectedMaxErasuresPerShard`,
+      0,
+      32,
+    ),
+    attempts: integerValue(parsed.attempts, `${label}.attempts`, 1, 4),
     selectedErasures: parseErasureDistribution(
       parsed.selectedErasures,
       `${label}.selectedErasures`,
@@ -603,6 +655,17 @@ function erasureDistribution(
   return { total: erasures.length, byShard };
 }
 
+function legacySaturatedShardErasures(
+  byteErasures: ArrayLike<number>,
+  profile: Color4Profile,
+): Uint16Array {
+  const counts = erasureDistribution(byteErasures, profile.shards).byShard;
+  const parity = profile.rsN - profile.rsK;
+  return Uint16Array.from(Array.from(byteErasures).filter((index) =>
+    counts[shardPosition(index, profile.shards).shard]! <= parity
+  ));
+}
+
 function classifierRejectionStage(reason: string): RejectionStage {
   if (reason === "invalid_geometry" || reason === "invalid_dimensions") return "geometry";
   if (reason === "calibration_failed") return "calibration";
@@ -666,7 +729,7 @@ async function replayFixture(
   context: TestContext,
   cv: OpenCvRuntime,
   fixtureName: string,
-): Promise<void> {
+): Promise<boolean> {
   const directory = join(FIXTURE_ROOT, fixtureName);
   const [pngBytes, metadataBytes] = await Promise.all([
     readFile(join(directory, "raw-frame.png")),
@@ -726,7 +789,7 @@ async function replayFixture(
       internalReason: normalized.reason,
       diagnosticReason: canonicalDiagnosticReason(normalized.reason, undefined) ?? null,
     });
-    return;
+    return false;
   }
   assert.equal(metadata.oracle.vision.status, "valid");
 
@@ -753,7 +816,7 @@ async function replayFixture(
         rejectedStage,
       ) ?? null,
     });
-    return;
+    return false;
   }
   assert.equal(classifierOracle.status, "valid");
   assert.equal(classified.profile.name, metadata.configuration.expectedProfile, `${fixtureName}: profile differs from configuration`);
@@ -771,6 +834,11 @@ async function replayFixture(
     classifierOracle.candidateErasures,
     `${fixtureName}: classifier candidate erasures changed`,
   );
+  assert.deepEqual(
+    classified.diagnostics.erasureCandidateScore,
+    classifierOracle.erasureCandidateScore,
+    `${fixtureName}: classifier erasure severity distribution changed`,
+  );
   assert.equal(
     classifierOracle.candidateErasures.byShard.length,
     classified.profile.shards,
@@ -786,7 +854,8 @@ async function replayFixture(
     codedBytes: classified.codedBytes,
     profile: classified.profile,
     paletteId: classified.paletteId,
-    erasures: classified.byteErasures,
+    erasureCandidates: classified.byteErasureCandidates,
+    expectedSequencePhase: classified.sequencePhase,
   });
   const unwrapped = coordinated.result;
   const unwrapObservations = coordinated.selectedObservations;
@@ -815,13 +884,23 @@ async function replayFixture(
       internalReason: unwrapped.reason,
       diagnosticReason,
     });
-    return;
+    return false;
   }
   assert.equal(unwrapOracle.status, "valid");
   assert.equal(
     coordinated.selectedPolicy,
     unwrapOracle.selectedPolicy,
     `${fixtureName}: selected erasure policy changed`,
+  );
+  assert.equal(
+    coordinated.selectedBudgetFraction,
+    unwrapOracle.selectedBudgetFraction,
+    `${fixtureName}: selected erasure budget fraction changed`,
+  );
+  assert.equal(
+    coordinated.selectedMaxErasuresPerShard,
+    unwrapOracle.selectedMaxErasuresPerShard,
+    `${fixtureName}: selected per-shard erasure budget changed`,
   );
   assert.equal(
     coordinated.attempts.length,
@@ -878,9 +957,28 @@ async function replayFixture(
     unwrapOracle.innerFrameSha256,
     `${fixtureName}: unwrapped inner frame changed`,
   );
+  const isIndependentFullFrame =
+    metadata.oracle.basis.kind === "independent-tx-ground-truth" &&
+    metadata.rawFrame.scope === "full-camera-frame";
+  let differentiatesLegacyPolicy = false;
+  if (isIndependentFullFrame) {
+    const legacyAttempts = [
+      legacySaturatedShardErasures(classified.byteErasures, classified.profile),
+      new Uint16Array(),
+    ].map((erasures) => unwrapColor4Frame(classified.codedBytes, {
+      profileId: classified.profile.id,
+      paletteId: classified.paletteId,
+      erasures,
+    }));
+    differentiatesLegacyPolicy = legacyAttempts.every((attempt) =>
+      attempt.status === "rejected" ||
+      !color4SequencePhaseMatches(attempt.header.sequence, classified.sequencePhase)
+    );
+  }
   context.diagnostic(
-    `${fixtureName}: ${png.width}x${png.height}, ${classified.profile.name}/${metadata.configuration.palette}, oracle=${metadata.oracle.basis.kind}`,
+    `${fixtureName}: ${png.width}x${png.height}, ${classified.profile.name}/${metadata.configuration.palette}, oracle=${metadata.oracle.basis.kind}, differentiatesLegacy=${differentiatesLegacyPolicy}`,
   );
+  return isIndependentFullFrame && differentiatesLegacyPolicy;
 }
 
 test("real COLOR_4 camera captures replay through OpenCV and the carrier", {
@@ -922,9 +1020,20 @@ test("real COLOR_4 camera captures replay through OpenCV and the carrier", {
 
   installImageData();
   const cv = await loadOpenCv();
+  let differentiatingIndependentFixtures = 0;
   for (const fixtureName of fixtureDirectories) {
     await context.test(fixtureName, async (fixtureContext) => {
-      await replayFixture(fixtureContext, cv, fixtureName);
+      if (await replayFixture(fixtureContext, cv, fixtureName)) {
+        differentiatingIndependentFixtures++;
+      }
     });
+  }
+  if (REQUIRE_INDEPENDENT_PHYSICAL_FIXTURE) {
+    assert.ok(
+      differentiatingIndependentFixtures > 0,
+      "Release acceptance requires an independent full-camera fixture where both " +
+        "legacy erasure selection and hard decision reject, while ranked erasures " +
+        "recover the exact inner frame.",
+    );
   }
 });

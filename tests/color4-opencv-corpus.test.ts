@@ -15,6 +15,8 @@ import {
   type VisionHomographyMethod,
   type VisionWarpInterpolation,
 } from "../receive/color4-vision.ts";
+import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
+import { runColor4ErasurePolicy } from "../receive/color4-erasure-policy.ts";
 
 interface Point {
   readonly x: number;
@@ -513,16 +515,43 @@ function evaluateCamera(
       ...(residualRmsModules === undefined ? {} : { residualRmsModules }),
     };
   }
-  const unwrapped = unwrapColor4Frame(raster.codedBytes, {
+  const direct = unwrapColor4Frame(raster.codedBytes, {
     profileId: raster.profile.id,
     paletteId: raster.paletteId,
     erasures: raster.byteErasures,
   });
+  if (direct.status === "valid") {
+    assert.deepEqual(
+      direct.innerFrame,
+      expected,
+      `${scenario}: a direct all-erasure unwrap must be byte exact`,
+    );
+  }
+  const coordinated = runColor4ErasurePolicy({
+    codedBytes: raster.codedBytes,
+    profile: raster.profile,
+    paletteId: raster.paletteId,
+    erasureCandidates: raster.byteErasureCandidates,
+    expectedSequencePhase: raster.sequencePhase,
+  });
+  const unwrapped = coordinated.result;
   if (unwrapped.status === "rejected") {
     return {
       scenario,
       status: "rejected",
       reason: `fec:${unwrapped.reason}`,
+      totalMs: performance.now() - started,
+      erasureBytes,
+      fiducialErrorMax,
+      homographyMethod,
+      ...(residualRmsModules === undefined ? {} : { residualRmsModules }),
+    };
+  }
+  if (!color4SequencePhaseMatches(unwrapped.header.sequence, raster.sequencePhase)) {
+    return {
+      scenario,
+      status: "rejected",
+      reason: "fec:sequence-phase-mismatch",
       totalMs: performance.now() - started,
       erasureBytes,
       fiducialErrorMax,

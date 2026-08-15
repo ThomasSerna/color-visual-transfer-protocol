@@ -60,6 +60,13 @@ not independent proof that the intended transmitter payload was recovered.
 Release acceptance still requires a controlled capture with independent
 transmitter bytes and inner-frame SHA-256 verification.
 
+Capture the differentiating fixture from the hosted HTTPS/PWA build with
+ROBUST, KCMY, 5 fps, fullscreen sender, maximum display brightness, requested
+camera width 1280 at 30 fps, detection limit 1280, canonical scale 6,
+`prefilter=observe`, 0.5 m and 0 degrees. Record the inner bytes, session,
+sequence and SHA-256 at the transmitter before the frame is displayed; camera
+`actual` settings remain authoritative when negotiation differs.
+
 Metadata template for a successful oracle. The descriptive hash placeholders
 below deliberately make it invalid until they are replaced with hashes measured
 from the physical capture and its decoded outputs:
@@ -75,16 +82,16 @@ from the physical capture and its decoded outputs:
     "browser": "browser and version"
   },
   "rawFrame": {
-    "width": 1920,
-    "height": 1440,
+    "width": 1280,
+    "height": 720,
     "pngSha256": "64 lowercase hexadecimal characters",
     "rgbaSha256": "64 lowercase hexadecimal characters",
     "preparation": "unaltered-export",
     "scope": "full-camera-frame"
   },
   "camera": {
-    "requested": { "width": 1920, "height": 1440, "frameRate": 30 },
-    "actual": { "width": 1920, "height": 1440, "frameRate": 30 },
+    "requested": { "width": 1280, "height": 720, "frameRate": 30 },
+    "actual": { "width": 1280, "height": 720, "frameRate": 30 },
     "distanceM": 0.5,
     "angleDeg": 0
   },
@@ -115,6 +122,13 @@ from the physical capture and its decoded outputs:
         "total": 0,
         "byShard": [0, 0, 0, 0, 0, 0]
       },
+      "erasureCandidateScore": {
+        "count": 0,
+        "min": 0,
+        "p50": 0,
+        "p95": 0,
+        "max": 0
+      },
       "codedBytesSha256": "64 lowercase hexadecimal characters"
     },
     "unwrap": {
@@ -122,6 +136,8 @@ from the physical capture and its decoded outputs:
       "sessionId": 0,
       "sequence": 0,
       "selectedPolicy": "classifier-budgeted",
+      "selectedBudgetFraction": 1,
+      "selectedMaxErasuresPerShard": 32,
       "attempts": 1,
       "selectedErasures": {
         "total": 0,
@@ -169,7 +185,10 @@ CVTP_REQUIRE_PHYSICAL_FIXTURES=1 npm run test:color4
 
 Release acceptance is stricter. It requires at least one unaltered
 `full-camera-frame` fixture with a valid unwrap whose `oracle.basis.kind` is
-`independent-tx-ground-truth`; the current
+`independent-tx-ground-truth`. That fixture must also distinguish the fix: both
+the legacy saturated-shard selection and its hard-decision fallback must reject,
+while the ranked policy recovers the exact independently recorded inner frame.
+The current
 `capture-000017` CRC-derived regression intentionally does not satisfy this
 gate:
 
