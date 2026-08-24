@@ -82,6 +82,13 @@ export interface SyntheticCameraOptions {
   readonly blurKernel?: 3 | 5 | 7;
   /** Horizontal tilt in degrees, applied as a symmetric trapezoid. */
   readonly angleDeg?: number;
+  /**
+   * Compress the raster into the measured corner-dependent black/white envelope
+   * of a real capture. Without it a synthetic frame carries a 0-255 span and
+   * roughly 250 luma of fiducial contrast, where physical exports report 40-115:
+   * every contrast-sensitive gate passes for reasons no camera reproduces.
+   */
+  readonly capturePhotometry?: boolean;
 }
 
 export interface SyntheticCameraFrame {
@@ -114,6 +121,63 @@ export function syntheticInnerFrame(profile: Color4Profile, sequence: number): U
     },
     block,
   );
+}
+
+/**
+ * The corner-dependent display channel measured from a real capture, shared with
+ * the OpenCV corpus so both suites degrade a frame the same way.
+ */
+const SPATIAL_ANCHOR_NEAR = 11;
+const SPATIAL_ANCHOR_FAR = 148;
+const CAPTURE_EQUIVALENT_ANCHORS = Object.freeze({
+  TL: Object.freeze({ black: 85.63, white: 179.59 }),
+  TR: Object.freeze({ black: 125.65, white: 206.97 }),
+  BR: Object.freeze({ black: 91.69, white: 174.03 }),
+  BL: Object.freeze({ black: 89.96, white: 176.38 }),
+});
+
+function interpolate(left: number, right: number, weight: number): number {
+  return left + (right - left) * weight;
+}
+
+function clampByte(value: number): number {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function applyCapturePhotometry(
+  pixels: Uint8ClampedArray<ArrayBuffer>,
+  width: number,
+  height: number,
+  moduleScale: number,
+  quietModules: number,
+): Uint8ClampedArray<ArrayBuffer> {
+  const span = SPATIAL_ANCHOR_FAR - SPATIAL_ANCHOR_NEAR;
+  const output = Uint8ClampedArray.from(pixels);
+  for (let y = 0; y < height; y++) {
+    const activeY = Math.floor(y / moduleScale) - quietModules;
+    const v = Math.max(0, Math.min(1, (activeY - SPATIAL_ANCHOR_NEAR) / span));
+    for (let x = 0; x < width; x++) {
+      const activeX = Math.floor(x / moduleScale) - quietModules;
+      const u = Math.max(0, Math.min(1, (activeX - SPATIAL_ANCHOR_NEAR) / span));
+      const black = interpolate(
+        interpolate(CAPTURE_EQUIVALENT_ANCHORS.TL.black, CAPTURE_EQUIVALENT_ANCHORS.TR.black, u),
+        interpolate(CAPTURE_EQUIVALENT_ANCHORS.BL.black, CAPTURE_EQUIVALENT_ANCHORS.BR.black, u),
+        v,
+      );
+      const white = interpolate(
+        interpolate(CAPTURE_EQUIVALENT_ANCHORS.TL.white, CAPTURE_EQUIVALENT_ANCHORS.TR.white, u),
+        interpolate(CAPTURE_EQUIVALENT_ANCHORS.BL.white, CAPTURE_EQUIVALENT_ANCHORS.BR.white, u),
+        v,
+      );
+      const range = white - black;
+      const offset = (y * width + x) * 4;
+      output[offset] = clampByte(black + (pixels[offset]! / 255) * range);
+      output[offset + 1] = clampByte(black + (pixels[offset + 1]! / 255) * range);
+      output[offset + 2] = clampByte(black + (pixels[offset + 2]! / 255) * range);
+      output[offset + 3] = 255;
+    }
+  }
+  return output;
 }
 
 function destinationQuad(
@@ -169,8 +233,17 @@ export function renderSyntheticCameraFrame(
   }
   const quad = destinationQuad(width / 2, height / 2, span, options.angleDeg ?? 0);
 
+  const rasterPixels = options.capturePhotometry === true
+    ? applyCapturePhotometry(
+        raster.pixels,
+        raster.width,
+        raster.height,
+        raster.moduleScale,
+        raster.layout.quietModules,
+      )
+    : Uint8ClampedArray.from(raster.pixels);
   const source = cv.matFromImageData(
-    new ImageData(Uint8ClampedArray.from(raster.pixels), raster.width, raster.height),
+    new ImageData(rasterPixels, raster.width, raster.height),
   );
   const sourcePoints = cv.matFromArray(4, 1, cv.CV_32FC2, [
     0, 0,

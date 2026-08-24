@@ -14,6 +14,7 @@ import type {
   Color4WorkerDebugFrame,
   Color4WorkerDebugOptions,
   Color4WorkerDiagnostics,
+  Color4WorkerFrameSource,
   Color4WorkerResponse,
 } from "./color4-worker-protocol";
 
@@ -52,6 +53,23 @@ const defaultDebug: Color4WorkerDebugOptions = Object.freeze({
   emitPlane: false,
   snapshot: false,
 });
+
+function frameSource(
+  source: CapturedFrame["source"],
+): { source: Color4WorkerFrameSource; transfer: Transferable[] } {
+  if (!(source instanceof ImageData)) {
+    return { source: { kind: "bitmap", bitmap: source }, transfer: [source] };
+  }
+  // captureFrame creates a fresh ImageData and never reuses it. Transfer its
+  // backing store directly so a 1920×1440 capture does not incur another
+  // full-frame copy before OpenCV.
+  const data = source.data;
+  const rgba: Uint8ClampedArray<ArrayBuffer> = data.buffer instanceof ArrayBuffer &&
+      data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+    ? new Uint8ClampedArray(data.buffer)
+    : Uint8ClampedArray.from(data);
+  return { source: { kind: "rgba", rgba: rgba.buffer }, transfer: [rgba.buffer] };
+}
 
 export class Color4CameraDecoder implements VisualDecoder {
   readonly carrier = "COLOR_4" as const;
@@ -116,20 +134,13 @@ export class Color4CameraDecoder implements VisualDecoder {
   ): Promise<BrowserDecodeResult> {
     if (this.disposed) throw new Error("COLOR_4 decoder is disposed.");
     await this.ready;
-    if (this.disposed) throw new Error("COLOR_4 decoder is disposed.");
-    if (this.pending) throw new Error("COLOR_4 decoder accepts one frame at a time.");
-    if (!(frame.source instanceof ImageData)) {
-      throw new Error("COLOR_4 camera decoder requires ImageData.");
+    if (this.disposed) {
+      if (frame.source instanceof ImageData === false) frame.source.close();
+      throw new Error("COLOR_4 decoder is disposed.");
     }
+    if (this.pending) throw new Error("COLOR_4 decoder accepts one frame at a time.");
     const id = this.nextId++;
-    // captureFrame creates a fresh ImageData and never reuses it. Transfer its
-    // backing store directly so a 1920×1440 capture does not incur another
-    // full-frame copy before OpenCV.
-    const source = frame.source.data;
-    const rgba: Uint8ClampedArray<ArrayBuffer> = source.buffer instanceof ArrayBuffer &&
-        source.byteOffset === 0 && source.byteLength === source.buffer.byteLength
-      ? new Uint8ClampedArray(source.buffer)
-      : Uint8ClampedArray.from(source);
+    const { source, transfer } = frameSource(frame.source);
     return new Promise((resolve, reject) => {
       this.pending = { id, startedAt: performance.now(), resolve, reject };
       this.worker.postMessage(
@@ -138,13 +149,13 @@ export class Color4CameraDecoder implements VisualDecoder {
           id,
           width: frame.source.width,
           height: frame.source.height,
-          rgba: rgba.buffer,
+          source,
           paletteId: this.paletteId,
           capturedAt: frame.timestamp,
           captureMs: Math.max(0, options.captureMs ?? 0),
           debug: options.debug ?? defaultDebug,
         },
-        [rgba.buffer],
+        transfer,
       );
     });
   }

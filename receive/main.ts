@@ -160,6 +160,19 @@ let receiveSettingsQueue: Promise<void> = Promise.resolve();
 let captureStability: CaptureStabilityTracker | null = null;
 let stableIntervalEpoch = 0;
 let lastSubmittedStableIntervalEpoch: number | undefined;
+/**
+ * Whether COLOR_4 captures can skip the main thread's pixel readback.
+ *
+ * Probed here rather than imported from the carrier: a value import would pull
+ * the COLOR_4 module — and its worker URL — into the deliberately QR-only
+ * standalone bundle. `OffscreenCanvas` is the limiting global, because the
+ * worker needs it to turn a transferred bitmap back into pixels; it arrived
+ * later than `createImageBitmap` on WebKit, so both are probed. Cleared for the
+ * session if this engine ever refuses a video bitmap at runtime.
+ */
+let useBitmapCapture = __COLOR4_ENABLED__ &&
+  typeof createImageBitmap === "function" &&
+  typeof OffscreenCanvas !== "undefined";
 
 const COLOR4_STABILITY_THRESHOLD = 0.025;
 
@@ -814,6 +827,84 @@ function measureColor4Stability(): CaptureStabilityResult {
   return captureStability!.observe(fingerprint);
 }
 
+/**
+ * Hand one COLOR_4 capture to the vision worker and route its result.
+ *
+ * Shared by both capture paths: the ImageBitmap path resolves asynchronously
+ * before it can call this, the canvas path calls it inline. `qualityRecorded`
+ * arrives by value because each capture owns its own accounting.
+ */
+function submitColor4Frame(
+  frame: { source: ImageData | ImageBitmap; timestamp: number },
+  captureMs: number,
+  capturedAt: number,
+  decoderGeneration: number,
+  stability: CaptureStabilityResult | undefined,
+  alreadyRecordedQuality: boolean,
+): void {
+  if (!colorDecoder) return;
+  let qualityRecorded = alreadyRecordedQuality;
+  // Claim the stable interval when the frame is dispatched, not when its
+  // asynchronous result arrives. A rejection still consumes the interval;
+  // an explicitly armed snapshot remains the sole dedupe bypass so it can
+  // capture the next frame. Transitions increment the epoch before another
+  // submission, so an older callback cannot consume the new interval.
+  if (captureStability?.mode === "enabled" && stability?.state === "stable") {
+    lastSubmittedStableIntervalEpoch = stableIntervalEpoch;
+  }
+  // Count the submission before snapshot metadata is frozen so the capture's
+  // experiment view is coherent with the frame being handed to the worker.
+  experiment?.recordVisionSubmission();
+  const debugOptions = visionDebugController?.decodeOptions(capturedAt);
+  void colorDecoder.decode(
+    frame,
+    { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
+  ).then(
+    (decoded) => {
+      if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
+      decodeTimes.push(performance.now());
+      const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
+      latestCarrierDiagnostics = diagnostics;
+      if (!qualityRecorded) {
+        experiment?.recordQualityClass(
+          classifyColor4CaptureQuality(stability?.state, diagnostics.vision),
+        );
+        qualityRecorded = true;
+      }
+      // The same measurements that feed the experiment counters are the only
+      // evidence the user has for why nothing is decoding, so keep a rolling
+      // verdict ready for the hint.
+      framingAdvice.observe({ stability: stability?.state, vision: diagnostics.vision });
+      if (decoded.debug && visionDebugController) {
+        visionDebugController.handleFrame({
+          ...decoded.debug,
+          diagnostics: {
+            carrier: diagnostics,
+            classifier: decoded.debug.classifier,
+            unwrap: decoded.debug.unwrap,
+          },
+        });
+      }
+      experiment?.setProfile(diagnostics.profile);
+      experiment?.recordAttempt(decoded.status, diagnostics);
+      if (decoded.status === "valid") {
+        onDecoded(decoded.innerFrame);
+      }
+    },
+    (error) => {
+      if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
+      decodeTimes.push(performance.now());
+      if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
+      visionDebugController?.failSnapshot("Snapshot failed because the vision worker stopped.");
+      experiment?.recordAttempt("rejected", { stage: "wire" });
+      const failureReason =
+        error instanceof Error ? error.message : "The COLOR_4 vision worker stopped.";
+      persistExperiment(false, failureReason);
+      cancelActiveReceiver(failureReason);
+    },
+  );
+}
+
 function captureFrame() {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
@@ -870,74 +961,67 @@ function captureFrame() {
       return; // all QR workers busy — drop it, no harm done
     }
   }
+  const captureStarted = performance.now();
+  // COLOR_4 hands the worker an ImageBitmap where the engine supports it: the
+  // drawImage/getImageData pair below costs about 90 ms of main-thread time on
+  // the 1440×1920 mode the physical exports use, and blocking the page for that
+  // long every frame is most of why the receiver could not keep up with its own
+  // camera. createImageBitmap costs about 1 ms and the worker reads the pixels
+  // back for about 5 ms. The canvas path stays for engines without
+  // OffscreenCanvas.
+  if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder && useBitmapCapture) {
+    const decoderGeneration = captureGen;
+    void createImageBitmap(video).then(
+      (bitmap) => {
+        if (done || decoderGeneration !== captureGen || activeCarrier !== "color4" || !colorDecoder) {
+          bitmap.close();
+          return;
+        }
+        // The busy check in captureFrame happened before this await, so another
+        // callback may have claimed the worker in between. Re-check rather than
+        // letting decode() reject and tear the receiver down.
+        if (colorDecoder.busy) {
+          bitmap.close();
+          experiment?.recordSkippedWhileBusy();
+          if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
+          return;
+        }
+        const capturedAt = performance.now();
+        submitColor4Frame(
+          { source: bitmap, timestamp: capturedAt },
+          Math.max(0, capturedAt - captureStarted),
+          capturedAt,
+          decoderGeneration,
+          stability,
+          qualityRecorded,
+        );
+      },
+      () => {
+        // A single refused bitmap is not evidence the engine lacks the API, but
+        // repeated failures would stall the receiver silently. Fall back for the
+        // rest of the session and let the next callback use the canvas.
+        useBitmapCapture = false;
+      },
+    );
+    return;
+  }
   if (grab.width !== vw || grab.height !== vh) {
     grab.width = vw;
     grab.height = vh;
   }
-  const captureStarted = performance.now();
   const ctx = grab.getContext("2d", { willReadFrequently: true })!;
   ctx.drawImage(video, 0, 0);
   const img = ctx.getImageData(0, 0, vw, vh);
   const capturedAt = performance.now();
   const captureMs = Math.max(0, capturedAt - captureStarted);
   if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder) {
-    const decoderGeneration = captureGen;
-    // Claim the stable interval when the frame is dispatched, not when its
-    // asynchronous result arrives. A rejection still consumes the interval;
-    // an explicitly armed snapshot remains the sole dedupe bypass so it can
-    // capture the next frame. Transitions increment the epoch before another
-    // submission, so an older callback cannot consume the new interval.
-    if (captureStability?.mode === "enabled" && stability?.state === "stable") {
-      lastSubmittedStableIntervalEpoch = stableIntervalEpoch;
-    }
-    // Count the submission before snapshot metadata is frozen so the capture's
-    // experiment view is coherent with the frame being handed to the worker.
-    experiment?.recordVisionSubmission();
-    const debugOptions = visionDebugController?.decodeOptions(capturedAt);
-    void colorDecoder.decode(
+    submitColor4Frame(
       { source: img, timestamp: capturedAt },
-      { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
-    ).then(
-      (decoded) => {
-        if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
-        decodeTimes.push(performance.now());
-        const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
-        latestCarrierDiagnostics = diagnostics;
-        if (!qualityRecorded) {
-          experiment?.recordQualityClass(classifyColor4CaptureQuality(stability?.state, diagnostics.vision));
-          qualityRecorded = true;
-        }
-        // The same measurements that feed the experiment counters are the only
-        // evidence the user has for why nothing is decoding, so keep a rolling
-        // verdict ready for the hint.
-        framingAdvice.observe({ stability: stability?.state, vision: diagnostics.vision });
-        if (decoded.debug && visionDebugController) {
-          visionDebugController.handleFrame({
-            ...decoded.debug,
-            diagnostics: {
-              carrier: diagnostics,
-              classifier: decoded.debug.classifier,
-              unwrap: decoded.debug.unwrap,
-            },
-          });
-        }
-        experiment?.setProfile(diagnostics.profile);
-        experiment?.recordAttempt(decoded.status, diagnostics);
-        if (decoded.status === "valid") {
-          onDecoded(decoded.innerFrame);
-        }
-      },
-      (error) => {
-        if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
-        decodeTimes.push(performance.now());
-        if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
-        visionDebugController?.failSnapshot("Snapshot failed because the vision worker stopped.");
-        experiment?.recordAttempt("rejected", { stage: "wire" });
-        const failureReason =
-          error instanceof Error ? error.message : "The COLOR_4 vision worker stopped.";
-        persistExperiment(false, failureReason);
-        cancelActiveReceiver(failureReason);
-      },
+      captureMs,
+      capturedAt,
+      captureGen,
+      stability,
+      qualityRecorded,
     );
     return;
   }

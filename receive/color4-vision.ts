@@ -949,6 +949,18 @@ function thresholdForPass(
   );
 }
 
+/**
+ * Proposal search runs on the downscaled image, but marker identity is read
+ * from the full-resolution one.
+ *
+ * A 9-module fiducial that spans 41 source pixels shrinks to 27 at a 1920->1280
+ * detection scale: three pixels per marker module, where `INTER_AREA` has
+ * already blended the black border into the white ring. That downscale blur was
+ * the single most common rejection in the physical exports —
+ * `FIDUCIAL_LOW_CONTRAST` on 13 of 27 attempts, each one a frame where not a
+ * single marker decoded. Locating candidate quads does not need the resolution;
+ * telling a frozen 5x5 payload from its rotations does.
+ */
 function findMarkers(
   cv: OpenCvRuntime,
   gray: CvMat,
@@ -1072,18 +1084,27 @@ function findMarkers(
     counters.candidateCountRanked = ranked.length;
     if (ranked.length < merged.length) warningSet.add("CANDIDATE_BUDGET_RANKED");
     const markers = new Map<FiducialId, MarkerCandidate>();
+    let candidatesSinceComplete = 0;
     for (const proposal of ranked) {
       // Every candidate costs a perspective warp plus a marker decode, and the
       // ranking already puts genuine fiducials first. Once all four IDs have
       // decoded without a single bit error there is nothing better left to find,
-      // so scanning the remaining candidates is pure latency. Debug collection
-      // keeps the full sweep because its traces describe every candidate.
-      if (!collectDebug && allFiducialsDecodedCleanly(markers)) break;
+      // so scanning the remaining candidates is pure latency. When the set is
+      // complete but imperfect, keep looking for a better candidate — but only
+      // for a bounded stretch. Debug collection keeps the full sweep because its
+      // traces describe every candidate.
+      if (!collectDebug) {
+        if (allFiducialsDecodedCleanly(markers)) break;
+        if (markers.size === ORDERED_FIDUCIAL_IDS.length) {
+          if (candidatesSinceComplete >= MAXIMUM_CANDIDATES_AFTER_COMPLETE) break;
+          candidatesSinceComplete++;
+        }
+      }
       const detectionQuad = proposal.detectionQuad;
       const quad = sourceQuad(detectionQuad, scale);
       const center = projectiveQuadCenter(quad);
       const decodeStarted = now();
-      const decoded = decodeCandidate(cv, detection, detectionQuad);
+      const decoded = decodeCandidate(cv, gray, quad);
       timings.fiducialDecodeMs += elapsed(now, decodeStarted);
       const identity = decoded?.identity;
       const score: VisionCandidateScore | undefined = identity === undefined ? undefined : {
@@ -1428,6 +1449,20 @@ function allFiducialsDecodedCleanly(
 ): boolean {
   return ORDERED_FIDUCIAL_IDS.every((id) => markers.get(id)?.errors === 0);
 }
+
+/**
+ * Candidates still decoded after all four IDs are present but at least one
+ * carries a bit error.
+ *
+ * The bit-perfect exit above is the common case on a sharp capture, but the
+ * physical exports show fiducial errors averaging 0.8 to 2.2 in the regime this
+ * work targets — so on exactly the frames that are slow, it never fires and all
+ * 256 ranked candidates are warped and decoded. A better-scoring candidate for
+ * an already-decoded ID is still worth looking for, but it is overwhelmingly
+ * likely to be nearby in the ranking: the ranking exists to put genuine
+ * fiducials first. This bounds that search instead of abandoning it.
+ */
+const MAXIMUM_CANDIDATES_AFTER_COMPLETE = 32;
 
 interface HomographySolution {
   readonly method: Exclude<VisionHomographyMethod, "none">;
