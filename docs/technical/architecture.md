@@ -26,7 +26,7 @@ Three pages, one shared core, a handful of single-purpose build plugins. No fram
   only completed summaries and user preferences may enter IndexedDB.
 - `display.ts` — QR display-size fitting against the viewport.
 - `platform.ts` — `isIOS`/`isAndroid` sniffs and camera capability probing (torch, continuous focus, max fps). Policy: probe wherever probeable; sniff only for unprobeable behavior.
-- `worker-pool.ts` — decode worker pool; busy workers drop frames, the fountain absorbs it.
+- `worker-pool.ts` — QR decode worker pool; busy workers drop frames, the fountain absorbs it. COLOR_4 keeps its own pool in `receive/color4-carrier.ts`, because its workers exchange diagnostics and debug artifacts rather than bare bytes, and each carries a full OpenCV instance (so it defaults to one worker where QR defaults to two).
 - `no-signal.ts` — pure timing policy for the "Nothing happening?" hint (short first delay, longer after dismissal).
 - `progress.ts` — frames-collected progress estimation and fountain-overhead model.
 - `send-settings.ts` — canonical tx settings lists; the sender's dropdowns and the no-signal advice both render from it.

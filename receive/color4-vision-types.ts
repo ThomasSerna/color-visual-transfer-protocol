@@ -16,6 +16,17 @@ export type VisionThresholdPass = "adaptive-31-7" | "adaptive-21-5" | "otsu";
 export type VisionWarpInterpolation = "nearest" | "linear" | "cubic";
 export type VisionHomographyMethod = "none" | "corners-16" | "centers-4";
 
+/**
+ * A rectangle of the source frame, in source pixels, that the proposal search
+ * may restrict itself to.
+ */
+export interface VisionSearchRegion {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 export interface VisionOptions {
   /** Defaults to the normative sampling scale of six pixels per module. */
   readonly canonicalScale?: VisionCanonicalScale;
@@ -30,6 +41,19 @@ export interface VisionOptions {
   readonly debugView?: VisionDebugView;
   /** Injectable monotonic clock for deterministic instrumentation tests. */
   readonly now?: () => number;
+  /**
+   * Where this frame's code was last seen, in source pixels.
+   *
+   * Thresholding and contour extraction dominate cold acquisition, and both
+   * scale with the searched area rather than with anything about the code. Two
+   * devices held still see the frame in the same place every time, so a caller
+   * that already located it can hand that back and pay for a fraction of the
+   * pixels. The region is a hint, never a constraint: a search that does not
+   * find all four fiducials inside it falls back to the whole frame within the
+   * same call, and the effective detection scale is derived from the full frame
+   * either way so corner precision does not depend on the crop.
+   */
+  readonly searchRegion?: VisionSearchRegion;
 }
 
 export interface VisionPoint {
@@ -117,7 +141,11 @@ export interface VisionContourCounters {
 
 export type VisionWarning =
   | "CONTOUR_BUDGET_UNIFORMLY_SAMPLED"
-  | "CANDIDATE_BUDGET_RANKED";
+  | "CANDIDATE_BUDGET_RANKED"
+  /** A caller-supplied search region held: only the cropped area was searched. */
+  | "GEOMETRY_SEARCH_REGION_APPLIED"
+  /** A caller-supplied search region missed and the full frame was searched. */
+  | "GEOMETRY_SEARCH_REGION_MISSED";
 
 export interface VisionOpticalMetrics {
   /** Mean of the projected top/bottom frame edges. */
@@ -238,6 +266,8 @@ interface VisionResultBase {
 export interface ValidVisionResult extends VisionResultBase {
   readonly status: "valid";
   readonly image: CanonicalRasterImage;
+  /** Where the code was found, padded and clamped, for the next `searchRegion`. */
+  readonly frameRegion?: VisionSearchRegion;
 }
 
 export interface RejectedVisionResult extends VisionResultBase {

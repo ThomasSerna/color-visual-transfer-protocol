@@ -32,6 +32,7 @@ import type {
   VisionQuad,
   VisionRejectReason,
   VisionResult,
+  VisionSearchRegion,
   VisionStageTimings,
   VisionThresholdPass,
   VisionWarning,
@@ -60,6 +61,7 @@ export type {
   VisionQuad,
   VisionRejectReason,
   VisionResult,
+  VisionSearchRegion,
   VisionStageTimings,
   VisionThresholdPass,
   VisionWarning,
@@ -73,6 +75,8 @@ interface CvMat {
   data32S: Int32Array;
   data32F?: Float32Array;
   data64F?: Float64Array;
+  /** A view over a sub-rectangle. Absent in minimal test adapters. */
+  roi?(rect: unknown): CvMat;
   delete(): void;
 }
 
@@ -86,6 +90,8 @@ export interface OpenCvRuntime {
   Mat: new () => CvMat;
   MatVector: new () => CvMatVector;
   Size: new (width: number, height: number) => unknown;
+  /** Needed only by the search-region crop; its absence disables that path. */
+  Rect?: new (x: number, y: number, width: number, height: number) => unknown;
   Scalar: new (...values: number[]) => unknown;
   CV_32FC2: unknown;
   COLOR_RGBA2GRAY: number;
@@ -237,6 +243,8 @@ interface DetectionResult {
   traces: VisionCandidateTrace[];
   tracesTruncated: boolean;
   thresholdPlane?: VisionPlane;
+  /** False when a requested region could not be honoured by this OpenCV build. */
+  regionApplied: boolean;
 }
 
 interface MutableHomographyDiagnostics {
@@ -331,9 +339,10 @@ function orderQuad(points: Point[]): VisionQuad {
 }
 
 function pointsFromContour(contour: CvMat): VisionQuad {
+  const values = contour.data32S;
   const points: Point[] = [];
   for (let row = 0; row < contour.rows; row++) {
-    points.push({ x: contour.data32S[row * 2]!, y: contour.data32S[row * 2 + 1]! });
+    points.push({ x: values[row * 2]!, y: values[row * 2 + 1]! });
   }
   return orderQuad(points);
 }
@@ -387,18 +396,30 @@ function medianNumber(values: readonly number[]): number {
     : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
-/** Sample one 9x9 marker and retain its local black/white separation. */
+/**
+ * Sample one 9x9 marker and retain its local black/white separation.
+ *
+ * `mat.data` is an OpenCV.js *getter* that builds a fresh typed-array view over
+ * the WASM heap on every read, so the pixel view and the row stride are hoisted
+ * once. Measured on a 1032-wide canonical mat, a scan that re-read `.data` per
+ * pixel ran 46x slower than the same scan over a hoisted view. Every pixel loop
+ * in this module follows that rule.
+ */
 function sampleMarker(warped: CvMat, offsetX: number, offsetY: number): MarkerSample {
+  const pixels = warped.data;
+  const stride = warped.cols;
   const luminances = new Array<number>(81);
   const darkAnchors: number[] = [];
   const lightAnchors: number[] = [];
+  const samples = new Array<number>(36);
   for (let moduleY = 0; moduleY < 9; moduleY++) {
     for (let moduleX = 0; moduleX < 9; moduleX++) {
-      const samples: number[] = [];
       const startX = moduleX * 10 + 2 + offsetX;
       const startY = moduleY * 10 + 2 + offsetY;
+      let count = 0;
       for (let y = startY; y < startY + 6; y++) {
-        for (let x = startX; x < startX + 6; x++) samples.push(warped.data[y * warped.cols + x]!);
+        const row = y * stride;
+        for (let x = startX; x < startX + 6; x++) samples[count++] = pixels[row + x]!;
       }
       const value = medianNumber(samples);
       luminances[moduleY * 9 + moduleX] = value;
@@ -465,17 +486,23 @@ export function analyzeFiducialModules(modules: Uint8Array): FiducialAnalysis {
 }
 
 function fiducialWarpQuality(warped: CvMat): Readonly<{ blurMetric: number }> {
+  const pixels = warped.data;
+  const stride = warped.cols;
+  const rows = warped.rows;
   let laplacianCount = 0;
   let laplacianTotal = 0;
   let laplacianSquaredTotal = 0;
-  for (let y = 1; y < warped.rows - 1; y++) {
-    for (let x = 1; x < warped.cols - 1; x++) {
-      const center = warped.data[y * warped.cols + x]!;
+  for (let y = 1; y < rows - 1; y++) {
+    const row = y * stride;
+    const above = row - stride;
+    const below = row + stride;
+    for (let x = 1; x < stride - 1; x++) {
+      const center = pixels[row + x]!;
       const value = center * 4 -
-        warped.data[(y - 1) * warped.cols + x]! -
-        warped.data[(y + 1) * warped.cols + x]! -
-        warped.data[y * warped.cols + x - 1]! -
-        warped.data[y * warped.cols + x + 1]!;
+        pixels[above + x]! -
+        pixels[below + x]! -
+        pixels[row + x - 1]! -
+        pixels[row + x + 1]!;
       laplacianCount++;
       laplacianTotal += value;
       laplacianSquaredTotal += value * value;
@@ -599,8 +626,72 @@ function planeFromMat(mat: CvMat, channels: 1 | 4): VisionPlane {
   };
 }
 
-function sourceQuad(quad: VisionQuad, scale: number): VisionQuad {
-  return quad.map((point) => ({ x: point.x / scale, y: point.y / scale })) as unknown as VisionQuad;
+function sourceQuad(
+  quad: VisionQuad,
+  scale: number,
+  offsetX = 0,
+  offsetY = 0,
+): VisionQuad {
+  return quad.map((point) => ({
+    x: point.x / scale + offsetX,
+    y: point.y / scale + offsetY,
+  })) as unknown as VisionQuad;
+}
+
+/**
+ * Pad the frame's bounding box by a fraction of its own size.
+ *
+ * Wide enough that small hand tremor, breathing or a slow drift keeps every
+ * fiducial inside it, narrow enough that the crop is still most of the saving.
+ * A miss is not a failure — the search falls back to the full frame in the same
+ * call — so this trades a rare doubled search against a common cheap one.
+ */
+const SEARCH_REGION_PADDING = 0.18;
+
+function paddedSearchRegion(
+  markers: ReadonlyMap<FiducialId, MarkerCandidate>,
+  width: number,
+  height: number,
+): VisionSearchRegion | undefined {
+  const points = [...markers.values()].flatMap((marker) => marker.quad);
+  if (points.length === 0) return undefined;
+  const left = Math.min(...points.map((point) => point.x));
+  const right = Math.max(...points.map((point) => point.x));
+  const top = Math.min(...points.map((point) => point.y));
+  const bottom = Math.max(...points.map((point) => point.y));
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return undefined;
+  if (!Number.isFinite(top) || !Number.isFinite(bottom)) return undefined;
+  const padX = (right - left) * SEARCH_REGION_PADDING;
+  const padY = (bottom - top) * SEARCH_REGION_PADDING;
+  return clampSearchRegion(
+    { x: left - padX, y: top - padY, width: right - left + 2 * padX, height: bottom - top + 2 * padY },
+    width,
+    height,
+  );
+}
+
+/**
+ * Snap a region to whole pixels inside the frame, or reject it.
+ *
+ * A region that covers essentially the whole frame is rejected too: cropping to
+ * it would cost a copy and save nothing.
+ */
+function clampSearchRegion(
+  region: VisionSearchRegion,
+  width: number,
+  height: number,
+): VisionSearchRegion | undefined {
+  const values = [region.x, region.y, region.width, region.height];
+  if (!values.every((value) => Number.isFinite(value))) return undefined;
+  const left = Math.max(0, Math.floor(region.x));
+  const top = Math.max(0, Math.floor(region.y));
+  const right = Math.min(width, Math.ceil(region.x + region.width));
+  const bottom = Math.min(height, Math.ceil(region.y + region.height));
+  const cropWidth = right - left;
+  const cropHeight = bottom - top;
+  if (cropWidth < 32 || cropHeight < 32) return undefined;
+  if (cropWidth * cropHeight >= width * height * 0.9) return undefined;
+  return { x: left, y: top, width: cropWidth, height: cropHeight };
 }
 
 function shouldCapturePlane(
@@ -700,15 +791,25 @@ function quadSquareness(quad: VisionQuad): number {
   return unitInterval(aspect * Math.sqrt(horizontalBalance * verticalBalance));
 }
 
-function graySample(gray: CvMat, point: Point): number | undefined {
-  const x = Math.round(point.x);
-  const y = Math.round(point.y);
-  if (x < 0 || y < 0 || x >= gray.cols || y >= gray.rows) return undefined;
-  return gray.data[y * gray.cols + x];
+/** A bounded point probe over an already-hoisted grayscale view. */
+function graySampleAt(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+): number | undefined {
+  const column = Math.round(x);
+  const row = Math.round(y);
+  if (column < 0 || row < 0 || column >= width || row >= height) return undefined;
+  return pixels[row * width + column];
 }
 
 /** A bounded edge probe used only for ranking, never as a validity decision. */
 function quadBorderContrast(gray: CvMat, quad: VisionQuad): number {
+  const pixels = gray.data;
+  const width = gray.cols;
+  const height = gray.rows;
   const center = projectiveQuadCenter(quad);
   const differences: number[] = [];
   for (let index = 0; index < 4; index++) {
@@ -716,8 +817,12 @@ function quadBorderContrast(gray: CvMat, quad: VisionQuad): number {
     const right = quad[(index + 1) % 4]!;
     const midpoint = { x: (left.x + right.x) / 2, y: (left.y + right.y) / 2 };
     const ray = { x: midpoint.x - center.x, y: midpoint.y - center.y };
-    const inside = graySample(gray, { x: center.x + ray.x * 0.88, y: center.y + ray.y * 0.88 });
-    const outside = graySample(gray, { x: center.x + ray.x * 1.12, y: center.y + ray.y * 1.12 });
+    const inside = graySampleAt(
+      pixels, width, height, center.x + ray.x * 0.88, center.y + ray.y * 0.88,
+    );
+    const outside = graySampleAt(
+      pixels, width, height, center.x + ray.x * 1.12, center.y + ray.y * 1.12,
+    );
     if (inside !== undefined && outside !== undefined) differences.push(Math.abs(inside - outside));
   }
   return medianNumber(differences);
@@ -916,6 +1021,18 @@ function thresholdForPass(
   );
 }
 
+/**
+ * Proposal search runs on the downscaled image, but marker identity is read
+ * from the full-resolution one.
+ *
+ * A 9-module fiducial that spans 41 source pixels shrinks to 27 at a 1920->1280
+ * detection scale: three pixels per marker module, where `INTER_AREA` has
+ * already blended the black border into the white ring. That downscale blur was
+ * the single most common rejection in the physical exports —
+ * `FIDUCIAL_LOW_CONTRAST` on 13 of 27 attempts, each one a frame where not a
+ * single marker decoded. Locating candidate quads does not need the resolution;
+ * telling a frozen 5x5 payload from its rotations does.
+ */
 function findMarkers(
   cv: OpenCvRuntime,
   gray: CvMat,
@@ -925,11 +1042,16 @@ function findMarkers(
   timings: MutableTimings,
   counters: MutableCounters,
   now: () => number,
+  region?: VisionSearchRegion,
 ): DetectionResult {
   let detection = gray;
+  let cropped: CvMat | undefined;
   let resized: CvMat | undefined;
   const limit = maxDetectionDimension === "source" ? Number.POSITIVE_INFINITY : maxDetectionDimension;
+  // Derived from the whole frame even when only part of it is searched, so a
+  // cropped pass resolves corners exactly as an uncropped one would.
   const scale = Math.min(1, limit / Math.max(gray.cols, gray.rows));
+  let regionApplied = false;
   const traces: VisionCandidateTrace[] = [];
   let tracesTruncated = false;
   let thresholdPlane: VisionPlane | undefined;
@@ -938,13 +1060,19 @@ function findMarkers(
   const contourRetrievalMode = cv.RETR_TREE === undefined ? "list" : "tree";
   const contourRetrievalFlag = cv.RETR_TREE ?? cv.RETR_LIST;
   try {
+    if (region !== undefined && cv.Rect !== undefined && gray.roi !== undefined) {
+      cropped = gray.roi(new cv.Rect(region.x, region.y, region.width, region.height));
+      detection = cropped;
+      regionApplied = true;
+    }
     if (scale < 1) {
       const started = now();
+      const source = detection;
       resized = new cv.Mat();
       cv.resize(
-        gray,
+        source,
         resized,
-        new cv.Size(Math.round(gray.cols * scale), Math.round(gray.rows * scale)),
+        new cv.Size(Math.round(source.cols * scale), Math.round(source.rows * scale)),
         0,
         0,
         cv.INTER_AREA,
@@ -1039,18 +1167,29 @@ function findMarkers(
     counters.candidateCountRanked = ranked.length;
     if (ranked.length < merged.length) warningSet.add("CANDIDATE_BUDGET_RANKED");
     const markers = new Map<FiducialId, MarkerCandidate>();
+    let candidatesSinceComplete = 0;
     for (const proposal of ranked) {
       // Every candidate costs a perspective warp plus a marker decode, and the
       // ranking already puts genuine fiducials first. Once all four IDs have
       // decoded without a single bit error there is nothing better left to find,
-      // so scanning the remaining candidates is pure latency. Debug collection
-      // keeps the full sweep because its traces describe every candidate.
-      if (!collectDebug && allFiducialsDecodedCleanly(markers)) break;
+      // so scanning the remaining candidates is pure latency. When the set is
+      // complete but imperfect, keep looking for a better candidate — but only
+      // for a bounded stretch. Debug collection keeps the full sweep because its
+      // traces describe every candidate.
+      if (!collectDebug) {
+        if (allFiducialsDecodedCleanly(markers)) break;
+        if (markers.size === ORDERED_FIDUCIAL_IDS.length) {
+          if (candidatesSinceComplete >= MAXIMUM_CANDIDATES_AFTER_COMPLETE) break;
+          candidatesSinceComplete++;
+        }
+      }
       const detectionQuad = proposal.detectionQuad;
-      const quad = sourceQuad(detectionQuad, scale);
+      const quad = regionApplied
+        ? sourceQuad(detectionQuad, scale, region!.x, region!.y)
+        : sourceQuad(detectionQuad, scale);
       const center = projectiveQuadCenter(quad);
       const decodeStarted = now();
-      const decoded = decodeCandidate(cv, detection, detectionQuad);
+      const decoded = decodeCandidate(cv, gray, quad);
       timings.fiducialDecodeMs += elapsed(now, decodeStarted);
       const identity = decoded?.identity;
       const score: VisionCandidateScore | undefined = identity === undefined ? undefined : {
@@ -1141,10 +1280,12 @@ function findMarkers(
       warnings: [...warningSet],
       traces,
       tracesTruncated,
+      regionApplied,
       ...(thresholdPlane === undefined ? {} : { thresholdPlane }),
     };
   } finally {
     resized?.delete();
+    cropped?.delete();
   }
 }
 
@@ -1276,6 +1417,8 @@ function opticalMetricsFor(
 }
 
 function canonicalActiveClippedPixelFraction(warped: CvMat, scale: VisionCanonicalScale): number {
+  const pixels = warped.data;
+  const stride = warped.cols;
   const start = QUIET_MODULES * scale;
   const end = (QUIET_MODULES + ACTIVE_MODULES) * scale;
   let samples = 0;
@@ -1283,10 +1426,10 @@ function canonicalActiveClippedPixelFraction(warped: CvMat, scale: VisionCanonic
   const isClipped = (value: number): boolean => value <= 1 || value >= 254;
   for (let y = start; y < end; y++) {
     for (let x = start; x < end; x++) {
-      const offset = (y * warped.cols + x) * 4;
-      const red = warped.data[offset];
-      const green = warped.data[offset + 1];
-      const blue = warped.data[offset + 2];
+      const offset = (y * stride + x) * 4;
+      const red = pixels[offset];
+      const green = pixels[offset + 1];
+      const blue = pixels[offset + 2];
       if (red === undefined || green === undefined || blue === undefined) continue;
       samples++;
       if (isClipped(red) && isClipped(green) && isClipped(blue)) clipped++;
@@ -1393,6 +1536,20 @@ function allFiducialsDecodedCleanly(
 ): boolean {
   return ORDERED_FIDUCIAL_IDS.every((id) => markers.get(id)?.errors === 0);
 }
+
+/**
+ * Candidates still decoded after all four IDs are present but at least one
+ * carries a bit error.
+ *
+ * The bit-perfect exit above is the common case on a sharp capture, but the
+ * physical exports show fiducial errors averaging 0.8 to 2.2 in the regime this
+ * work targets — so on exactly the frames that are slow, it never fires and all
+ * 256 ranked candidates are warped and decoded. A better-scoring candidate for
+ * an already-decoded ID is still worth looking for, but it is overwhelmingly
+ * likely to be nearby in the ranking: the ranking exists to put genuine
+ * fiducials first. This bounds that search instead of abandoning it.
+ */
+const MAXIMUM_CANDIDATES_AFTER_COMPLETE = 32;
 
 interface HomographySolution {
   readonly method: Exclude<VisionHomographyMethod, "none">;
@@ -1633,6 +1790,7 @@ export function normalizeColor4WithOpenCv(
     warnings: [],
     traces: [],
     tracesTruncated: false,
+    regionApplied: false,
   };
   const finish = (warpedAvailable: boolean): {
     diagnostics: VisionDiagnostics;
@@ -1680,16 +1838,47 @@ export function normalizeColor4WithOpenCv(
     timings.grayscaleMs = elapsed(now, grayscaleStarted);
     if (shouldCapturePlane(options, "grayscale")) planes.grayscale = planeFromMat(gray, 1);
     activeStage = "detection";
+    const captureThreshold = shouldCapturePlane(options, "threshold");
+    // A search region is only worth trying when it can actually be honoured and
+    // when every candidate would still be found: debug and snapshot passes
+    // describe the whole frame, so they always search all of it.
+    const region = collectDebug || captureThreshold || options.searchRegion === undefined
+      ? undefined
+      : clampSearchRegion(options.searchRegion, width, height);
     found = findMarkers(
       cv,
       gray,
       maxDetectionDimension,
       collectDebug,
-      shouldCapturePlane(options, "threshold"),
+      captureThreshold,
       timings,
       counters,
       now,
+      region,
     );
+    if (found.regionApplied) {
+      if (ORDERED_FIDUCIAL_IDS.every((id) => found.markers.has(id))) {
+        found.warnings.push("GEOMETRY_SEARCH_REGION_APPLIED");
+      } else {
+        // The hint was stale — the devices moved, or the frame left the crop.
+        // Pay for the full search now rather than rejecting a usable frame.
+        // Counters accumulate across both passes because the frame really did
+        // both; the assigned candidate counts are overwritten by the pass that
+        // decides the outcome, which is the one worth reporting.
+        const carriedWarnings = found.warnings;
+        found = findMarkers(
+          cv,
+          gray,
+          maxDetectionDimension,
+          collectDebug,
+          captureThreshold,
+          timings,
+          counters,
+          now,
+        );
+        found.warnings.push(...carriedWarnings, "GEOMETRY_SEARCH_REGION_MISSED");
+      }
+    }
     if (found.thresholdPlane) planes.threshold = found.thresholdPlane;
     if (found.reason !== undefined || ORDERED_FIDUCIAL_IDS.some((id) => !found.markers.has(id))) {
       return {
@@ -1784,10 +1973,12 @@ export function normalizeColor4WithOpenCv(
     clippedPixelFraction = canonicalActiveClippedPixelFraction(warped, canonicalScale);
     if (shouldCapturePlane(options, "warped")) planes.warped = planeFromMat(warped, 4);
     const canonicalPixels = Uint8ClampedArray.from(warped.data);
+    const frameRegion = paddedSearchRegion(found.markers, width, height);
     return {
       status: "valid",
       candidates: found.candidates,
       image: { width: canonicalSize, height: canonicalSize, pixels: canonicalPixels },
+      ...(frameRegion === undefined ? {} : { frameRegion }),
       ...finish(true),
     };
   } catch {

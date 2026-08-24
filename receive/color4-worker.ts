@@ -43,6 +43,19 @@ const scope = self as unknown as {
 let openCvPromise: Promise<OpenCvRuntime> | undefined;
 let openCvInitMs = 0;
 
+/**
+ * Where this worker last located a frame, in source pixels.
+ *
+ * Thresholding and contour extraction are the bulk of cold acquisition and cost
+ * whatever the searched area costs. Two devices held still put the code in the
+ * same place frame after frame, so remembering it turns most frames into a
+ * search over a fraction of the pixels. The hint is dropped as soon as a frame
+ * fails to locate the code — the scene has changed, and the next frame should
+ * look everywhere. Each worker in the pool keeps its own hint and converges
+ * independently.
+ */
+let searchRegion: import("./color4-vision").VisionSearchRegion | undefined;
+
 async function loadOpenCv(): Promise<OpenCvRuntime> {
   if (openCvPromise) return openCvPromise;
   const started = performance.now();
@@ -438,9 +451,36 @@ function postRejected(
   );
 }
 
+/**
+ * Reused between frames: allocating an OffscreenCanvas per capture would give
+ * back most of what the bitmap path saves.
+ */
+let bitmapCanvas: OffscreenCanvas | undefined;
+let bitmapContext: OffscreenCanvasRenderingContext2D | undefined;
+
+function pixelsFromRequest(request: Color4WorkerDecodeRequest): Uint8ClampedArray {
+  if (request.source.kind === "rgba") return new Uint8ClampedArray(request.source.rgba);
+  const { bitmap } = request.source;
+  try {
+    if (
+      bitmapCanvas === undefined ||
+      bitmapCanvas.width !== request.width ||
+      bitmapCanvas.height !== request.height
+    ) {
+      bitmapCanvas = new OffscreenCanvas(request.width, request.height);
+      bitmapContext = bitmapCanvas.getContext("2d", { willReadFrequently: true }) ?? undefined;
+    }
+    if (!bitmapContext) throw new Error("This worker cannot open a 2D OffscreenCanvas context.");
+    bitmapContext.drawImage(bitmap, 0, 0);
+    return bitmapContext.getImageData(0, 0, request.width, request.height).data;
+  } finally {
+    // The bitmap was transferred here, so this worker owns its release.
+    bitmap.close();
+  }
+}
+
 async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
   const started = performance.now();
-  const pixels = new Uint8ClampedArray(request.rgba);
   const classifierObservations: CanonicalRasterObservation[] = [];
   const unwrapObservations: Color4UnwrapObservation[] = [];
   let normalized: VisionResult | undefined;
@@ -448,6 +488,9 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
   const observerDetail = request.debug.snapshot ||
     (request.debug.emitPlane && request.debug.view === "calibration");
   try {
+    // Inside the try: a canvas that refuses a 2D context is a rejected frame,
+    // not a dead worker that tears the whole receiver down.
+    const pixels = pixelsFromRequest(request);
     // Camera input always traverses geometry. Inferring a canonical fixture
     // from square dimensions could bypass homography on a legitimate square
     // camera mode whose width happened to be a multiple of 172.
@@ -458,7 +501,9 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
       debug: request.debug.enabled,
       snapshot: request.debug.snapshot,
       ...(request.debug.emitPlane ? { debugView: request.debug.view } : {}),
+      ...(searchRegion === undefined ? {} : { searchRegion }),
     });
+    searchRegion = normalized.status === "valid" ? normalized.frameRegion : undefined;
     if (normalized.status === "rejected") {
       const diagnostics = baseDiagnostics(
         request,

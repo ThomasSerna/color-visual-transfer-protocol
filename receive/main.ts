@@ -138,6 +138,12 @@ let done = false;
 let settingsWired = false;
 const manualCaptureWidths = new Map<CarrierChoice, string>();
 const manualCaptureFps = new Map<CarrierChoice, string>();
+const manualWorkers = new Map<CarrierChoice, string>();
+
+/** QR decode workers are cheap; a COLOR_4 vision worker carries all of OpenCV. */
+function defaultWorkerCount(carrier: CarrierChoice): number {
+  return carrier === "color4" ? 1 : 2;
+}
 let statsTimer: ReturnType<typeof setInterval> | undefined;
 let activeCarrier: CarrierChoice | null = null;
 let colorDecoder: Color4CameraDecoder | null = null;
@@ -160,12 +166,29 @@ let receiveSettingsQueue: Promise<void> = Promise.resolve();
 let captureStability: CaptureStabilityTracker | null = null;
 let stableIntervalEpoch = 0;
 let lastSubmittedStableIntervalEpoch: number | undefined;
+/**
+ * Whether COLOR_4 captures can skip the main thread's pixel readback.
+ *
+ * Probed here rather than imported from the carrier: a value import would pull
+ * the COLOR_4 module — and its worker URL — into the deliberately QR-only
+ * standalone bundle. `OffscreenCanvas` is the limiting global, because the
+ * worker needs it to turn a transferred bitmap back into pixels; it arrived
+ * later than `createImageBitmap` on WebKit, so both are probed. Cleared for the
+ * session if this engine ever refuses a video bitmap at runtime.
+ */
+let useBitmapCapture = __COLOR4_ENABLED__ &&
+  typeof createImageBitmap === "function" &&
+  typeof OffscreenCanvas !== "undefined";
 
 const COLOR4_STABILITY_THRESHOLD = 0.025;
 
 const noSignal = new NoSignalHintTimer(NO_SIGNAL_FIRST_MS, NO_SIGNAL_DISMISSED_MS);
 /** Why recent COLOR_4 captures were unreadable, once enough of them agree. */
-const framingAdvice = new Color4FramingAdviceTracker();
+// COLOR_4-only, and constructed conditionally so it is not merely unused in the
+// QR-only standalone build but absent from it. Its advice strings name the
+// COLOR_4 carrier, and a live reference to the tracker was retaining them in an
+// artifact the carrier-isolation E2E requires to contain no COLOR_4 payload.
+const framingAdvice = __COLOR4_ENABLED__ ? new Color4FramingAdviceTracker() : undefined;
 const captureTimes: number[] = [];
 const decodeTimes: number[] = [];
 let latestCarrierDiagnostics: BrowserCarrierDiagnostics | undefined;
@@ -198,6 +221,10 @@ function applyCarrierControls(): void {
   }
   cfgWidth.value = manualCaptureWidths.get(carrier) ?? String(defaultCaptureWidth(carrier));
   cfgCapFps.value = manualCaptureFps.get(carrier) ?? String(defaultCaptureFps(carrier));
+  // Both carriers decode in a worker pool, but they want different defaults: a
+  // ZXing worker holds ~940 KB of WASM, a COLOR_4 vision worker holds a whole
+  // OpenCV build. COLOR_4 therefore starts at one and lets the user opt in.
+  cfgWorkers.value = manualWorkers.get(carrier) ?? String(defaultWorkerCount(carrier));
   qrSettings.forEach((element) => { element.hidden = carrier !== "qr"; });
   colorSettings.forEach((element) => { element.hidden = carrier !== "color4"; });
 }
@@ -223,6 +250,10 @@ cfgWidth.addEventListener("change", () => {
 
 cfgCapFps.addEventListener("change", () => {
   manualCaptureFps.set(currentCarrier(), cfgCapFps.value);
+});
+
+cfgWorkers.addEventListener("change", () => {
+  manualWorkers.set(currentCarrier(), cfgWorkers.value);
 });
 
 function captureWidthChoice(): CaptureWidthChoice {
@@ -443,7 +474,7 @@ function renderNoSignalTips(): void {
 /** Framing advice is COLOR_4-only: the QR path measures none of these inputs. */
 function measuredFramingAdvice() {
   if (!__COLOR4_ENABLED__ || currentCarrier() !== "color4") return undefined;
-  return framingAdvice.advice;
+  return framingAdvice?.advice;
 }
 
 document.getElementById("no-signal-help")!.addEventListener("click", () => {
@@ -530,7 +561,7 @@ async function start() {
       ]);
       if (startGeneration !== captureGen) return;
       const paletteId = Number(cfgColorPalette!.value) === 1 ? 1 : 0;
-      colorDecoder = module.createColor4Decoder(paletteId);
+      colorDecoder = module.createColor4Decoder(paletteId, Number(cfgWorkers.value));
       startBtn.textContent = "Initializing COLOR_4 vision…";
       await colorDecoder.ready;
       if (startGeneration !== captureGen) {
@@ -683,8 +714,9 @@ function reportCameraSettings(note?: string) {
     : s.width !== undefined && s.width !== askedWidth
       ? ` (asked ${askedWidth})`
       : "";
+  const colorWorkers = colorDecoder?.size ?? 0;
   const workers = __COLOR4_ENABLED__ && activeCarrier === "color4"
-    ? "1 COLOR_4 vision worker"
+    ? `${colorWorkers} COLOR_4 vision worker${colorWorkers === 1 ? "" : "s"}`
     : `${qrDecoder?.size ?? 0} QR decode worker${qrDecoder?.size === 1 ? "" : "s"}`;
   cameraActual.textContent =
     `camera ${s.width}×${s.height}${widthNote} @ ${gotFps} fps${fpsNote} · ${workers} · ` +
@@ -730,7 +762,13 @@ async function applyReceiveSettings(
 ): Promise<void> {
   // finish() has already torn the pool down — don't resurrect it.
   if (done || generation !== captureGen) return;
+  // A QR worker can join or leave a live pool cheaply. A COLOR_4 worker has to
+  // load and initialize its own OpenCV build first, so a live change would
+  // stall the very pipeline it is meant to widen: it takes effect on restart.
   if (activeCarrier === "qr") qrDecoder?.resize(workerCount);
+  else if (colorDecoder && workerCount !== colorDecoder.size) {
+    reportCameraSettings("worker count applies on the next Start camera");
+  }
   const track = stream?.getVideoTracks()[0];
   if (!track) return;
   try {
@@ -814,6 +852,84 @@ function measureColor4Stability(): CaptureStabilityResult {
   return captureStability!.observe(fingerprint);
 }
 
+/**
+ * Hand one COLOR_4 capture to the vision worker and route its result.
+ *
+ * Shared by both capture paths: the ImageBitmap path resolves asynchronously
+ * before it can call this, the canvas path calls it inline. `qualityRecorded`
+ * arrives by value because each capture owns its own accounting.
+ */
+function submitColor4Frame(
+  frame: { source: ImageData | ImageBitmap; timestamp: number },
+  captureMs: number,
+  capturedAt: number,
+  decoderGeneration: number,
+  stability: CaptureStabilityResult | undefined,
+  alreadyRecordedQuality: boolean,
+): void {
+  if (!colorDecoder) return;
+  let qualityRecorded = alreadyRecordedQuality;
+  // Claim the stable interval when the frame is dispatched, not when its
+  // asynchronous result arrives. A rejection still consumes the interval;
+  // an explicitly armed snapshot remains the sole dedupe bypass so it can
+  // capture the next frame. Transitions increment the epoch before another
+  // submission, so an older callback cannot consume the new interval.
+  if (captureStability?.mode === "enabled" && stability?.state === "stable") {
+    lastSubmittedStableIntervalEpoch = stableIntervalEpoch;
+  }
+  // Count the submission before snapshot metadata is frozen so the capture's
+  // experiment view is coherent with the frame being handed to the worker.
+  experiment?.recordVisionSubmission();
+  const debugOptions = visionDebugController?.decodeOptions(capturedAt);
+  void colorDecoder.decode(
+    frame,
+    { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
+  ).then(
+    (decoded) => {
+      if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
+      decodeTimes.push(performance.now());
+      const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
+      latestCarrierDiagnostics = diagnostics;
+      if (!qualityRecorded) {
+        experiment?.recordQualityClass(
+          classifyColor4CaptureQuality(stability?.state, diagnostics.vision),
+        );
+        qualityRecorded = true;
+      }
+      // The same measurements that feed the experiment counters are the only
+      // evidence the user has for why nothing is decoding, so keep a rolling
+      // verdict ready for the hint.
+      framingAdvice?.observe({ stability: stability?.state, vision: diagnostics.vision });
+      if (decoded.debug && visionDebugController) {
+        visionDebugController.handleFrame({
+          ...decoded.debug,
+          diagnostics: {
+            carrier: diagnostics,
+            classifier: decoded.debug.classifier,
+            unwrap: decoded.debug.unwrap,
+          },
+        });
+      }
+      experiment?.setProfile(diagnostics.profile);
+      experiment?.recordAttempt(decoded.status, diagnostics);
+      if (decoded.status === "valid") {
+        onDecoded(decoded.innerFrame);
+      }
+    },
+    (error) => {
+      if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
+      decodeTimes.push(performance.now());
+      if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
+      visionDebugController?.failSnapshot("Snapshot failed because the vision worker stopped.");
+      experiment?.recordAttempt("rejected", { stage: "wire" });
+      const failureReason =
+        error instanceof Error ? error.message : "The COLOR_4 vision worker stopped.";
+      persistExperiment(false, failureReason);
+      cancelActiveReceiver(failureReason);
+    },
+  );
+}
+
 function captureFrame() {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
@@ -844,7 +960,7 @@ function captureFrame() {
       // A capture dropped before decoding never reaches the worker callback, so
       // record it here or a receiver that gates on stability would collect no
       // evidence at all about why it is stuck.
-      framingAdvice.observe({ stability: stability.state, vision: undefined });
+      framingAdvice?.observe({ stability: stability.state, vision: undefined });
       return;
     }
     if (
@@ -870,74 +986,67 @@ function captureFrame() {
       return; // all QR workers busy — drop it, no harm done
     }
   }
+  const captureStarted = performance.now();
+  // COLOR_4 hands the worker an ImageBitmap where the engine supports it: the
+  // drawImage/getImageData pair below costs about 90 ms of main-thread time on
+  // the 1440×1920 mode the physical exports use, and blocking the page for that
+  // long every frame is most of why the receiver could not keep up with its own
+  // camera. createImageBitmap costs about 1 ms and the worker reads the pixels
+  // back for about 5 ms. The canvas path stays for engines without
+  // OffscreenCanvas.
+  if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder && useBitmapCapture) {
+    const decoderGeneration = captureGen;
+    void createImageBitmap(video).then(
+      (bitmap) => {
+        if (done || decoderGeneration !== captureGen || activeCarrier !== "color4" || !colorDecoder) {
+          bitmap.close();
+          return;
+        }
+        // The busy check in captureFrame happened before this await, so another
+        // callback may have claimed the worker in between. Re-check rather than
+        // letting decode() reject and tear the receiver down.
+        if (colorDecoder.busy) {
+          bitmap.close();
+          experiment?.recordSkippedWhileBusy();
+          if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
+          return;
+        }
+        const capturedAt = performance.now();
+        submitColor4Frame(
+          { source: bitmap, timestamp: capturedAt },
+          Math.max(0, capturedAt - captureStarted),
+          capturedAt,
+          decoderGeneration,
+          stability,
+          qualityRecorded,
+        );
+      },
+      () => {
+        // A single refused bitmap is not evidence the engine lacks the API, but
+        // repeated failures would stall the receiver silently. Fall back for the
+        // rest of the session and let the next callback use the canvas.
+        useBitmapCapture = false;
+      },
+    );
+    return;
+  }
   if (grab.width !== vw || grab.height !== vh) {
     grab.width = vw;
     grab.height = vh;
   }
-  const captureStarted = performance.now();
   const ctx = grab.getContext("2d", { willReadFrequently: true })!;
   ctx.drawImage(video, 0, 0);
   const img = ctx.getImageData(0, 0, vw, vh);
   const capturedAt = performance.now();
   const captureMs = Math.max(0, capturedAt - captureStarted);
   if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder) {
-    const decoderGeneration = captureGen;
-    // Claim the stable interval when the frame is dispatched, not when its
-    // asynchronous result arrives. A rejection still consumes the interval;
-    // an explicitly armed snapshot remains the sole dedupe bypass so it can
-    // capture the next frame. Transitions increment the epoch before another
-    // submission, so an older callback cannot consume the new interval.
-    if (captureStability?.mode === "enabled" && stability?.state === "stable") {
-      lastSubmittedStableIntervalEpoch = stableIntervalEpoch;
-    }
-    // Count the submission before snapshot metadata is frozen so the capture's
-    // experiment view is coherent with the frame being handed to the worker.
-    experiment?.recordVisionSubmission();
-    const debugOptions = visionDebugController?.decodeOptions(capturedAt);
-    void colorDecoder.decode(
+    submitColor4Frame(
       { source: img, timestamp: capturedAt },
-      { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
-    ).then(
-      (decoded) => {
-        if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
-        decodeTimes.push(performance.now());
-        const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
-        latestCarrierDiagnostics = diagnostics;
-        if (!qualityRecorded) {
-          experiment?.recordQualityClass(classifyColor4CaptureQuality(stability?.state, diagnostics.vision));
-          qualityRecorded = true;
-        }
-        // The same measurements that feed the experiment counters are the only
-        // evidence the user has for why nothing is decoding, so keep a rolling
-        // verdict ready for the hint.
-        framingAdvice.observe({ stability: stability?.state, vision: diagnostics.vision });
-        if (decoded.debug && visionDebugController) {
-          visionDebugController.handleFrame({
-            ...decoded.debug,
-            diagnostics: {
-              carrier: diagnostics,
-              classifier: decoded.debug.classifier,
-              unwrap: decoded.debug.unwrap,
-            },
-          });
-        }
-        experiment?.setProfile(diagnostics.profile);
-        experiment?.recordAttempt(decoded.status, diagnostics);
-        if (decoded.status === "valid") {
-          onDecoded(decoded.innerFrame);
-        }
-      },
-      (error) => {
-        if (done || decoderGeneration !== captureGen || activeCarrier !== "color4") return;
-        decodeTimes.push(performance.now());
-        if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
-        visionDebugController?.failSnapshot("Snapshot failed because the vision worker stopped.");
-        experiment?.recordAttempt("rejected", { stage: "wire" });
-        const failureReason =
-          error instanceof Error ? error.message : "The COLOR_4 vision worker stopped.";
-        persistExperiment(false, failureReason);
-        cancelActiveReceiver(failureReason);
-      },
+      captureMs,
+      capturedAt,
+      captureGen,
+      stability,
+      qualityRecorded,
     );
     return;
   }
@@ -973,7 +1082,7 @@ function onDecoded(bytes: Uint8Array) {
   if (header.k !== Math.ceil(header.totalLen / header.blockLen)) return;
   // The link demonstrably works, so whatever the earlier captures were
   // complaining about is history and must not resurface later in the transfer.
-  framingAdvice.reset();
+  framingAdvice?.reset();
   if (noSignal.frameDecoded()) {
     noSignalToast.hidden = true;
     // The dialog's premise ("nothing decoded") just became false mid-read.

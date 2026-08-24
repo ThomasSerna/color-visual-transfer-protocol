@@ -135,6 +135,7 @@ test("the COLOR_4 camera receiver exposes carrier-specific settings", async ({ p
   await expect(page.locator("#cfg-width")).toHaveValue("1280");
   await expect(page.locator("#cfg-capfps")).toHaveValue("60");
   await expect(page.locator("#cfg-workers")).toBeVisible();
+  await expect(page.locator("#cfg-workers")).toHaveValue("2");
   await page.locator("#carrier-color-option").click();
   await expect(color).toBeChecked();
   await expect(qr).not.toBeChecked();
@@ -144,7 +145,10 @@ test("the COLOR_4 camera receiver exposes carrier-specific settings", async ({ p
   await expect(page.locator("#cfg-capfps")).toHaveValue("30");
   await expect(page.locator("#cfg-capfps option[value='15']")).not.toHaveAttribute("hidden", "");
   await expect(page.locator("#cfg-capfps option[value='60']")).toHaveAttribute("hidden", "");
-  await expect(page.locator("#cfg-workers")).toBeHidden();
+  // COLOR_4 decodes in a worker pool too, but each of its workers carries a
+  // whole OpenCV build, so it starts at one and lets the user opt in.
+  await expect(page.locator("#cfg-workers")).toBeVisible();
+  await expect(page.locator("#cfg-workers")).toHaveValue("1");
   await expect(page.locator("details:has(> summary:text-is('Debug Vision'))")).toBeVisible();
   await expect(page.locator("#cfg-vision-debug")).not.toBeChecked();
   expect(errors).toEqual([]);

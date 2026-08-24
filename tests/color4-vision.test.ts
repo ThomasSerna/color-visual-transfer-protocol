@@ -309,6 +309,9 @@ function fakeOpenCv(
     constructor(..._values: number[]) {}
   }
 
+  // 1 until resize() runs; production only downscales when the source exceeds the
+  // detection limit, and the refinement pass re-runs detection at "source" scale.
+  let detectionScale = 1;
   let thresholdPass = 0;
   const runtime: OpenCvRuntime = {
     Mat,
@@ -347,8 +350,12 @@ function fakeOpenCv(
       destination.cols = source.cols;
       destination.data = new Uint8Array(source.rows * source.cols).fill(255);
     },
-    resize(_source, destination, size) {
+    resize(source, destination, size) {
       const dimensions = size as Size;
+      // Marker identity is decoded from the full-resolution image, so the fake
+      // has to undo the same scale production applies before it can match a
+      // candidate quad against its detection-space fixtures below.
+      detectionScale = dimensions.width / source.cols;
       destination.cols = dimensions.width;
       destination.rows = dimensions.height;
       destination.data = new Uint8Array(dimensions.width * dimensions.height).fill(255);
@@ -411,12 +418,17 @@ function fakeOpenCv(
       const transform = new Mat();
       transform.rows = 3;
       transform.cols = 3;
-      const left = (source as FakeMatShape).values?.[0];
-      const top = (source as FakeMatShape).values?.[1];
+      // Candidate quads arrive in source coordinates; the fixtures below are in
+      // detection coordinates. Rescale before matching, and allow a rounding
+      // tolerance because the division is not exact.
+      const rawLeft = (source as FakeMatShape).values?.[0];
+      const rawTop = (source as FakeMatShape).values?.[1];
+      const left = rawLeft === undefined ? undefined : rawLeft * detectionScale;
+      const top = rawTop === undefined ? undefined : rawTop * detectionScale;
       const markerIndex = left === undefined || top === undefined
         ? -1
         : (refinementActive ? refinementQuads : quads).findIndex(
-          (quad) => quad[0] === left && quad[1] === top,
+          (quad) => Math.abs(quad[0]! - left) < 1e-6 && Math.abs(quad[1]! - top) < 1e-6,
         );
       if (markerIndex >= 0) transform.markerId = ids[markerIndex];
       else if (invalidCenterHomography) transform.data32F = new Float32Array(9).fill(Number.NaN);

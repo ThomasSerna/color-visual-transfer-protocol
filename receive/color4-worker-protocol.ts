@@ -35,14 +35,33 @@ export interface Color4WorkerInitRequest {
   readonly id: number;
 }
 
+/**
+ * One captured frame, in whichever representation the receiver could produce.
+ *
+ * `rgba` is the original path: the page draws the video into a 2D canvas and
+ * reads the pixels back. Measured in Chromium against a 1280x960 fake camera,
+ * that `drawImage` plus `getImageData` pair costs 44.6 ms of *main-thread* time
+ * per frame — around 90 ms at the 1440x1920 mode the physical exports use, and
+ * it matches the `capture` timing those exports report.
+ *
+ * `bitmap` moves the same work to the worker and makes it cheaper on the way:
+ * `createImageBitmap(video)` costs 0.9 ms on the page, and blitting that bitmap
+ * into an `OffscreenCanvas` plus reading it back costs 4.6 ms in the worker.
+ * The page keeps the `rgba` path for engines without `OffscreenCanvas`.
+ */
+export type Color4WorkerFrameSource =
+  | { readonly kind: "rgba"; readonly rgba: ArrayBuffer }
+  | { readonly kind: "bitmap"; readonly bitmap: ImageBitmap };
+
 export interface Color4WorkerDecodeRequest {
   readonly kind: "decode";
   readonly id: number;
   readonly width: number;
   readonly height: number;
-  readonly rgba: ArrayBuffer;
+  readonly source: Color4WorkerFrameSource;
   readonly paletteId: Color4PaletteId;
   readonly capturedAt: number;
+  /** Main-thread milliseconds spent obtaining the frame, however it was obtained. */
   readonly captureMs: number;
   readonly debug: Color4WorkerDebugOptions;
 }
