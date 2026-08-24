@@ -24,7 +24,10 @@ import {
   decodeCanonicalColor4Raster,
   type CanonicalRasterObservation,
 } from "../shared/color4/index.ts";
-import { normalizeColor4WithOpenCv } from "../receive/color4-vision.ts";
+import {
+  normalizeColor4WithOpenCv,
+  type VisionSearchRegion,
+} from "../receive/color4-vision.ts";
 import { loadOpenCvRuntime } from "./helpers/opencv-runtime.ts";
 import {
   renderSyntheticCameraFrame,
@@ -100,6 +103,7 @@ async function loadPhysicalFrame(): Promise<Frame> {
 function runOnce(
   cv: Awaited<ReturnType<typeof loadOpenCvRuntime>>,
   frame: Frame,
+  searchRegion?: VisionSearchRegion,
 ): Omit<BenchCase, "name" | "pixelsPerModule"> {
   const visionStarted = performance.now();
   const normalized = normalizeColor4WithOpenCv(
@@ -109,7 +113,11 @@ function runOnce(
     // OpenCV takes ownership of the buffer it is handed; keep the caller's copy
     // intact so repeated runs measure the same input.
     Uint8ClampedArray.from(frame.pixels),
-    { canonicalScale: 6, maxDetectionDimension: 1280 },
+    {
+      canonicalScale: 6,
+      maxDetectionDimension: 1280,
+      ...(searchRegion === undefined ? {} : { searchRegion }),
+    },
   );
   const visionMs = performance.now() - visionStarted;
 
@@ -154,9 +162,10 @@ function benchmark(
   name: string,
   frame: Frame,
   pixelsPerModule?: number,
+  searchRegion?: VisionSearchRegion,
 ): BenchCase {
-  for (let run = 0; run < WARMUP_RUNS; run++) runOnce(cv, frame);
-  const runs = Array.from({ length: MEASURED_RUNS }, () => runOnce(cv, frame));
+  for (let run = 0; run < WARMUP_RUNS; run++) runOnce(cv, frame, searchRegion);
+  const runs = Array.from({ length: MEASURED_RUNS }, () => runOnce(cv, frame, searchRegion));
   const last = runs[runs.length - 1]!;
   const stageKeys = Object.keys(last.stages) as (keyof StageTimings)[];
   const stages = Object.fromEntries(
@@ -202,6 +211,25 @@ test("COLOR_4 receive pipeline stays inside its stage-latency budget", {
   const physical = await loadPhysicalFrame();
   cases.push(benchmark(cv, "physical-capture-000017", physical));
 
+  // The same frame decoded again through the region the first pass reported:
+  // what a receiver watching a display that has not moved actually pays.
+  const located = normalizeColor4WithOpenCv(
+    cv,
+    physical.width,
+    physical.height,
+    Uint8ClampedArray.from(physical.pixels),
+    { canonicalScale: 6, maxDetectionDimension: 1280 },
+  );
+  const trackedRegion = located.status === "valid" ? located.frameRegion : undefined;
+  assert.ok(trackedRegion, "the physical fixture must report a region to track");
+  cases.push(benchmark(
+    cv,
+    "physical-capture-000017-tracked",
+    physical,
+    undefined,
+    trackedRegion,
+  ));
+
   for (const [label, profile, pixelsPerModule] of [
     ["synthetic-robust-6px", ROBUST_PROFILE, 6],
     ["synthetic-experimental-6px", EXPERIMENTAL_PROFILE, 6],
@@ -231,6 +259,18 @@ test("COLOR_4 receive pipeline stays inside its stage-latency budget", {
       `${entry.name}: ${entry.pipelineMs} ms exceeds the ${PIPELINE_BUDGET_MS} ms pipeline budget`,
     );
   }
+
+  // Tracking exists to make the steady state cheaper than acquisition. If a
+  // change ever inverts that, the region is costing more than it saves and
+  // should not be shipped, however sound the rest of it looks.
+  const cold = cases.find((entry) => entry.name === "physical-capture-000017")!;
+  const tracked = cases.find((entry) => entry.name === "physical-capture-000017-tracked")!;
+  assert.ok(
+    tracked.stages.thresholdMs + tracked.stages.contoursMs <
+      cold.stages.thresholdMs + cold.stages.contoursMs,
+    `tracking did not reduce the proposal search: ${tracked.stages.thresholdMs} + ` +
+      `${tracked.stages.contoursMs} vs ${cold.stages.thresholdMs} + ${cold.stages.contoursMs} ms`,
+  );
 
   // The synthetic frames are clean and in-focus, so every stage after detection
   // must reach a verdict; a rejection here means the bench stopped measuring the

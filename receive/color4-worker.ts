@@ -43,6 +43,19 @@ const scope = self as unknown as {
 let openCvPromise: Promise<OpenCvRuntime> | undefined;
 let openCvInitMs = 0;
 
+/**
+ * Where this worker last located a frame, in source pixels.
+ *
+ * Thresholding and contour extraction are the bulk of cold acquisition and cost
+ * whatever the searched area costs. Two devices held still put the code in the
+ * same place frame after frame, so remembering it turns most frames into a
+ * search over a fraction of the pixels. The hint is dropped as soon as a frame
+ * fails to locate the code — the scene has changed, and the next frame should
+ * look everywhere. Each worker in the pool keeps its own hint and converges
+ * independently.
+ */
+let searchRegion: import("./color4-vision").VisionSearchRegion | undefined;
+
 async function loadOpenCv(): Promise<OpenCvRuntime> {
   if (openCvPromise) return openCvPromise;
   const started = performance.now();
@@ -488,7 +501,9 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
       debug: request.debug.enabled,
       snapshot: request.debug.snapshot,
       ...(request.debug.emitPlane ? { debugView: request.debug.view } : {}),
+      ...(searchRegion === undefined ? {} : { searchRegion }),
     });
+    searchRegion = normalized.status === "valid" ? normalized.frameRegion : undefined;
     if (normalized.status === "rejected") {
       const diagnostics = baseDiagnostics(
         request,

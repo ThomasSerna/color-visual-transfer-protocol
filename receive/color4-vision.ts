@@ -32,6 +32,7 @@ import type {
   VisionQuad,
   VisionRejectReason,
   VisionResult,
+  VisionSearchRegion,
   VisionStageTimings,
   VisionThresholdPass,
   VisionWarning,
@@ -60,6 +61,7 @@ export type {
   VisionQuad,
   VisionRejectReason,
   VisionResult,
+  VisionSearchRegion,
   VisionStageTimings,
   VisionThresholdPass,
   VisionWarning,
@@ -73,6 +75,8 @@ interface CvMat {
   data32S: Int32Array;
   data32F?: Float32Array;
   data64F?: Float64Array;
+  /** A view over a sub-rectangle. Absent in minimal test adapters. */
+  roi?(rect: unknown): CvMat;
   delete(): void;
 }
 
@@ -86,6 +90,8 @@ export interface OpenCvRuntime {
   Mat: new () => CvMat;
   MatVector: new () => CvMatVector;
   Size: new (width: number, height: number) => unknown;
+  /** Needed only by the search-region crop; its absence disables that path. */
+  Rect?: new (x: number, y: number, width: number, height: number) => unknown;
   Scalar: new (...values: number[]) => unknown;
   CV_32FC2: unknown;
   COLOR_RGBA2GRAY: number;
@@ -237,6 +243,8 @@ interface DetectionResult {
   traces: VisionCandidateTrace[];
   tracesTruncated: boolean;
   thresholdPlane?: VisionPlane;
+  /** False when a requested region could not be honoured by this OpenCV build. */
+  regionApplied: boolean;
 }
 
 interface MutableHomographyDiagnostics {
@@ -618,8 +626,72 @@ function planeFromMat(mat: CvMat, channels: 1 | 4): VisionPlane {
   };
 }
 
-function sourceQuad(quad: VisionQuad, scale: number): VisionQuad {
-  return quad.map((point) => ({ x: point.x / scale, y: point.y / scale })) as unknown as VisionQuad;
+function sourceQuad(
+  quad: VisionQuad,
+  scale: number,
+  offsetX = 0,
+  offsetY = 0,
+): VisionQuad {
+  return quad.map((point) => ({
+    x: point.x / scale + offsetX,
+    y: point.y / scale + offsetY,
+  })) as unknown as VisionQuad;
+}
+
+/**
+ * Pad the frame's bounding box by a fraction of its own size.
+ *
+ * Wide enough that small hand tremor, breathing or a slow drift keeps every
+ * fiducial inside it, narrow enough that the crop is still most of the saving.
+ * A miss is not a failure — the search falls back to the full frame in the same
+ * call — so this trades a rare doubled search against a common cheap one.
+ */
+const SEARCH_REGION_PADDING = 0.18;
+
+function paddedSearchRegion(
+  markers: ReadonlyMap<FiducialId, MarkerCandidate>,
+  width: number,
+  height: number,
+): VisionSearchRegion | undefined {
+  const points = [...markers.values()].flatMap((marker) => marker.quad);
+  if (points.length === 0) return undefined;
+  const left = Math.min(...points.map((point) => point.x));
+  const right = Math.max(...points.map((point) => point.x));
+  const top = Math.min(...points.map((point) => point.y));
+  const bottom = Math.max(...points.map((point) => point.y));
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return undefined;
+  if (!Number.isFinite(top) || !Number.isFinite(bottom)) return undefined;
+  const padX = (right - left) * SEARCH_REGION_PADDING;
+  const padY = (bottom - top) * SEARCH_REGION_PADDING;
+  return clampSearchRegion(
+    { x: left - padX, y: top - padY, width: right - left + 2 * padX, height: bottom - top + 2 * padY },
+    width,
+    height,
+  );
+}
+
+/**
+ * Snap a region to whole pixels inside the frame, or reject it.
+ *
+ * A region that covers essentially the whole frame is rejected too: cropping to
+ * it would cost a copy and save nothing.
+ */
+function clampSearchRegion(
+  region: VisionSearchRegion,
+  width: number,
+  height: number,
+): VisionSearchRegion | undefined {
+  const values = [region.x, region.y, region.width, region.height];
+  if (!values.every((value) => Number.isFinite(value))) return undefined;
+  const left = Math.max(0, Math.floor(region.x));
+  const top = Math.max(0, Math.floor(region.y));
+  const right = Math.min(width, Math.ceil(region.x + region.width));
+  const bottom = Math.min(height, Math.ceil(region.y + region.height));
+  const cropWidth = right - left;
+  const cropHeight = bottom - top;
+  if (cropWidth < 32 || cropHeight < 32) return undefined;
+  if (cropWidth * cropHeight >= width * height * 0.9) return undefined;
+  return { x: left, y: top, width: cropWidth, height: cropHeight };
 }
 
 function shouldCapturePlane(
@@ -970,11 +1042,16 @@ function findMarkers(
   timings: MutableTimings,
   counters: MutableCounters,
   now: () => number,
+  region?: VisionSearchRegion,
 ): DetectionResult {
   let detection = gray;
+  let cropped: CvMat | undefined;
   let resized: CvMat | undefined;
   const limit = maxDetectionDimension === "source" ? Number.POSITIVE_INFINITY : maxDetectionDimension;
+  // Derived from the whole frame even when only part of it is searched, so a
+  // cropped pass resolves corners exactly as an uncropped one would.
   const scale = Math.min(1, limit / Math.max(gray.cols, gray.rows));
+  let regionApplied = false;
   const traces: VisionCandidateTrace[] = [];
   let tracesTruncated = false;
   let thresholdPlane: VisionPlane | undefined;
@@ -983,13 +1060,19 @@ function findMarkers(
   const contourRetrievalMode = cv.RETR_TREE === undefined ? "list" : "tree";
   const contourRetrievalFlag = cv.RETR_TREE ?? cv.RETR_LIST;
   try {
+    if (region !== undefined && cv.Rect !== undefined && gray.roi !== undefined) {
+      cropped = gray.roi(new cv.Rect(region.x, region.y, region.width, region.height));
+      detection = cropped;
+      regionApplied = true;
+    }
     if (scale < 1) {
       const started = now();
+      const source = detection;
       resized = new cv.Mat();
       cv.resize(
-        gray,
+        source,
         resized,
-        new cv.Size(Math.round(gray.cols * scale), Math.round(gray.rows * scale)),
+        new cv.Size(Math.round(source.cols * scale), Math.round(source.rows * scale)),
         0,
         0,
         cv.INTER_AREA,
@@ -1101,7 +1184,9 @@ function findMarkers(
         }
       }
       const detectionQuad = proposal.detectionQuad;
-      const quad = sourceQuad(detectionQuad, scale);
+      const quad = regionApplied
+        ? sourceQuad(detectionQuad, scale, region!.x, region!.y)
+        : sourceQuad(detectionQuad, scale);
       const center = projectiveQuadCenter(quad);
       const decodeStarted = now();
       const decoded = decodeCandidate(cv, gray, quad);
@@ -1195,10 +1280,12 @@ function findMarkers(
       warnings: [...warningSet],
       traces,
       tracesTruncated,
+      regionApplied,
       ...(thresholdPlane === undefined ? {} : { thresholdPlane }),
     };
   } finally {
     resized?.delete();
+    cropped?.delete();
   }
 }
 
@@ -1703,6 +1790,7 @@ export function normalizeColor4WithOpenCv(
     warnings: [],
     traces: [],
     tracesTruncated: false,
+    regionApplied: false,
   };
   const finish = (warpedAvailable: boolean): {
     diagnostics: VisionDiagnostics;
@@ -1750,16 +1838,47 @@ export function normalizeColor4WithOpenCv(
     timings.grayscaleMs = elapsed(now, grayscaleStarted);
     if (shouldCapturePlane(options, "grayscale")) planes.grayscale = planeFromMat(gray, 1);
     activeStage = "detection";
+    const captureThreshold = shouldCapturePlane(options, "threshold");
+    // A search region is only worth trying when it can actually be honoured and
+    // when every candidate would still be found: debug and snapshot passes
+    // describe the whole frame, so they always search all of it.
+    const region = collectDebug || captureThreshold || options.searchRegion === undefined
+      ? undefined
+      : clampSearchRegion(options.searchRegion, width, height);
     found = findMarkers(
       cv,
       gray,
       maxDetectionDimension,
       collectDebug,
-      shouldCapturePlane(options, "threshold"),
+      captureThreshold,
       timings,
       counters,
       now,
+      region,
     );
+    if (found.regionApplied) {
+      if (ORDERED_FIDUCIAL_IDS.every((id) => found.markers.has(id))) {
+        found.warnings.push("GEOMETRY_SEARCH_REGION_APPLIED");
+      } else {
+        // The hint was stale — the devices moved, or the frame left the crop.
+        // Pay for the full search now rather than rejecting a usable frame.
+        // Counters accumulate across both passes because the frame really did
+        // both; the assigned candidate counts are overwritten by the pass that
+        // decides the outcome, which is the one worth reporting.
+        const carriedWarnings = found.warnings;
+        found = findMarkers(
+          cv,
+          gray,
+          maxDetectionDimension,
+          collectDebug,
+          captureThreshold,
+          timings,
+          counters,
+          now,
+        );
+        found.warnings.push(...carriedWarnings, "GEOMETRY_SEARCH_REGION_MISSED");
+      }
+    }
     if (found.thresholdPlane) planes.threshold = found.thresholdPlane;
     if (found.reason !== undefined || ORDERED_FIDUCIAL_IDS.some((id) => !found.markers.has(id))) {
       return {
@@ -1854,10 +1973,12 @@ export function normalizeColor4WithOpenCv(
     clippedPixelFraction = canonicalActiveClippedPixelFraction(warped, canonicalScale);
     if (shouldCapturePlane(options, "warped")) planes.warped = planeFromMat(warped, 4);
     const canonicalPixels = Uint8ClampedArray.from(warped.data);
+    const frameRegion = paddedSearchRegion(found.markers, width, height);
     return {
       status: "valid",
       candidates: found.candidates,
       image: { width: canonicalSize, height: canonicalSize, pixels: canonicalPixels },
+      ...(frameRegion === undefined ? {} : { frameRegion }),
       ...finish(true),
     };
   } catch {
