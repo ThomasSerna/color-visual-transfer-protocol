@@ -122,6 +122,22 @@ npm run test:color4:corpus
 npm run test:e2e:color4
 ```
 
+`test:e2e:color4` covers three fake-camera projects: the ROBUST baseline, the
+degraded ROBUST fixture with the stability prefilter active, and an EXPERIMENTAL
+fixture framed at roughly five camera pixels per module. `test:color4` includes
+two records worth diffing between runs rather than only asserting on:
+
+- `VISION_BENCH` (`tests/color4-vision-bench.test.ts`) reports per-stage decode
+  latency for the physical fixture, the same fixture decoded through a tracked
+  search region, and synthetic frames of both profiles. Correctness tests cannot
+  see a latency regression — a frame that decodes in two seconds passes all of
+  them — so a change that slows acquisition shows up here or nowhere.
+- `OPTICAL_SWEEP` (`tests/color4-optical-sweep.test.ts`) reports what each
+  profile's classifier produces as pixels per module fall through the bands in
+  the [COLOR_4/1 specification](color4-protocol.md). Its synthetic channel is
+  cleaner than a camera — no sensor noise, no 4:2:0, no defocus or motion — so
+  its figures are upper bounds and do not replace the A–E matrix.
+
 The required synthetic corpus must be byte-exact at 960, 1280 and 1920 input
 sizes; all four rotations; perspective through ±15°; a roughly 480 px frame;
 4:2:0 colour loss; mild blur, exposure, noise, radial distortion and glare; a
@@ -144,6 +160,16 @@ failure instead of relaxing Hamming, RS, CRC or classification uncertainty.
 Insufficient pixels/module under an actually negotiated high-resolution,
 well-focused setup is evidence for evaluating a less dense future PHY; detector,
 geometry or calibration-dominant failures are not.
+
+Acquisition throughput is part of that evidence and is easy to misread as a
+carrier failure. A run whose `visionSubmissions` are a small fraction of its
+`captures`, or whose `skippedWhileBusy` dominates, is reporting that the
+receiver never saw most of the stream — not that the frames it did see were
+undecodable. Read `visionSubmissions / captures`, `validFrames /
+carrierAttempts` and the `workerTotal` distribution before concluding anything
+about the physical layer, and note the `GEOMETRY_SEARCH_REGION_APPLIED` and
+`GEOMETRY_SEARCH_REGION_MISSED` warning counts: a run dominated by misses was
+not observing a stationary scene, whatever the setup intended.
 
 ## Opt-in 64 MiB pipeline stress
 

@@ -261,9 +261,18 @@ log-area band; only the best eight are retained per bucket. Cross-threshold
 duplicates are merged and final ranking prefers threshold-pass support,
 pre-warp score, nesting, contrast, square-ness and low corner spread before
 keeping at most 256 expensive decodes. Truncation records
-`CANDIDATE_BUDGET_RANKED`; it is a warning, not a rejection. The detector also
-requires at least 30 luma levels of local fiducial contrast before Hamming
-decode. This early detection gate is distinct from the 40-level canonical
+`CANDIDATE_BUDGET_RANKED`; it is a warning, not a rejection. Scanning stops as
+soon as all four IDs have decoded without a bit error; when the set is complete
+but imperfect the receiver examines at most 32 further candidates rather than
+the whole remainder. The detector also requires at least 30 luma levels of local
+fiducial contrast before Hamming decode.
+
+Proposal search runs on the downscaled detection image, but marker identity is
+read from the full-resolution one. A 9-module fiducial spanning 41 source pixels
+is 27 pixels at a 1920→1280 detection scale, where the area filter has already
+blended its black border into its white ring; locating a candidate quad does not
+need that resolution, but separating a frozen 5×5 payload from its rotations
+does. This early detection gate is distinct from the 40-level canonical
 black/white requirement below.
 
 Once four oriented camera-stage fiducials exist, internal `VisionDiagnostics`
@@ -290,6 +299,49 @@ in `[0,1]` of active-frame pixels whose three RGB channels are all at `<= 1` or
 clipping is absent until a canonical warp exists. For physical interpretation only, below
 4 px/module is very poor, 4–5 risky, 5–6 borderline and at least 6 preferred;
 these bands are warnings, not device-independent validity gates.
+
+### Search region and acquisition state
+
+Thresholding and contour extraction cost whatever the searched area costs, and
+nothing about them scales with the code. The reference receiver therefore
+retains the padded bounding box of the last located frame, in source pixels, and
+restricts the next capture's proposal search to it.
+
+This is receiver policy and carries no wire meaning. It is a hint, never a
+constraint:
+
+- the effective detection scale is derived from the complete frame whether or
+  not a region is applied, so a cropped pass resolves corners exactly as an
+  uncropped one would;
+- a pass that does not locate all four fiducials inside the region repeats the
+  search over the whole frame within the same decode, so a stale region costs
+  latency and never a frame;
+- a region covering essentially the whole frame is declined, because cropping to
+  it would copy every pixel and save nothing;
+- debug and snapshot passes never crop, because their traces and planes describe
+  the whole frame;
+- any frame that fails to locate the code discards the region.
+
+Outcomes are reported through the existing vision warnings as
+`GEOMETRY_SEARCH_REGION_APPLIED` and `GEOMETRY_SEARCH_REGION_MISSED`. A receiver
+running several vision workers gives each its own region; they converge
+independently and share no state.
+
+### Decode concurrency
+
+The number of COLOR_4 vision workers is receiver policy. Frames are independent
+— the fountain decoder needs no ordering and cares which frames arrive only
+through their count — so a receiver may decode several concurrently. Each worker
+carries its own OpenCV instance, so the reference receiver defaults to one and
+treats more as an explicit choice on hardware that can afford the memory.
+
+Where the engine provides `createImageBitmap` and `OffscreenCanvas`, captures
+reach the worker as a transferred `ImageBitmap` rather than a pixel buffer read
+back on the page. Measured in Chromium against a 1280×960 camera, the canvas
+readback costs 44.6 ms of main-thread time per frame against 0.9 ms to create a
+bitmap plus 4.6 ms for the worker to read it back. Engines without
+`OffscreenCanvas` keep the canvas path. This is acquisition policy, not a
+COLOR_4/1 constant.
 
 ### Canonical validation
 
