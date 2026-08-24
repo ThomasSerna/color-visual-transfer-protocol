@@ -635,24 +635,51 @@ interface ModuleSampler {
   sampleLogical(x: number, y: number): FloatRgb;
 }
 
+/**
+ * Median of the first `length` entries of a scratch buffer, sorted in place.
+ *
+ * Identical to `median()` on the same values, but without the array literal, the
+ * three `push` growths and the copy `[...values]` makes before sorting. Module
+ * sampling runs this on the order of fifty thousand times per EXPERIMENTAL
+ * frame, so those allocations dominated the classification stage.
+ */
+function medianOfScratch(scratch: Float64Array, length: number): number {
+  if (length === 0) return 0;
+  const window = scratch.subarray(0, length);
+  window.sort();
+  const middle = length >> 1;
+  return (length & 1) === 1
+    ? window[middle]!
+    : (window[middle - 1]! + window[middle]!) / 2;
+}
+
 function createSampler(image: CanonicalRasterImage, scale: number): ModuleSampler {
+  const inset = Math.floor(scale / 4);
+  const span = Math.max(1, scale - 2 * inset);
+  // One scratch buffer per channel, reused across every module of this frame.
+  const samples = span * span;
+  const redScratch = new Float64Array(samples);
+  const greenScratch = new Float64Array(samples);
+  const blueScratch = new Float64Array(samples);
   const sampleLogical = (logicalX: number, logicalY: number): FloatRgb => {
-    const inset = Math.floor(scale / 4);
-    const span = Math.max(1, scale - 2 * inset);
-    const reds: number[] = [];
-    const greens: number[] = [];
-    const blues: number[] = [];
     const startX = logicalX * scale + inset;
     const startY = logicalY * scale + inset;
+    let count = 0;
     for (let y = 0; y < span; y++) {
+      let offset = ((startY + y) * image.width + startX) * 4;
       for (let x = 0; x < span; x++) {
-        const offset = ((startY + y) * image.width + startX + x) * 4;
-        reds.push(image.pixels[offset]!);
-        greens.push(image.pixels[offset + 1]!);
-        blues.push(image.pixels[offset + 2]!);
+        redScratch[count] = image.pixels[offset]!;
+        greenScratch[count] = image.pixels[offset + 1]!;
+        blueScratch[count] = image.pixels[offset + 2]!;
+        count++;
+        offset += 4;
       }
     }
-    return [median(reds), median(greens), median(blues)];
+    return [
+      medianOfScratch(redScratch, count),
+      medianOfScratch(greenScratch, count),
+      medianOfScratch(blueScratch, count),
+    ];
   };
   return {
     scale,
@@ -1466,16 +1493,37 @@ function refineCentroids(
   };
 }
 
+/**
+ * The four Lab centroids for every data column.
+ *
+ * A cell's `position` is derived from its column alone, so a centroid field only
+ * ever takes `profile.columns` distinct values. Evaluating the field per cell
+ * instead re-ran four sRGB→Lab conversions — twelve `Math.pow` calls, plus the
+ * twenty-four anchor normalizations behind `targetAt` — for each of the 14,280
+ * EXPERIMENTAL cells, on each of the five passes over the field. That is on the
+ * order of a million transcendental calls per frame to produce 480 distinct
+ * results. Tabulating by column is arithmetically identical and computes each
+ * one once.
+ */
+type CentroidTable = readonly (readonly LabColor[])[];
+
+function tabulateCentroids(
+  field: CentroidField,
+  columnPositions: readonly number[],
+): CentroidTable {
+  return columnPositions.map((position) => field(position));
+}
+
 /** Mean distance from each cell to its winning centroid: lower is a better fit. */
 function meanWinningDistance(
   labs: readonly LabColor[],
-  positions: Float64Array,
-  centroids: CentroidField,
+  columns: Int32Array,
+  centroids: CentroidTable,
 ): number {
   if (labs.length === 0) return 0;
   let total = 0;
   for (let index = 0; index < labs.length; index++) {
-    total += nearestCentroid(labs[index]!, centroids(positions[index]!)).bestDeltaE;
+    total += nearestCentroid(labs[index]!, centroids[columns[index]!]!).bestDeltaE;
   }
   return total / labs.length;
 }
@@ -1859,46 +1907,56 @@ export function decodeCanonicalColor4Raster(
   // to label it, then against centroids re-estimated from those labels — and
   // re-reading pixels for each pass would cost more than the refinement saves.
   const cellCount = profile.columns * profile.rows;
+  // Everything that depends only on a cell's horizontal position is tabulated by
+  // column once, rather than recomputed for each of the cells in that column.
+  const columnPosition: readonly number[] = Array.from(
+    { length: profile.columns },
+    (_, column) => profile.columns === 1 ? 0.5 : column / (profile.columns - 1),
+  );
+  const columnAnchors = columnPosition.map((position) => interpolatedAnchors(model, position));
   const cellRaw: FloatRgb[] = new Array<FloatRgb>(cellCount);
   const cellNormalized: FloatRgb[] = new Array<FloatRgb>(cellCount);
   const cellLab: LabColor[] = new Array<LabColor>(cellCount);
   const cellPosition = new Float64Array(cellCount);
+  const cellColumn = new Int32Array(cellCount);
   for (let index = 0; index < cellCount; index++) {
     const column = index % profile.columns;
     const row = (index - column) / profile.columns;
-    const position = profile.columns === 1 ? 0.5 : column / (profile.columns - 1);
+    const position = columnPosition[column]!;
     const raw = colourSampler.sampleActive(layout.data.x + column, layout.data.y + row);
-    const cellAnchors = interpolatedAnchors(model, position);
+    const cellAnchors = columnAnchors[column]!;
     const normalized = normalizedWithAnchors(raw, cellAnchors.black, cellAnchors.white);
     cellRaw[index] = raw;
     cellNormalized[index] = normalized;
     cellLab[index] = normalizedRgbToLab(normalized);
     cellPosition[index] = position;
+    cellColumn[index] = column;
   }
 
   const swatchCentroids: CentroidField = (position) =>
     [0, 1, 2, 3].map((candidate) =>
       normalizedRgbToLab(targetAt(model, paletteId, candidate, position)),
     );
-  let centroidsAt = swatchCentroids;
+  let centroidTable = tabulateCentroids(swatchCentroids, columnPosition);
   // The swatches remain the reference until a refinement demonstrably beats
   // them. Refining collapses each class to two half-medians, which discards any
   // vertical structure the vertically-distributed swatches carry, so on a frame
   // whose palette is already well described this trade is a loss. Measuring it
   // rather than assuming it keeps the change strictly non-regressive.
-  let bestFit = meanWinningDistance(cellLab, cellPosition, centroidsAt);
+  let bestFit = meanWinningDistance(cellLab, cellColumn, centroidTable);
   const labels = new Uint8Array(cellCount);
   const positions = Array.from(cellPosition);
   for (let pass = 0; pass < DECISION_DIRECTED_PASSES; pass++) {
     for (let index = 0; index < cellCount; index++) {
-      labels[index] = nearestCentroid(cellLab[index]!, centroidsAt(cellPosition[index]!)).dibit;
+      labels[index] = nearestCentroid(cellLab[index]!, centroidTable[cellColumn[index]!]!).dibit;
     }
     const refined = refineCentroids(labels, cellLab, positions);
     if (refined === undefined) break;
-    const fit = meanWinningDistance(cellLab, cellPosition, refined);
+    const refinedTable = tabulateCentroids(refined, columnPosition);
+    const fit = meanWinningDistance(cellLab, cellColumn, refinedTable);
     if (fit >= bestFit) break;
     bestFit = fit;
-    centroidsAt = refined;
+    centroidTable = refinedTable;
   }
 
   for (let byteIndex = 0; byteIndex < codedBytes.length; byteIndex++) {
@@ -1908,10 +1966,9 @@ export function decodeCanonicalColor4Raster(
     for (let dibitIndex = 0; dibitIndex < 4; dibitIndex++) {
       const column = cell % profile.columns;
       const row = Math.floor(cell / profile.columns);
-      const position = cellPosition[cell]!;
       const raw = cellRaw[cell]!;
       const normalized = cellNormalized[cell]!;
-      const nearest = nearestCentroid(cellLab[cell]!, centroidsAt(position));
+      const nearest = nearestCentroid(cellLab[cell]!, centroidTable[column]!);
       const classified: LabClassification = {
         dibit: nearest.dibit,
         erased: nearest.bestDeltaE > dynamicMaximumDeltaE ||
