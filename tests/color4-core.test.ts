@@ -212,6 +212,47 @@ test("RS decoders meet the exact error and erasure limits", () => {
   }
 });
 
+test("RS reports how much parity a correction left unspent", () => {
+  const parityBytes = 32;
+  const codec = new ReedSolomonCodec(223, parityBytes);
+  const data = deterministicBytes(223, 5);
+  const codeword = codec.encode(data);
+
+  const clean = codec.decode(codeword);
+  assert.equal(clean.status, "corrected");
+  if (clean.status === "corrected") assert.equal(clean.verificationMargin, parityBytes);
+
+  // Every marked erasure and every located error costs code distance.
+  const halfBudget = damage(codeword, 8, 2, 7);
+  const partial = codec.decode(halfBudget.damaged, halfBudget.positions);
+  assert.equal(partial.status, "corrected");
+  if (partial.status === "corrected") {
+    assert.deepEqual(partial.data, data);
+    assert.equal(partial.verificationMargin, parityBytes - 8);
+  }
+
+  // Spending the whole budget leaves the closing syndrome check with nothing to
+  // detect: the answer stays maximum-likelihood but is no longer self-verifying.
+  const saturated = damage(codeword, parityBytes, 2, 7);
+  const exact = codec.decode(saturated.damaged, saturated.positions);
+  assert.equal(exact.status, "corrected");
+  if (exact.status === "corrected") {
+    assert.deepEqual(exact.data, data);
+    assert.equal(exact.verificationMargin, 0);
+  }
+
+  // Same zero margin, but now with more corruption than positions marked. RS
+  // still says "corrected" and the payload is wrong, which is precisely why a
+  // zero margin must not be read as a verified shard.
+  const underMarked = damage(codeword, parityBytes + 10, 3, 11);
+  const misled = codec.decode(underMarked.damaged, underMarked.positions.slice(0, parityBytes));
+  assert.equal(misled.status, "corrected");
+  if (misled.status === "corrected") {
+    assert.equal(misled.verificationMargin, 0);
+    assert.notDeepEqual(misled.data, data);
+  }
+});
+
 test("RS decoders recover mixed damage whenever 2E + S <= parity", () => {
   for (const [dataBytes, parityBytes] of [[223, 32], [239, 16]] as const) {
     const codec = new ReedSolomonCodec(dataBytes, parityBytes);

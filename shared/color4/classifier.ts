@@ -134,6 +134,12 @@ export interface CanonicalRasterDiagnostics {
   readonly timingUncertainModules: number;
   readonly timingModules: number;
   readonly timingRails?: TimingRailsDiagnostics;
+  /**
+   * Inter-symbol interference strength the colour stage corrected for. Zero
+   * means the estimator found the capture sharp enough to leave alone; values
+   * approaching 0.4 mean a module's own light was a minority of its sample.
+   */
+  readonly isiStrength: number;
   readonly calibrationMad: number;
   readonly observedContrast: number;
   readonly minimumPaletteDistance: number;
@@ -339,6 +345,7 @@ interface MutableDiagnostics {
   timingUncertainModules: number;
   timingModules: number;
   timingRails?: TimingRailsDiagnostics;
+  isiStrength: number;
   calibrationMad: number;
   observedContrast: number;
   minimumPaletteDistance: number;
@@ -461,6 +468,7 @@ function diagnostics(initial?: Partial<MutableDiagnostics>): MutableDiagnostics 
     timingErrors: 0,
     timingUncertainModules: 0,
     timingModules: 0,
+    isiStrength: 0,
     calibrationMad: 0,
     observedContrast: 0,
     minimumPaletteDistance: 0,
@@ -651,6 +659,282 @@ function createSampler(image: CanonicalRasterImage, scale: number): ModuleSample
     sampleLogical,
     sampleActive: (x, y) => sampleLogical(x + QUIET_MODULES, y + QUIET_MODULES),
   };
+}
+
+/**
+ * Inter-symbol interference correction.
+ *
+ * A camera resolving only a handful of pixels per module cannot keep a module's
+ * light inside its own cell: each sample is a blend of its neighbours. The
+ * effect is invisible to the geometry stages, whose features are large or
+ * repeated, but it dominates colour classification, whose features are single
+ * modules with arbitrary neighbours.
+ *
+ * It also breaks calibration in a way that is easy to miss. Reference swatches
+ * are 2x2 blocks, so their centres are mostly surrounded by their own colour and
+ * read close to the true value. Data cells are 1x1 with random neighbours and
+ * read pulled toward the local average. Measured on a real 3.95 px/module
+ * capture: an isolated black module read 46 luma brighter than a 2x2 black
+ * block, and cells with no same-coloured neighbour sat at 22.9 dE from their
+ * centroid against 12.4 dE for cells surrounded by their own colour. The
+ * centroids were not wrong; they described a different spatial frequency than
+ * the data they were being compared against.
+ *
+ * Undoing a first-order blur on the module lattice puts both back on the same
+ * footing. It must happen in linear light — blurring is linear in radiance, and
+ * doing it on gamma-encoded values lifts darks far more than it lowers lights.
+ */
+const ISI_DIAGONAL_WEIGHT = 0.25;
+/**
+ * Strengths tried when estimating the blur. Zero is included and, on ties, wins:
+ * a sharp capture must not be sharpened, and the estimator has to be able to
+ * conclude that no correction is the right answer.
+ */
+const ISI_STRENGTH_CANDIDATES: readonly number[] = Object.freeze([
+  0, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4,
+]);
+/** Guards the separation score when a synthetic frame has literally zero spread. */
+const ISI_SCORE_EPSILON = 1e-6;
+
+function linearFromDevice(value: number): number {
+  const scaled = value / 255;
+  return scaled <= 0.04045 ? scaled / 12.92 : ((scaled + 0.055) / 1.055) ** 2.4;
+}
+
+function deviceFromLinear(value: number): number {
+  const clamped = Math.max(0, Math.min(1, value));
+  return 255 * (clamped <= 0.0031308
+    ? 12.92 * clamped
+    : 1.055 * clamped ** (1 / 2.4) - 0.055);
+}
+
+/**
+ * A rectangle of active modules held in linear light, row-major, three channels
+ * per module. The outermost ring is never corrected; it exists so the modules
+ * inside it have neighbours to be corrected against.
+ */
+interface ModuleLattice {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly values: Float64Array;
+}
+
+function sampleModuleLattice(
+  sampler: ModuleSampler,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): ModuleLattice {
+  const values = new Float64Array(width * height * 3);
+  for (let row = 0; row < height; row++) {
+    for (let column = 0; column < width; column++) {
+      const rgb = sampler.sampleActive(x + column, y + row);
+      const offset = (row * width + column) * 3;
+      values[offset] = linearFromDevice(rgb[0]);
+      values[offset + 1] = linearFromDevice(rgb[1]);
+      values[offset + 2] = linearFromDevice(rgb[2]);
+    }
+  }
+  return { x, y, width, height, values };
+}
+
+/**
+ * Invert `observed = (1 - strength) * true + strength * neighbourhood` on the
+ * module lattice. Border modules keep their observed value: they have no full
+ * neighbourhood, and inventing one would corrupt the very cells the quiet zone
+ * exists to protect.
+ */
+function deconvolveModuleLattice(lattice: ModuleLattice, strength: number): ModuleLattice {
+  if (strength <= 0) return lattice;
+  const { width, height, values } = lattice;
+  const out = new Float64Array(values);
+  const crossWeight = (1 - ISI_DIAGONAL_WEIGHT) / 4;
+  const diagonalWeight = ISI_DIAGONAL_WEIGHT / 4;
+  const at = (column: number, row: number, channel: number) =>
+    values[(row * width + column) * 3 + channel]!;
+
+  for (let row = 1; row < height - 1; row++) {
+    for (let column = 1; column < width - 1; column++) {
+      const offset = (row * width + column) * 3;
+      for (let channel = 0; channel < 3; channel++) {
+        const cross =
+          at(column - 1, row, channel) + at(column + 1, row, channel) +
+          at(column, row - 1, channel) + at(column, row + 1, channel);
+        const diagonal =
+          at(column - 1, row - 1, channel) + at(column + 1, row - 1, channel) +
+          at(column - 1, row + 1, channel) + at(column + 1, row + 1, channel);
+        const neighbourhood = cross * crossWeight + diagonal * diagonalWeight;
+        out[offset + channel] =
+          (values[offset + channel]! - strength * neighbourhood) / (1 - strength);
+      }
+    }
+  }
+  return { ...lattice, values: out };
+}
+
+function latticeLuminance(lattice: ModuleLattice, column: number, row: number): number {
+  const offset = ((row - lattice.y) * lattice.width + (column - lattice.x)) * 3;
+  return luminance([
+    deviceFromLinear(lattice.values[offset]!),
+    deviceFromLinear(lattice.values[offset + 1]!),
+    deviceFromLinear(lattice.values[offset + 2]!),
+  ]);
+}
+
+/** Same-colour neighbours that make a module "clustered" rather than isolated. */
+const ISI_CLUSTERED_NEIGHBOURS = 2;
+const ISI_ISOLATED_NEIGHBOURS = 1;
+/** Luma the correction must recover before it is worth applying at all. */
+const ISI_MINIMUM_RECOVERED_LUMA = 8;
+
+interface IsiContrastGroups {
+  readonly clusteredDark: number[];
+  readonly isolatedDark: number[];
+  readonly clusteredLight: number[];
+  readonly isolatedLight: number[];
+}
+
+/**
+ * Measure how much contrast a module loses purely for being isolated.
+ *
+ * The fiducial patterns are frozen in the spec, so inside a marker it is known
+ * in advance which modules sit in a run of their own colour and which stand
+ * alone. Without blur the two read identically. Under blur the isolated ones are
+ * dragged toward their neighbours and their black-to-white span collapses, so
+ * the disagreement between the two spans measures the interference directly.
+ *
+ * Crucially it measures *only* interference. An earlier version scored how
+ * cleanly black separated from white in units of its own spread, which a
+ * brightness gradient across the frame inflates just as effectively as blur
+ * does: on a synthetic, perfectly sharp frame carrying a measured corner
+ * photometric field it recommended the strongest correction available and
+ * corrupted 46 bytes that had decoded exactly. Comparing two groups that share
+ * the same gradient cancels it.
+ */
+function isiContrastGroups(
+  lattices: readonly ModuleLattice[],
+  strength: number,
+): IsiContrastGroups {
+  const groups: IsiContrastGroups = {
+    clusteredDark: [], isolatedDark: [], clusteredLight: [], isolatedLight: [],
+  };
+  for (let index = 0; index < FIDUCIALS.length; index++) {
+    const marker = FIDUCIALS[index]!;
+    const corrected = deconvolveModuleLattice(lattices[index]!, strength);
+    // The interior only: an edge module's neighbourhood runs outside the marker,
+    // where the pattern is not known ahead of decoding.
+    for (let y = 1; y < marker.height - 1; y++) {
+      for (let x = 1; x < marker.width - 1; x++) {
+        const own = fiducialModule(marker.id, x, y);
+        let same = 0;
+        if (fiducialModule(marker.id, x - 1, y) === own) same++;
+        if (fiducialModule(marker.id, x + 1, y) === own) same++;
+        if (fiducialModule(marker.id, x, y - 1) === own) same++;
+        if (fiducialModule(marker.id, x, y + 1) === own) same++;
+        const value = latticeLuminance(corrected, marker.x + x, marker.y + y);
+        if (same >= ISI_CLUSTERED_NEIGHBOURS) {
+          (own === 1 ? groups.clusteredDark : groups.clusteredLight).push(value);
+        } else if (same <= ISI_ISOLATED_NEIGHBOURS) {
+          (own === 1 ? groups.isolatedDark : groups.isolatedLight).push(value);
+        }
+      }
+    }
+  }
+  return groups;
+}
+
+function isiContrastDisagreement(groups: IsiContrastGroups): number | undefined {
+  if (
+    groups.clusteredDark.length === 0 || groups.isolatedDark.length === 0 ||
+    groups.clusteredLight.length === 0 || groups.isolatedLight.length === 0
+  ) {
+    return undefined;
+  }
+  const clustered = median(groups.clusteredLight) - median(groups.clusteredDark);
+  const isolated = median(groups.isolatedLight) - median(groups.isolatedDark);
+  return Math.abs(clustered - isolated);
+}
+
+/**
+ * Pick the correction strength that best equalises isolated and clustered
+ * contrast. Zero is a candidate and wins ties, and the winner must also close a
+ * meaningful amount of the gap, so a sharp capture is left untouched rather than
+ * sharpened on the strength of measurement noise.
+ */
+function estimateIsiStrength(sampler: ModuleSampler): number {
+  const lattices = FIDUCIALS.map((marker) =>
+    sampleModuleLattice(sampler, marker.x - 1, marker.y - 1, marker.width + 2, marker.height + 2),
+  );
+  const baseline = isiContrastDisagreement(isiContrastGroups(lattices, 0));
+  if (baseline === undefined || baseline < ISI_MINIMUM_RECOVERED_LUMA) return 0;
+
+  let bestStrength = 0;
+  let bestDisagreement = baseline;
+  for (const strength of ISI_STRENGTH_CANDIDATES) {
+    if (strength === 0) continue;
+    const disagreement = isiContrastDisagreement(isiContrastGroups(lattices, strength));
+    if (disagreement === undefined) continue;
+    if (disagreement < bestDisagreement - ISI_SCORE_EPSILON) {
+      bestDisagreement = disagreement;
+      bestStrength = strength;
+    }
+  }
+  // Reject a correction that barely moved the measurement it was chosen for.
+  return baseline - bestDisagreement >= ISI_MINIMUM_RECOVERED_LUMA ? bestStrength : 0;
+}
+
+/**
+ * A sampler backed by the corrected lattice, falling through to the raw image
+ * outside it. Only the colour stage uses this: the geometry stages are already
+ * reliable on raw samples, and re-deriving them from corrected values would
+ * change checks that currently pass for reasons unrelated to colour.
+ */
+function createLatticeSampler(base: ModuleSampler, lattice: ModuleLattice): ModuleSampler {
+  const sampleActive = (x: number, y: number): FloatRgb => {
+    const column = x - lattice.x;
+    const row = y - lattice.y;
+    if (column < 0 || row < 0 || column >= lattice.width || row >= lattice.height) {
+      return base.sampleActive(x, y);
+    }
+    const offset = (row * lattice.width + column) * 3;
+    return [
+      deviceFromLinear(lattice.values[offset]!),
+      deviceFromLinear(lattice.values[offset + 1]!),
+      deviceFromLinear(lattice.values[offset + 2]!),
+    ];
+  };
+  return { scale: base.scale, sampleActive, sampleLogical: base.sampleLogical };
+}
+
+/** Active-module bounds covering the data grid and both calibration banks, plus
+ *  the one-module ring the correction needs as neighbourhood. */
+function colourLatticeBounds(layout: PhysicalLayout): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} {
+  const columns = [
+    layout.data.x,
+    layout.data.x + layout.data.width - 1,
+    ...layout.calibration.left.flatMap((p) => [p.x, p.x + p.width - 1]),
+    ...layout.calibration.right.flatMap((p) => [p.x, p.x + p.width - 1]),
+  ];
+  const rows = [
+    layout.data.y,
+    layout.data.y + layout.data.height - 1,
+    ...layout.calibration.left.flatMap((p) => [p.y, p.y + p.height - 1]),
+    ...layout.calibration.right.flatMap((p) => [p.y, p.y + p.height - 1]),
+  ];
+  const limit = ACTIVE_MODULES - 1;
+  const x = Math.max(0, Math.min(...columns) - 1);
+  const y = Math.max(0, Math.min(...rows) - 1);
+  const right = Math.min(limit, Math.max(...columns) + 1);
+  const bottom = Math.min(limit, Math.max(...rows) + 1);
+  return { x, y, width: right - x + 1, height: bottom - y + 1 };
 }
 
 interface CollectedBinaryAnchors {
@@ -1110,6 +1394,112 @@ export interface LabClassification {
   readonly secondDeltaE: number;
 }
 
+/**
+ * Decision-directed centroid refinement.
+ *
+ * The reference swatches are 2x2 blocks and the data is 1x1 modules, so even a
+ * perfectly measured palette describes a slightly different thing than the cells
+ * it is used to classify. The cells themselves are the better reference: there
+ * are thousands of them, they are exactly the geometry in question, and most are
+ * classified confidently even when the absolute distances are poor.
+ *
+ * So the swatch centroids are used once to label the field, and then each
+ * centroid is re-estimated as the median of the cells that chose it. Medians
+ * make this safe: a minority of misclassified cells cannot drag a centroid, and
+ * a class must be well populated in both halves of the frame before its
+ * refinement is trusted at all.
+ */
+const DECISION_DIRECTED_PASSES = 2;
+/** Cells a class needs in each half before its refined centroid is believed. */
+const DECISION_DIRECTED_MINIMUM_SAMPLES = 32;
+/** Frame positions the two half-centroids are treated as sitting at. */
+const DECISION_DIRECTED_LEFT_ANCHOR = 0.25;
+const DECISION_DIRECTED_RIGHT_ANCHOR = 0.75;
+
+type CentroidField = (position: number) => readonly LabColor[];
+
+function medianLab(values: readonly LabColor[]): LabColor {
+  return {
+    l: median(values.map((value) => value.l)),
+    a: median(values.map((value) => value.a)),
+    b: median(values.map((value) => value.b)),
+  };
+}
+
+function mixLab(left: LabColor, right: LabColor, position: number): LabColor {
+  return {
+    l: mix(left.l, right.l, position),
+    a: mix(left.a, right.a, position),
+    b: mix(left.b, right.b, position),
+  };
+}
+
+/**
+ * Re-estimate the four centroids from labelled cells, split into left and right
+ * halves so the existing horizontal interpolation survives. Returns undefined
+ * when any class is too sparse to trust, which leaves the swatch centroids in
+ * place rather than inventing one from a handful of samples.
+ */
+function refineCentroids(
+  labels: Uint8Array,
+  labs: readonly LabColor[],
+  positions: readonly number[],
+): CentroidField | undefined {
+  const halves: LabColor[][][] = [0, 1, 2, 3].map(() => [[], []]);
+  for (let index = 0; index < labels.length; index++) {
+    halves[labels[index]!]![positions[index]! < 0.5 ? 0 : 1]!.push(labs[index]!);
+  }
+  const anchors: (readonly [LabColor, LabColor])[] = [];
+  for (const [left, right] of halves) {
+    if (
+      left!.length < DECISION_DIRECTED_MINIMUM_SAMPLES ||
+      right!.length < DECISION_DIRECTED_MINIMUM_SAMPLES
+    ) {
+      return undefined;
+    }
+    anchors.push([medianLab(left!), medianLab(right!)]);
+  }
+  const span = DECISION_DIRECTED_RIGHT_ANCHOR - DECISION_DIRECTED_LEFT_ANCHOR;
+  return (position) => {
+    const t = clamp01((position - DECISION_DIRECTED_LEFT_ANCHOR) / span);
+    return anchors.map(([left, right]) => mixLab(left, right, t));
+  };
+}
+
+/** Mean distance from each cell to its winning centroid: lower is a better fit. */
+function meanWinningDistance(
+  labs: readonly LabColor[],
+  positions: Float64Array,
+  centroids: CentroidField,
+): number {
+  if (labs.length === 0) return 0;
+  let total = 0;
+  for (let index = 0; index < labs.length; index++) {
+    total += nearestCentroid(labs[index]!, centroids(positions[index]!)).bestDeltaE;
+  }
+  return total / labs.length;
+}
+
+function nearestCentroid(
+  lab: LabColor,
+  centroids: readonly LabColor[],
+): { dibit: Dibit; bestDeltaE: number; secondDeltaE: number } {
+  let best = Number.POSITIVE_INFINITY;
+  let second = Number.POSITIVE_INFINITY;
+  let dibit: Dibit = 0;
+  for (let candidate = 0; candidate < centroids.length; candidate++) {
+    const distance = deltaE76(lab, centroids[candidate]!);
+    if (distance < best) {
+      second = best;
+      best = distance;
+      dibit = candidate as Dibit;
+    } else if (distance < second) {
+      second = distance;
+    }
+  }
+  return { dibit, bestDeltaE: best, secondDeltaE: second };
+}
+
 /** Classify one normalized RGB cell against four normalized RGB centroids. */
 export function classifyLabCell(
   sample: FloatRgb,
@@ -1390,7 +1780,26 @@ export function decodeCanonicalColor4Raster(
   }
   finishBootstrap("completed", undefined, bootstrap, topPhase, bottomPhase);
 
-  const model = buildCalibration(sampler, layout, paletteId);
+  // From here on the colour stage works from an ISI-corrected view of the
+  // frame. Geometry above this point deliberately keeps the raw samples.
+  const isiStrength = estimateIsiStrength(sampler);
+  const latticeBounds = colourLatticeBounds(layout);
+  const colourSampler = isiStrength <= 0 ? sampler : createLatticeSampler(
+    sampler,
+    deconvolveModuleLattice(
+      sampleModuleLattice(
+        sampler,
+        latticeBounds.x,
+        latticeBounds.y,
+        latticeBounds.width,
+        latticeBounds.height,
+      ),
+      isiStrength,
+    ),
+  );
+  values.isiStrength = isiStrength;
+
+  const model = buildCalibration(colourSampler, layout, paletteId);
   values.calibrationMad = model.mad;
   values.observedContrast = model.contrast;
   values.minimumPaletteDistance = model.minimumPaletteDistance;
@@ -1446,6 +1855,52 @@ export function decodeCanonicalColor4Raster(
   let cell = 0;
   let totalBestDeltaE = 0;
 
+  // Sample every cell once. The field is then classified more than once — first
+  // to label it, then against centroids re-estimated from those labels — and
+  // re-reading pixels for each pass would cost more than the refinement saves.
+  const cellCount = profile.columns * profile.rows;
+  const cellRaw: FloatRgb[] = new Array<FloatRgb>(cellCount);
+  const cellNormalized: FloatRgb[] = new Array<FloatRgb>(cellCount);
+  const cellLab: LabColor[] = new Array<LabColor>(cellCount);
+  const cellPosition = new Float64Array(cellCount);
+  for (let index = 0; index < cellCount; index++) {
+    const column = index % profile.columns;
+    const row = (index - column) / profile.columns;
+    const position = profile.columns === 1 ? 0.5 : column / (profile.columns - 1);
+    const raw = colourSampler.sampleActive(layout.data.x + column, layout.data.y + row);
+    const cellAnchors = interpolatedAnchors(model, position);
+    const normalized = normalizedWithAnchors(raw, cellAnchors.black, cellAnchors.white);
+    cellRaw[index] = raw;
+    cellNormalized[index] = normalized;
+    cellLab[index] = normalizedRgbToLab(normalized);
+    cellPosition[index] = position;
+  }
+
+  const swatchCentroids: CentroidField = (position) =>
+    [0, 1, 2, 3].map((candidate) =>
+      normalizedRgbToLab(targetAt(model, paletteId, candidate, position)),
+    );
+  let centroidsAt = swatchCentroids;
+  // The swatches remain the reference until a refinement demonstrably beats
+  // them. Refining collapses each class to two half-medians, which discards any
+  // vertical structure the vertically-distributed swatches carry, so on a frame
+  // whose palette is already well described this trade is a loss. Measuring it
+  // rather than assuming it keeps the change strictly non-regressive.
+  let bestFit = meanWinningDistance(cellLab, cellPosition, centroidsAt);
+  const labels = new Uint8Array(cellCount);
+  const positions = Array.from(cellPosition);
+  for (let pass = 0; pass < DECISION_DIRECTED_PASSES; pass++) {
+    for (let index = 0; index < cellCount; index++) {
+      labels[index] = nearestCentroid(cellLab[index]!, centroidsAt(cellPosition[index]!)).dibit;
+    }
+    const refined = refineCentroids(labels, cellLab, positions);
+    if (refined === undefined) break;
+    const fit = meanWinningDistance(cellLab, cellPosition, refined);
+    if (fit >= bestFit) break;
+    bestFit = fit;
+    centroidsAt = refined;
+  }
+
   for (let byteIndex = 0; byteIndex < codedBytes.length; byteIndex++) {
     let byte = 0;
     let byteErased = false;
@@ -1453,19 +1908,17 @@ export function decodeCanonicalColor4Raster(
     for (let dibitIndex = 0; dibitIndex < 4; dibitIndex++) {
       const column = cell % profile.columns;
       const row = Math.floor(cell / profile.columns);
-      const position = profile.columns === 1 ? 0.5 : column / (profile.columns - 1);
-      const raw = sampler.sampleActive(layout.data.x + column, layout.data.y + row);
-      const cellAnchors = interpolatedAnchors(model, position);
-      const normalized = normalizedWithAnchors(raw, cellAnchors.black, cellAnchors.white);
-      const centroids = [0, 1, 2, 3].map((candidate) =>
-        targetAt(model, paletteId, candidate, position),
-      );
-      const classified = classifyLabCell(
-        normalized,
-        centroids,
-        dynamicMaximumDeltaE,
-        dynamicMinimumGap,
-      );
+      const position = cellPosition[cell]!;
+      const raw = cellRaw[cell]!;
+      const normalized = cellNormalized[cell]!;
+      const nearest = nearestCentroid(cellLab[cell]!, centroidsAt(position));
+      const classified: LabClassification = {
+        dibit: nearest.dibit,
+        erased: nearest.bestDeltaE > dynamicMaximumDeltaE ||
+          nearest.secondDeltaE - nearest.bestDeltaE < dynamicMinimumGap,
+        bestDeltaE: nearest.bestDeltaE,
+        secondDeltaE: nearest.secondDeltaE,
+      };
       const deltaEGap = classified.secondDeltaE - classified.bestDeltaE;
       const distanceRejected = classified.bestDeltaE > dynamicMaximumDeltaE;
       const gapRejected = deltaEGap < dynamicMinimumGap;

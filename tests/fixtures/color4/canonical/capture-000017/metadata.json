@@ -18,7 +18,8 @@
   "oracle": {
     "basis": {
       "kind": "crc-derived-regression",
-      "description": "Recovered from the retained capture and accepted only after Reed-Solomon correction, CRC32C validation, outer-header validation, inner-frame validation and identity validation; the original transmitter bytes are unavailable."
+      "description": "Recovered from the retained capture and accepted only after Reed-Solomon correction, CRC32C validation, outer-header validation, inner-frame validation and identity validation; the original transmitter bytes are unavailable.",
+      "stability": "innerFrameSha256 is the invariant and must never change: it is the recovered payload. Every other number here is a snapshot of how much damage the decoder had to absorb to reach it, and improves when classification improves. The counters below were last re-derived when inter-symbol interference correction was added, which cut uncertain cells from 219 to 95 and left every shard inside its parity budget."
     },
     "stages": [
       "canonicalGeometry",
@@ -40,19 +41,20 @@
       "modules": 314
     },
     "classification": {
-      "uncertainCells": 219,
+      "isiStrength": 0.4,
+      "uncertainCells": 95,
       "candidateErasures": {
-        "total": 195,
-        "byShard": [26, 35, 29, 34, 34, 37]
+        "total": 87,
+        "byShard": [13, 14, 14, 15, 18, 13]
       },
       "erasureCandidateScore": {
-        "count": 195,
-        "min": 1.0014599635981696,
-        "p50": 1.6220608388842113,
-        "p95": 12.534467124400843,
-        "max": 62.854022931804224
+        "count": 87,
+        "min": 1.000340246414468,
+        "p50": 1.6532158348557915,
+        "p95": 17.866086603057013,
+        "max": 454.59501886870567
       },
-      "codedBytesSha256": "fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df"
+      "codedBytesSha256": "33bc06b4a229242eaa61843376cc6d9feaab416a31fa55b09ab6db89ea0bd938"
     },
     "unwrap": {
       "status": "valid",
@@ -63,11 +65,11 @@
       "selectedMaxErasuresPerShard": 32,
       "attempts": 1,
       "selectedErasures": {
-        "total": 183,
-        "byShard": [26, 32, 29, 32, 32, 32]
+        "total": 87,
+        "byShard": [13, 14, 14, 15, 18, 13]
       },
-      "correctedErrors": 0,
-      "correctedBytes": 47,
+      "correctedErrors": 1,
+      "correctedBytes": 15,
       "correctedShards": 6,
       "innerFrameSha256": "a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84"
     }

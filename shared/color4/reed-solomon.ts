@@ -218,6 +218,18 @@ export interface ReedSolomonDecodeSuccess {
   readonly errors: number;
   readonly erasures: number;
   readonly correctedBytes: number;
+  /**
+   * Parity symbols left over after accounting for the damage that was located:
+   * `parityBytes - erasures - 2 * errors`.
+   *
+   * A margin of zero means the correction consumed the whole code distance, so
+   * the final syndrome check could not have failed: with `erasures` equal to
+   * `parityBytes` the Vandermonde system is exactly determined and always
+   * yields *a* zero-syndrome codeword, correct or not. Such a result is a valid
+   * maximum-likelihood answer but carries no self-verification, so callers that
+   * cannot check the payload by other means must not treat it as trustworthy.
+   */
+  readonly verificationMargin: number;
 }
 
 export interface ReedSolomonDecodeFailure {
@@ -293,6 +305,8 @@ export class ReedSolomonCodec {
         errors: 0,
         erasures: erasures.length,
         correctedBytes: 0,
+        // An untouched codeword was verified against the full parity set.
+        verificationMargin: this.parityBytes,
       };
     }
 
@@ -333,6 +347,8 @@ export class ReedSolomonCodec {
       errors: unknownErrors.length,
       erasures: erasures.length,
       correctedBytes,
+      verificationMargin:
+        this.parityBytes - erasures.length - 2 * unknownErrors.length,
     };
   }
 }

@@ -40,6 +40,14 @@ export interface Color4RsShardObservation {
     | "invalid-global-erasure";
   readonly errors: number;
   readonly correctedBytes: number;
+  /**
+   * Parity symbols still unspent after this shard's correction, present only on
+   * a `corrected` shard. Zero means the decode consumed the entire code
+   * distance, so Reed-Solomon could not have rejected it however wrong the
+   * marked positions were — the shard is a guess that only the outer header and
+   * CRC32C can still disprove.
+   */
+  readonly verificationMargin?: number;
 }
 
 export interface Color4RsObservation {
@@ -405,6 +413,7 @@ function decodeFec(
       status: "corrected",
       errors: decoded.errors,
       correctedBytes: decoded.correctedBytes,
+      verificationMargin: decoded.verificationMargin,
     }));
   }
   const timing = observing

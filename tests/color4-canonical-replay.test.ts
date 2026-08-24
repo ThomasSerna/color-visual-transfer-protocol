@@ -12,7 +12,6 @@ import {
   type Color4UnwrapObservation,
 } from "../shared/color4/index.ts";
 import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
-import { fecDiagnosticReason } from "../receive/color4-diagnostic-reason.ts";
 import { runColor4ErasurePolicy } from "../receive/color4-erasure-policy.ts";
 
 const FIXTURE_DIRECTORY = fileURLToPath(
@@ -20,7 +19,10 @@ const FIXTURE_DIRECTORY = fileURLToPath(
 );
 const PNG_SHA256 = "3af7b4dd41ef15447fc54f7ef99e2d150a3f8a754b5c6a8a900003ae8e864bcc";
 const RGBA_SHA256 = "86ebacb71a5bb9268848c3c478cdc51452ad4671d30bd38dc0d20e03a1402554";
-const CODED_BYTES_SHA256 = "fd777331c87b26bbdc019c2b78eccd4713e62bb942df2bcca62e9128b75536df";
+// The bytes the classifier reads off the image. This tracks classifier
+// behaviour and moves whenever classification improves; INNER_FRAME_SHA256 below
+// is the payload and must not move.
+const CODED_BYTES_SHA256 = "33bc06b4a229242eaa61843376cc6d9feaab416a31fa55b09ab6db89ea0bd938";
 const INNER_FRAME_SHA256 = "a5dcecd1058c25b13c5076e9f7d7e2617af3c830823c33831180d6a4f9976a84";
 
 interface CanonicalFixtureMetadata {
@@ -138,34 +140,46 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
   assert.equal(classified.sequencePhase, 3);
   assert.equal(classified.diagnostics.timingErrors, 0);
   assert.equal(classified.diagnostics.timingModules, 314);
-  assert.equal(classified.diagnostics.uncertainCells, 219);
-  assert.equal(classified.diagnostics.erasureBytes, 195);
-  assert.equal(classified.diagnostics.distanceRejectedCells, 124);
-  assert.equal(classified.diagnostics.gapRejectedCells, 196);
-  assert.equal(classified.diagnostics.bothRejectedCells, 101);
-  assert.deepEqual(classified.diagnostics.erasuresByShard, [26, 35, 29, 34, 34, 37]);
+  // This capture is blurred enough that a module's own light is a minority of
+  // its sample, so the classifier corrects for the interference before reading
+  // colour. Without it these counters were 219 uncertain cells and 195 erasure
+  // bytes, and three of six shards were over parity.
+  assert.equal(classified.diagnostics.isiStrength, 0.4);
+  assert.equal(classified.diagnostics.uncertainCells, 95);
+  assert.equal(classified.diagnostics.erasureBytes, 87);
+  assert.equal(classified.diagnostics.distanceRejectedCells, 75);
+  assert.equal(classified.diagnostics.gapRejectedCells, 72);
+  assert.equal(classified.diagnostics.bothRejectedCells, 52);
+  assert.deepEqual(classified.diagnostics.erasuresByShard, [13, 14, 14, 15, 18, 13]);
   assert.equal(classified.diagnostics.parityByShard, 32);
+  // Every shard now sits inside its parity budget with room to spare.
   assert.deepEqual(
     classified.diagnostics.remainingErasureBudgetByShard,
-    [6, -3, 3, -2, -2, -5],
+    [19, 18, 18, 17, 14, 19],
+  );
+  assert.ok(
+    classified.diagnostics.remainingErasureBudgetByShard.every((budget) => budget > 0),
+    "no shard may exceed its parity budget on this capture",
   );
   assert.equal(classified.diagnostics.uncertainCellsByRow.length, classified.profile.rows);
   assert.equal(classified.diagnostics.uncertainCellsByColumn.length, classified.profile.columns);
   assert.equal(
     classified.diagnostics.uncertainCellsByRow.reduce((sum, count) => sum + count, 0),
-    219,
+    95,
   );
   assert.equal(
     classified.diagnostics.uncertainCellsByColumn.reduce((sum, count) => sum + count, 0),
-    219,
+    95,
   );
+  // Uncertainty still concentrates in the bottom third of this capture, which is
+  // the part of the sending screen furthest off-axis from the camera.
   assert.deepEqual([
     classified.diagnostics.uncertainCellsByRow.slice(0, 28).reduce((sum, count) => sum + count, 0),
     classified.diagnostics.uncertainCellsByRow.slice(28, 57).reduce((sum, count) => sum + count, 0),
     classified.diagnostics.uncertainCellsByRow.slice(57).reduce((sum, count) => sum + count, 0),
-  ], [14, 31, 174]);
+  ], [3, 6, 86]);
   assert.equal(classified.diagnostics.effectiveMaximumDeltaE, 45);
-  assert.ok(classified.diagnostics.effectiveMinimumDeltaEGap > 18);
+  assert.ok(classified.diagnostics.effectiveMinimumDeltaEGap > 17);
   for (const summary of [
     classified.diagnostics.bestDeltaE,
     classified.diagnostics.deltaEGap,
@@ -176,32 +190,37 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
     assert.ok(summary.p95 <= summary.max);
   }
   assert.deepEqual(structuredClone(classified.diagnostics), classified.diagnostics);
-  assert.equal(classified.byteErasures.length, 195);
+  assert.equal(classified.byteErasures.length, 87);
   assert.deepEqual(
     erasureDistribution(classified.byteErasures, classified.profile.shards),
-    { total: 195, byShard: [26, 35, 29, 34, 34, 37] },
+    { total: 87, byShard: [13, 14, 14, 15, 18, 13] },
   );
   assert.deepEqual(classified.diagnostics.erasureCandidateScore, {
-    count: 195,
-    min: 1.0014599635981696,
-    p50: 1.6220608388842113,
-    p95: 12.534467124400843,
-    max: 62.854022931804224,
+    count: 87,
+    min: 1.000340246414468,
+    p50: 1.6532158348557915,
+    p95: 17.866086603057013,
+    max: 454.59501886870567,
   });
   assert.equal(sha256(classified.codedBytes), CODED_BYTES_SHA256);
   assert.deepEqual(metadata.oracle.classification, {
-    uncertainCells: 219,
-    candidateErasures: { total: 195, byShard: [26, 35, 29, 34, 34, 37] },
+    isiStrength: 0.4,
+    uncertainCells: 95,
+    candidateErasures: { total: 87, byShard: [13, 14, 14, 15, 18, 13] },
     erasureCandidateScore: {
-      count: 195,
-      min: 1.0014599635981696,
-      p50: 1.6220608388842113,
-      p95: 12.534467124400843,
-      max: 62.854022931804224,
+      count: 87,
+      min: 1.000340246414468,
+      p50: 1.6532158348557915,
+      p95: 17.866086603057013,
+      max: 454.59501886870567,
     },
     codedBytesSha256: CODED_BYTES_SHA256,
   });
 
+  // Marking every uncertain byte used to overrun parity on three shards, so this
+  // capture only survived via the ranked erasure ladder. With the interference
+  // corrected the raw classifier hints now fit, and the plain unwrap succeeds on
+  // its own. The ladder below still has to reach the identical payload.
   const directObservations: Color4UnwrapObservation[] = [];
   const direct = unwrapColor4Frame(classified.codedBytes, {
     profileId: classified.profile.id,
@@ -209,20 +228,25 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
     erasures: classified.byteErasures,
     observer: (observation) => directObservations.push(observation),
   });
-  assert.equal(direct.status, "rejected");
-  if (direct.status !== "rejected") return;
-  assert.equal(direct.reason, "fec-uncorrectable");
-  assert.equal(direct.diagnostics.erasures, 195);
+  assert.equal(direct.status, "valid");
+  if (direct.status !== "valid") return;
+  assert.equal(direct.diagnostics.erasures, 87);
+  assert.equal(sha256(direct.innerFrame), INNER_FRAME_SHA256);
   const directShardReasons = directObservations.flatMap((observation) =>
     observation.stage === "rs"
       ? observation.shards.map((shard) => shard.reason)
       : [],
   );
-  assert.ok(directShardReasons.includes("too-many-erasures"));
-  assert.equal(
-    fecDiagnosticReason(direct.reason, directShardReasons),
-    "COLOR_CLASSIFICATION_TOO_UNCERTAIN",
+  assert.ok(!directShardReasons.includes("too-many-erasures"));
+  // Every shard kept parity in reserve, so Reed-Solomon could still have
+  // rejected these corrections. The payload is verified, not merely solved.
+  const directMargins = directObservations.flatMap((observation) =>
+    observation.stage === "rs"
+      ? observation.shards.map((shard) => shard.verificationMargin)
+      : [],
   );
+  assert.equal(directMargins.length, classified.profile.shards);
+  assert.ok(directMargins.every((margin) => margin !== undefined && margin > 0));
 
   const coordinated = runColor4ErasurePolicy({
     codedBytes: classified.codedBytes,
@@ -235,10 +259,13 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
   assert.equal(coordinated.selectedBudgetFraction, 1);
   assert.equal(coordinated.selectedMaxErasuresPerShard, 32);
   assert.equal(coordinated.attempts.length, 1);
+  // Nothing is clipped any more: the ladder spends exactly the hints it was
+  // given, because none of them exceed a shard's parity budget.
   assert.deepEqual(
     erasureDistribution(coordinated.selectedErasures, classified.profile.shards),
-    { total: 183, byShard: [26, 32, 29, 32, 32, 32] },
+    { total: 87, byShard: [13, 14, 14, 15, 18, 13] },
   );
+  assert.deepEqual(coordinated.saturatedErasureShards, []);
 
   const unwrapped = coordinated.result;
   assert.equal(unwrapped.status, "valid");
@@ -249,8 +276,8 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
     color4SequencePhaseMatches(unwrapped.header.sequence, classified.sequencePhase),
     true,
   );
-  assert.equal(unwrapped.diagnostics.correctedErrors, 0);
-  assert.equal(unwrapped.diagnostics.correctedBytes, 47);
+  assert.equal(unwrapped.diagnostics.correctedErrors, 1);
+  assert.equal(unwrapped.diagnostics.correctedBytes, 15);
   assert.equal(unwrapped.diagnostics.correctedShards, 6);
   assert.equal(sha256(unwrapped.innerFrame), INNER_FRAME_SHA256);
 
@@ -272,9 +299,9 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
     selectedBudgetFraction: 1,
     selectedMaxErasuresPerShard: 32,
     attempts: 1,
-    selectedErasures: { total: 183, byShard: [26, 32, 29, 32, 32, 32] },
-    correctedErrors: 0,
-    correctedBytes: 47,
+    selectedErasures: { total: 87, byShard: [13, 14, 14, 15, 18, 13] },
+    correctedErrors: 1,
+    correctedBytes: 15,
     correctedShards: 6,
     innerFrameSha256: INNER_FRAME_SHA256,
   });

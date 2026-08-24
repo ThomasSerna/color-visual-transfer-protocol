@@ -250,6 +250,14 @@ function setStageFullscreen(on: boolean): void {
 stage.addEventListener("click", () => {
   setStageFullscreen(!document.body.classList.contains("qr-full"));
 });
+// Tapping the frame stays the fast path, but it is undiscoverable, and a
+// windowed sender is the most common reason a receiver never locks on: it
+// leaves the camera too few pixels per module to classify colour at all.
+document.getElementById("go-fullscreen")?.addEventListener("click", (event) => {
+  // The stage's own handler would immediately toggle it back.
+  event.stopPropagation();
+  setStageFullscreen(true);
+});
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") setStageFullscreen(false);
 });

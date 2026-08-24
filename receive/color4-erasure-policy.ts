@@ -20,6 +20,17 @@ const CLASSIFIER_BUDGET_FRACTIONS = Object.freeze([
   0.5,
 ] as const satisfies readonly Color4ErasureBudgetFraction[]);
 
+/**
+ * The full rung deliberately spends the whole parity budget. That leaves
+ * Reed-Solomon exactly enough equations to solve for the marked positions, so
+ * its closing syndrome check cannot fail and the shard result carries no
+ * self-verification (see `verificationMargin` in reed-solomon.ts). The rung is
+ * still worth trying: it genuinely recovers a shard damaged in exactly `parity`
+ * known positions, every later rung is attempted regardless of what it returns,
+ * and the outer header, CRC32C and sequence phase all re-validate the payload
+ * before a frame is accepted.
+ */
+
 export interface Color4ErasurePolicyAttempt {
   readonly policy: Color4ErasurePolicy;
   readonly budgetFraction: Color4ErasureBudgetFraction;

@@ -568,7 +568,24 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
       } else if (unwrapped.reason === "crc-mismatch") {
         updateReject(diagnostics, "crc", unwrapped.reason, "CRC_FAILED");
         diagnostics.crcFailures = 1;
-      } else updateReject(diagnostics, "wire", unwrapped.reason);
+      } else {
+        // A structural rejection after FEC "succeeded" is the signature of a
+        // saturated erasure budget: the shards were solved against more damage
+        // than they could locate. Attribute it rather than reporting the bare
+        // wire reason with no cause.
+        updateReject(
+          diagnostics,
+          "wire",
+          unwrapped.reason,
+          actionableDiagnosticReason(
+            raster,
+            classifierObservations,
+            erasurePolicy.selectedObservations,
+            unwrapped.reason,
+            erasurePolicy.saturatedErasureShards,
+          ),
+        );
+      }
       postRejected(
         request,
         unwrapped.reason,

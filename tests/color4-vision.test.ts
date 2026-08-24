@@ -125,13 +125,28 @@ test("fiducial center uses the perspective-invariant diagonal intersection", () 
 test("homography refinement is bounded to one recoverable residual", () => {
   assert.equal(shouldRefineHomography(undefined), false);
   assert.equal(shouldRefineHomography(0.25), false);
-  assert.equal(shouldRefineHomography(0.5), true);
+  assert.equal(shouldRefineHomography(0.5), false);
+  assert.equal(shouldRefineHomography(0.51), true);
   assert.equal(shouldRefineHomography(1.25), true);
   assert.equal(shouldRefineHomography(1.26), false);
   assert.equal(refinementImprovesHomography(1, 0.5), true);
   assert.equal(refinementImprovesHomography(1, 0.76), false);
   assert.equal(refinementImprovesHomography(0.4, 0.3), true);
   assert.equal(refinementImprovesHomography(0.4, 0.31), false);
+});
+
+test("a warp already at the acceptance bar is not refined", () => {
+  // Residuals between the old 0.25 trigger and the 0.5 acceptance bar could
+  // never clear the "at least 25% better" test, so every such frame paid for a
+  // full second marker search and threw the result away. 0.307 is the residual
+  // measured on capture-000013, where refinement cost 2297 ms and was rejected.
+  for (const residual of [0.26, 0.307, 0.4, 0.49, 0.5]) {
+    assert.equal(shouldRefineHomography(residual), false, `residual ${residual}`);
+  }
+  // Above the bar the warp is genuinely worse than what refinement must reach,
+  // so the second pass can still pay for itself.
+  assert.equal(shouldRefineHomography(0.8), true);
+  assert.equal(refinementImprovesHomography(0.8, 0.45), true);
 });
 
 test("contour over-budget sampling is uniform, bounded, and includes both endpoints", () => {
@@ -204,10 +219,14 @@ function fakeOpenCv(
     new Int32Array([10, 80, 19, 80, 19, 89, 10, 89]),
   ];
   const ids: FiducialId[] = ["TL", "TR", "BR", "BL"];
+  // A uniform horizontal offset of N pixels lands the refinement pass at exactly
+  // N / canonicalScale modules of residual. Five pixels puts it above the 0.5
+  // module refinement trigger, which is what the refinement branches need to run.
+  const REFINEMENT_QUAD_OFFSET_PX = 5;
   const refinementQuads = FIDUCIALS.map((marker) => {
-    const left = (QUIET_MODULES + marker.x) * 6 + 3;
+    const left = (QUIET_MODULES + marker.x) * 6 + REFINEMENT_QUAD_OFFSET_PX;
     const top = (QUIET_MODULES + marker.y) * 6;
-    const right = (QUIET_MODULES + marker.x + marker.width) * 6 - 1 + 3;
+    const right = (QUIET_MODULES + marker.x + marker.width) * 6 - 1 + REFINEMENT_QUAD_OFFSET_PX;
     const bottom = (QUIET_MODULES + marker.y + marker.height) * 6 - 1;
     return new Int32Array([left, top, right, top, right, bottom, left, bottom]);
   });
@@ -454,11 +473,14 @@ function fakeOpenCv(
       transform.rows = 3;
       transform.cols = 3;
       transform.projectedValues = [...((destination as FakeMatShape).values ?? [])];
+      // 4.8 px / scale 6 = 0.8 modules: above the refinement trigger, so the
+      // first warp is genuinely worse than the bar a correction must clear.
+      // The correction then lands at 0.1 modules (adopted) or 0.7 (too poor).
       transform.residualPixels = fakeStats.homographyCalls === 1
-        ? 3
+        ? 4.8
         : refinement === "apply"
           ? 0.6
-          : 2.4;
+          : 4.2;
       return transform;
     };
     runtime.perspectiveTransform = (_source, destination, transform) => {
@@ -573,6 +595,51 @@ test("candidate floods are bucketed per threshold pass and only the top 256 are 
   assert.ok(decoded.every((trace) => trace.candidateScore?.passSupport === 3));
 });
 
+test("a clean set of four fiducials stops the candidate sweep early", () => {
+  installImageDataForNode();
+  // Same 2,100-candidate flood as the test above, but without debug collection.
+  // Each candidate costs a perspective warp and a marker decode, and the real
+  // fiducials sort to the front, so the sweep has no reason to keep going.
+  const cv = fakeOpenCv(false, false, false, "none", false, false, true);
+  const result = normalizeColor4WithOpenCv(
+    cv,
+    1000,
+    1000,
+    new Uint8ClampedArray(1000 * 1000 * 4),
+    { maxDetectionDimension: "source" },
+  );
+
+  assert.equal(result.status, "valid");
+  assert.equal(result.diagnostics.counters.candidateCountRanked, 256);
+  // All four markers are still present, and each stopped the sweep because it
+  // decoded without a single bit error.
+  for (const id of ["TL", "TR", "BR", "BL"] as const) {
+    assert.equal(result.diagnostics.fiducials[id]?.errors, 0, id);
+  }
+  // 256 candidates were ranked, but the four genuine markers sort to the front,
+  // so only four are ever warped and decoded.
+  assert.equal(cv.fakeStats.candidateWarps, 4, `warps=${cv.fakeStats.candidateWarps}`);
+  assert.equal(cv.fakeStats.candidateWarps >= 4, true);
+});
+
+test("debug collection keeps the full candidate sweep", () => {
+  installImageDataForNode();
+  // Traces describe every candidate, so the early exit must stay off whenever a
+  // debug snapshot is being assembled — otherwise the bundle would silently
+  // describe a truncated view of the frame.
+  const cv = fakeOpenCv(false, false, false, "none", false, false, true);
+  const result = normalizeColor4WithOpenCv(
+    cv,
+    1000,
+    1000,
+    new Uint8ClampedArray(1000 * 1000 * 4),
+    { maxDetectionDimension: "source", debug: true, debugView: "fiducials" },
+  );
+
+  assert.equal(result.status, "valid");
+  assert.equal(cv.fakeStats.candidateWarps, 256);
+});
+
 test("camera-stage fiducials require 30 luma levels without relaxing Hamming four", () => {
   installImageDataForNode();
   const cv = fakeOpenCv(false, false, false, "none", false, true);
@@ -669,17 +736,17 @@ for (const [mode, applied, expectedWarps] of [
         JSON.stringify({ homography: result.diagnostics.homography, stats: cv.fakeStats }),
       );
       assert.ok(
-        Math.abs((result.diagnostics.homography.residualRmsModules ?? 0) - 0.5) < 1e-6,
+        Math.abs((result.diagnostics.homography.residualRmsModules ?? 0) - 0.8) < 1e-6,
       );
       assert.ok(
         Math.abs(
-          (result.diagnostics.homography.refinementResidualBeforeRmsModules ?? 0) - 0.5,
+          (result.diagnostics.homography.refinementResidualBeforeRmsModules ?? 0) - 5 / 6,
         ) < 1e-6,
       );
       assert.ok(
         Math.abs(
           (result.diagnostics.homography.refinementResidualAfterRmsModules ?? 0) -
-            (mode === "apply" ? 0.1 : 0.4),
+            (mode === "apply" ? 0.1 : 0.7),
         ) < 1e-5,
       );
       assert.equal(cv.fakeStats.homographyCalls, 2);

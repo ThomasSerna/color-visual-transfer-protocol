@@ -273,9 +273,21 @@ const THRESHOLD_PASSES: readonly Readonly<{
   Object.freeze({ id: "adaptive-21-5", kind: "adaptive", blockSize: 21, constant: 5 }),
   Object.freeze({ id: "otsu", kind: "otsu" }),
 ]);
-const REFINEMENT_MINIMUM_RMS_MODULES = 0.25;
 const REFINEMENT_MAXIMUM_RMS_MODULES = 1.25;
 const REFINEMENT_ACCEPTED_RMS_MODULES = 0.5;
+/**
+ * Refinement re-runs the whole marker search over the warped canonical frame,
+ * which costs more than every other vision stage combined. It is only worth
+ * paying when the current warp is worse than the quality a refinement would
+ * have to reach to be adopted, so the trigger is tied to the acceptance bar
+ * rather than sitting below it.
+ *
+ * The two used to be independent (trigger above 0.25, adopt only below 0.5 and
+ * at least 25% better). Residuals in the 0.25-0.4 band therefore always ran the
+ * full second pass and always failed the 25% test: measured on a real capture,
+ * 2297 ms of a 5289 ms frame spent to discard the result every time.
+ */
+const REFINEMENT_MINIMUM_RMS_MODULES = REFINEMENT_ACCEPTED_RMS_MODULES;
 
 export function shouldRefineHomography(residualRmsModules: number | undefined): boolean {
   return residualRmsModules !== undefined &&
@@ -1028,6 +1040,12 @@ function findMarkers(
     if (ranked.length < merged.length) warningSet.add("CANDIDATE_BUDGET_RANKED");
     const markers = new Map<FiducialId, MarkerCandidate>();
     for (const proposal of ranked) {
+      // Every candidate costs a perspective warp plus a marker decode, and the
+      // ranking already puts genuine fiducials first. Once all four IDs have
+      // decoded without a single bit error there is nothing better left to find,
+      // so scanning the remaining candidates is pure latency. Debug collection
+      // keeps the full sweep because its traces describe every candidate.
+      if (!collectDebug && allFiducialsDecodedCleanly(markers)) break;
       const detectionQuad = proposal.detectionQuad;
       const quad = sourceQuad(detectionQuad, scale);
       const center = projectiveQuadCenter(quad);
@@ -1364,6 +1382,17 @@ function debugArtifacts(
 }
 
 const ORDERED_FIDUCIAL_IDS: readonly FiducialId[] = Object.freeze(["TL", "TR", "BR", "BL"]);
+
+/**
+ * True when all four markers are present and each decoded with zero Hamming
+ * errors. Only a bit-perfect set is treated as final: a marker carrying errors
+ * may still be beaten by a later, better-scoring candidate for the same ID.
+ */
+function allFiducialsDecodedCleanly(
+  markers: ReadonlyMap<FiducialId, MarkerCandidate>,
+): boolean {
+  return ORDERED_FIDUCIAL_IDS.every((id) => markers.get(id)?.errors === 0);
+}
 
 interface HomographySolution {
   readonly method: Exclude<VisionHomographyMethod, "none">;

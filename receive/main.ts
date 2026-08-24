@@ -72,6 +72,7 @@ import {
   type CaptureStabilityResult,
 } from "./color4-capture-stability";
 import { classifyColor4CaptureQuality } from "./color4-capture-quality";
+import { Color4FramingAdviceTracker } from "./color4-framing-advice";
 
 const startBtn = document.getElementById("start") as HTMLButtonElement;
 const video = document.getElementById("video") as HTMLVideoElement;
@@ -110,8 +111,10 @@ const exportMetricsBtn = document.getElementById("export-metrics") as HTMLButton
 const clearMetricsBtn = document.getElementById("clear-metrics") as HTMLButtonElement;
 const cameraActual = document.getElementById("camera-actual")!;
 const noSignalToast = document.getElementById("no-signal")!;
+const noSignalHeadline = document.getElementById("no-signal-headline")!;
 const noSignalDialog = document.getElementById("no-signal-dialog") as HTMLDialogElement;
 const noSignalTips = document.getElementById("no-signal-tips")!;
+const NO_SIGNAL_DEFAULT_HEADLINE = noSignalHeadline.textContent ?? "Nothing happening?";
 const metric = (id: string) => document.getElementById(id)!;
 
 // Nothing has decoded in this long → the sender is almost certainly too dense
@@ -161,6 +164,8 @@ let lastSubmittedStableIntervalEpoch: number | undefined;
 const COLOR4_STABILITY_THRESHOLD = 0.025;
 
 const noSignal = new NoSignalHintTimer(NO_SIGNAL_FIRST_MS, NO_SIGNAL_DISMISSED_MS);
+/** Why recent COLOR_4 captures were unreadable, once enough of them agree. */
+const framingAdvice = new Color4FramingAdviceTracker();
 const captureTimes: number[] = [];
 const decodeTimes: number[] = [];
 let latestCarrierDiagnostics: BrowserCarrierDiagnostics | undefined;
@@ -422,13 +427,23 @@ function renderNoSignalTips(): void {
     "Fill this camera's view with the code, and prop the phone against something — autofocus hunting from hand tremor is the usual culprit.",
     "Turn the sending screen's brightness all the way up.",
   ];
+  // Measured advice goes first: generic troubleshooting is a guess, and this is
+  // the one thing the receiver actually knows about the frames it is seeing.
+  const measuredTips = measuredFramingAdvice()?.tips ?? [];
+  const lines = [...measuredTips, ...carrierTips, ...commonTips];
   noSignalTips.replaceChildren(
-    ...[...carrierTips, ...commonTips].map((line) => {
+    ...lines.map((line) => {
       const item = document.createElement("li");
       item.textContent = line;
       return item;
     }),
   );
+}
+
+/** Framing advice is COLOR_4-only: the QR path measures none of these inputs. */
+function measuredFramingAdvice() {
+  if (!__COLOR4_ENABLED__ || currentCarrier() !== "color4") return undefined;
+  return framingAdvice.advice;
 }
 
 document.getElementById("no-signal-help")!.addEventListener("click", () => {
@@ -826,6 +841,10 @@ function captureFrame() {
     }
     if (!stability.shouldSubmit) {
       if (stability.state === "unstable") experiment?.recordSkippedUnstable();
+      // A capture dropped before decoding never reaches the worker callback, so
+      // record it here or a receiver that gates on stability would collect no
+      // evidence at all about why it is stuck.
+      framingAdvice.observe({ stability: stability.state, vision: undefined });
       return;
     }
     if (
@@ -888,6 +907,10 @@ function captureFrame() {
           experiment?.recordQualityClass(classifyColor4CaptureQuality(stability?.state, diagnostics.vision));
           qualityRecorded = true;
         }
+        // The same measurements that feed the experiment counters are the only
+        // evidence the user has for why nothing is decoding, so keep a rolling
+        // verdict ready for the hint.
+        framingAdvice.observe({ stability: stability?.state, vision: diagnostics.vision });
         if (decoded.debug && visionDebugController) {
           visionDebugController.handleFrame({
             ...decoded.debug,
@@ -948,6 +971,9 @@ function onDecoded(bytes: Uint8Array) {
   if (!parsed || done) return;
   const { header, block } = parsed;
   if (header.k !== Math.ceil(header.totalLen / header.blockLen)) return;
+  // The link demonstrably works, so whatever the earlier captures were
+  // complaining about is history and must not resurface later in the transfer.
+  framingAdvice.reset();
   if (noSignal.frameDecoded()) {
     noSignalToast.hidden = true;
     // The dialog's premise ("nothing decoded") just became false mid-read.
@@ -1211,6 +1237,10 @@ async function servableMediaUrl(file: OpticalFile, blobUrl: string): Promise<str
  * parses, which is the only thing that actually means it worked.
  */
 function showNoSignalHint() {
+  // "Nothing happening?" is all we can say when the receiver has no idea why.
+  // When the captures agree on a cause, lead with the fix instead.
+  noSignalHeadline.textContent =
+    measuredFramingAdvice()?.headline ?? NO_SIGNAL_DEFAULT_HEADLINE;
   noSignalToast.hidden = false;
 }
 
@@ -1286,7 +1316,9 @@ function updateStats() {
         }`
       : "—";
   }
-  if (noSignal.tick(now)) showNoSignalHint();
+  // Evidence keeps arriving while the hint is on screen, so a verdict that only
+  // reaches quorum after it appeared still gets to replace the generic line.
+  if (noSignal.tick(now) || noSignal.isVisible) showNoSignalHint();
   if (!decoder) return;
   const elapsed = (now - startTs) / 1000;
   updateProgressEstimate();
