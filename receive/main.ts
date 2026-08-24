@@ -137,6 +137,12 @@ let captureGen = 0;
 let done = false;
 let settingsWired = false;
 const manualCaptureWidths = new Map<CarrierChoice, string>();
+const manualWorkers = new Map<CarrierChoice, string>();
+
+/** QR decode workers are cheap; a COLOR_4 vision worker carries all of OpenCV. */
+function defaultWorkerCount(carrier: CarrierChoice): number {
+  return carrier === "color4" ? 1 : 2;
+}
 const manualCaptureFps = new Map<CarrierChoice, string>();
 let statsTimer: ReturnType<typeof setInterval> | undefined;
 let activeCarrier: CarrierChoice | null = null;
@@ -211,6 +217,10 @@ function applyCarrierControls(): void {
   }
   cfgWidth.value = manualCaptureWidths.get(carrier) ?? String(defaultCaptureWidth(carrier));
   cfgCapFps.value = manualCaptureFps.get(carrier) ?? String(defaultCaptureFps(carrier));
+  // Both carriers decode in a worker pool, but they want different defaults: a
+  // ZXing worker holds ~940 KB of WASM, a COLOR_4 vision worker holds a whole
+  // OpenCV build. COLOR_4 therefore starts at one and lets the user opt in.
+  cfgWorkers.value = manualWorkers.get(carrier) ?? String(defaultWorkerCount(carrier));
   qrSettings.forEach((element) => { element.hidden = carrier !== "qr"; });
   colorSettings.forEach((element) => { element.hidden = carrier !== "color4"; });
 }
@@ -236,6 +246,10 @@ cfgWidth.addEventListener("change", () => {
 
 cfgCapFps.addEventListener("change", () => {
   manualCaptureFps.set(currentCarrier(), cfgCapFps.value);
+});
+
+cfgWorkers.addEventListener("change", () => {
+  manualWorkers.set(currentCarrier(), cfgWorkers.value);
 });
 
 function captureWidthChoice(): CaptureWidthChoice {
@@ -543,7 +557,7 @@ async function start() {
       ]);
       if (startGeneration !== captureGen) return;
       const paletteId = Number(cfgColorPalette!.value) === 1 ? 1 : 0;
-      colorDecoder = module.createColor4Decoder(paletteId);
+      colorDecoder = module.createColor4Decoder(paletteId, Number(cfgWorkers.value));
       startBtn.textContent = "Initializing COLOR_4 vision…";
       await colorDecoder.ready;
       if (startGeneration !== captureGen) {
@@ -696,8 +710,9 @@ function reportCameraSettings(note?: string) {
     : s.width !== undefined && s.width !== askedWidth
       ? ` (asked ${askedWidth})`
       : "";
+  const colorWorkers = colorDecoder?.size ?? 0;
   const workers = __COLOR4_ENABLED__ && activeCarrier === "color4"
-    ? "1 COLOR_4 vision worker"
+    ? `${colorWorkers} COLOR_4 vision worker${colorWorkers === 1 ? "" : "s"}`
     : `${qrDecoder?.size ?? 0} QR decode worker${qrDecoder?.size === 1 ? "" : "s"}`;
   cameraActual.textContent =
     `camera ${s.width}×${s.height}${widthNote} @ ${gotFps} fps${fpsNote} · ${workers} · ` +
@@ -743,7 +758,13 @@ async function applyReceiveSettings(
 ): Promise<void> {
   // finish() has already torn the pool down — don't resurrect it.
   if (done || generation !== captureGen) return;
+  // A QR worker can join or leave a live pool cheaply. A COLOR_4 worker has to
+  // load and initialize its own OpenCV build first, so a live change would
+  // stall the very pipeline it is meant to widen: it takes effect on restart.
   if (activeCarrier === "qr") qrDecoder?.resize(workerCount);
+  else if (colorDecoder && workerCount !== colorDecoder.size) {
+    reportCameraSettings("worker count applies on the next Start camera");
+  }
   const track = stream?.getVideoTracks()[0];
   if (!track) return;
   try {
