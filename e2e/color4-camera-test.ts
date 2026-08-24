@@ -6,6 +6,16 @@ import {
   COLOR4_CAMERA_SCHEDULE,
 } from "./global-setup";
 
+interface Color4CameraExpectation {
+  readonly prefilterMode?: "observe" | "enabled";
+  /** Which profile the fake camera is transmitting; the receiver auto-detects it. */
+  readonly profile?: "ROBUST" | "EXPERIMENTAL";
+  readonly payload?: Uint8Array;
+  readonly fileName?: string;
+  /** LT source blocks the fixture must resolve. */
+  readonly resolvedBlocks?: number;
+}
+
 /**
  * Shared assertions for both fake-camera projects. Keeping the receiver flow
  * here makes the degraded project exercise the same contract as the baseline
@@ -13,8 +23,12 @@ import {
  */
 export async function expectColor4CameraReconstruction(
   page: Page,
-  options: { readonly prefilterMode?: "observe" | "enabled" } = {},
+  options: Color4CameraExpectation = {},
 ): Promise<void> {
+  const profile = options.profile ?? "ROBUST";
+  const payload = options.payload ?? COLOR4_CAMERA_PAYLOAD;
+  const fileName = options.fileName ?? "camera-e2e.bin";
+  const resolvedBlocks = options.resolvedBlocks ?? 2;
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   const openCvLoaded = page.waitForResponse(
@@ -53,18 +67,16 @@ export async function expectColor4CameraReconstruction(
         `Live COLOR_4 metrics: ${JSON.stringify(exportRecord?.current ?? null)}`,
     );
   }
-  await expect(page.locator('#result a[download="camera-e2e.bin"]')).toHaveText(
-    "Save camera-e2e.bin",
-  );
+  await expect(page.locator(`#result a[download="${fileName}"]`)).toHaveText(`Save ${fileName}`);
   await expect(page.locator("#result .hint")).toContainText("SHA-256 verified");
-  const recovered = await page.locator('#result a[download="camera-e2e.bin"]').evaluate(
+  const recovered = await page.locator(`#result a[download="${fileName}"]`).evaluate(
     async (anchor: HTMLAnchorElement) =>
       Array.from(new Uint8Array(await (await fetch(anchor.href)).arrayBuffer())),
   );
   const recoveredBytes = Buffer.from(recovered);
-  expect(recoveredBytes).toEqual(Buffer.from(COLOR4_CAMERA_PAYLOAD));
+  expect(recoveredBytes).toEqual(Buffer.from(payload));
   expect(createHash("sha256").update(recoveredBytes).digest("hex")).toBe(
-    createHash("sha256").update(COLOR4_CAMERA_PAYLOAD).digest("hex"),
+    createHash("sha256").update(payload).digest("hex"),
   );
   expect(COLOR4_CAMERA_SCHEDULE.filter((entry) => entry.sequence === 1)).toHaveLength(2);
   await expect(page.locator("#m-carrier")).toContainText(/^\d+\/\d+$/);
@@ -103,7 +115,7 @@ export async function expectColor4CameraReconstruction(
   expect(metrics.history).toHaveLength(1);
   expect(metrics.history[0]).toMatchObject({
     carrier: "COLOR_4",
-    profile: "ROBUST",
+    profile,
     success: true,
     cameraWidth: 1280,
     cameraHeight: 960,
@@ -116,7 +128,7 @@ export async function expectColor4CameraReconstruction(
   expect(metrics.history[0]!.validFrames).toBe(
     metrics.history[0]!.newFrames + metrics.history[0]!.duplicateFrames,
   );
-  expect(metrics.history[0]!.resolvedBlocks).toBe(2);
+  expect(metrics.history[0]!.resolvedBlocks).toBe(resolvedBlocks);
   expect(metrics.history[0]!.crcFailures).toBe(0);
   expect(
     (metrics.history[0]!.stableCaptures ?? 0) +

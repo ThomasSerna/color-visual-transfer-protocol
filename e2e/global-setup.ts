@@ -4,6 +4,7 @@ import { writeFile } from "node:fs/promises";
 import { LTDecoder, LTEncoder } from "../shared/fountain";
 import { fnv1a, packFile, packFrame } from "../shared/protocol";
 import {
+  EXPERIMENTAL_PROFILE,
   ROBUST_PROFILE,
   rasterizeColor4,
   wrapColor4Frame,
@@ -13,6 +14,10 @@ export const COLOR4_CAMERA_FIXTURE = join(tmpdir(), "cvtp-color4-playwright.y4m"
 export const COLOR4_CAMERA_DEGRADED_FIXTURE = join(
   tmpdir(),
   "cvtp-color4-playwright-degraded.y4m",
+);
+export const COLOR4_CAMERA_EXPERIMENTAL_FIXTURE = join(
+  tmpdir(),
+  "cvtp-color4-playwright-experimental.y4m",
 );
 
 /**
@@ -30,9 +35,9 @@ export const COLOR4_CAMERA_SCHEDULE = [
   { sequence: 0, hold: 4 },
 ] as const;
 
-export const COLOR4_CAMERA_PAYLOAD = (() => {
-  const bytes = new Uint8Array(2_048);
-  let state = 0x6d2b79f5;
+function incompressiblePayload(length: number, seed: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  let state = seed >>> 0;
   for (let index = 0; index < bytes.length; index++) {
     // Deterministic xorshift32 output is deliberately incompressible enough to
     // keep packFile() on the uncompressed path and the fixture at k > 1.
@@ -42,7 +47,17 @@ export const COLOR4_CAMERA_PAYLOAD = (() => {
     bytes[index] = state >>> 24;
   }
   return bytes;
-})();
+}
+
+export const COLOR4_CAMERA_PAYLOAD = incompressiblePayload(2_048, 0x6d2b79f5);
+
+/**
+ * EXPERIMENTAL carries 3,306 bytes per LT block against ROBUST's 1,298, so the
+ * ROBUST payload would collapse this fixture to k = 1 and stop exercising the
+ * fountain. 5,000 bytes packs to a 5,100-byte container, which is k = 2 — the
+ * same shape the schedule above is written for.
+ */
+export const COLOR4_EXPERIMENTAL_PAYLOAD = incompressiblePayload(5_000, 0x1b8f3c27);
 
 const WIDTH = 1280;
 const HEIGHT = 960;
@@ -63,6 +78,18 @@ const DEGRADED_CAMERA_QUAD: CameraQuad = [
   { x: 1090, y: 140 },
   { x: 1050, y: 885 },
   { x: 165, y: 820 },
+];
+/**
+ * EXPERIMENTAL packs 120x119 data cells into the same 172-module frame, so it
+ * needs the code to fill more of the camera view than ROBUST does. This quad
+ * spans roughly 860 px, about 5.0 camera pixels per module — the regime the
+ * physical exports actually report, rather than a comfortable one.
+ */
+const EXPERIMENTAL_CAMERA_QUAD: CameraQuad = [
+  { x: 208, y: 48 },
+  { x: 1072, y: 76 },
+  { x: 1048, y: 912 },
+  { x: 186, y: 884 },
 ];
 
 function clampByte(value: number): number {
@@ -336,21 +363,40 @@ function cameraTimeline(frames: ReadonlyMap<number, Uint8Array>): Uint8Array[] {
   return timeline;
 }
 
-export default async function globalSetup(): Promise<void> {
-  const packed = await packFile(
-    "camera-e2e.bin",
-    "application/octet-stream",
-    COLOR4_CAMERA_PAYLOAD,
-  );
-  const sessionId = 0x4242;
-  const fountain = new LTEncoder(packed.container, ROBUST_PROFILE.blockBytes, sessionId);
-  if (fountain.k <= 1) throw new Error("The camera E2E fixture must span multiple LT blocks.");
+interface CameraFixtureVariant {
+  /** Name for the y4m rasters this variant produces. */
+  readonly label: string;
+  readonly renderer: (
+    raster: ReturnType<typeof rasterizeColor4>,
+    sequence: number,
+  ) => Uint8ClampedArray;
+  readonly path: string;
+}
 
-  const baselineFrameForSequence = new Map<number, Uint8Array>();
-  const degradedFrameForSequence = new Map<number, Uint8Array>();
+/**
+ * Render one profile's fountain stream into every requested camera variant.
+ *
+ * The LT probe is deliberately run against the same schedule the timeline uses:
+ * a fixture that cannot reconstruct its own container is a broken gate, and it
+ * should fail here rather than as a mysterious browser timeout.
+ */
+async function writeCameraFixtures(
+  profile: typeof ROBUST_PROFILE,
+  fileName: string,
+  payload: Uint8Array,
+  sessionId: number,
+  variants: readonly CameraFixtureVariant[],
+): Promise<void> {
+  const packed = await packFile(fileName, "application/octet-stream", payload);
+  const fountain = new LTEncoder(packed.container, profile.blockBytes, sessionId);
+  if (fountain.k <= 1) {
+    throw new Error(`The ${profile.name} camera E2E fixture must span multiple LT blocks.`);
+  }
+
+  const framesByVariant = variants.map(() => new Map<number, Uint8Array>());
   const probe = new LTDecoder(
     fountain.k,
-    ROBUST_PROFILE.blockBytes,
+    profile.blockBytes,
     sessionId,
     packed.container.length,
   );
@@ -359,48 +405,94 @@ export default async function globalSetup(): Promise<void> {
     for (let held = 0; held < entry.hold; held++) {
       probe.addFrame(entry.sequence, block);
     }
-    if (baselineFrameForSequence.has(entry.sequence)) continue;
+    if (framesByVariant[0]!.has(entry.sequence)) continue;
     const inner = packFrame(
       {
         sessionId,
         seq: entry.sequence,
         k: fountain.k,
-        blockLen: ROBUST_PROFILE.blockBytes,
+        blockLen: profile.blockBytes,
         totalLen: packed.container.length,
         payloadFnv: fnv1a(packed.container),
       },
       block,
     );
-    const encoded = wrapColor4Frame(inner, {
-      profileId: ROBUST_PROFILE.id,
-      paletteId: 0,
-    });
+    const encoded = wrapColor4Frame(inner, { profileId: profile.id, paletteId: 0 });
     const raster = rasterizeColor4(encoded.codedBytes, {
-      profile: ROBUST_PROFILE,
+      profile,
       paletteId: 0,
       sequence: entry.sequence,
       moduleScale: 4,
     });
-    baselineFrameForSequence.set(entry.sequence, rgbaToI420(cameraRgba(raster)));
-    degradedFrameForSequence.set(
-      entry.sequence,
-      rgbaToI420(degradedCameraRgba(raster, entry.sequence)),
-    );
+    variants.forEach((variant, index) => {
+      framesByVariant[index]!.set(
+        entry.sequence,
+        rgbaToI420(variant.renderer(raster, entry.sequence)),
+      );
+    });
   }
   if (!probe.isComplete || probe.framesNew < 2 || probe.framesDup < 1) {
-    throw new Error("The camera E2E schedule must reconstruct with new and duplicate LT frames.");
+    throw new Error(
+      `The ${profile.name} camera E2E schedule must reconstruct with new and duplicate LT frames.`,
+    );
   }
   const assembled = probe.assemble();
   if (!assembled || !assembled.every((byte, index) => byte === packed.container[index])) {
-    throw new Error("The camera E2E schedule did not reconstruct its DCF2 container exactly.");
+    throw new Error(
+      `The ${profile.name} camera E2E schedule did not reconstruct its DCF2 container exactly.`,
+    );
   }
 
-  await writeFile(
-    COLOR4_CAMERA_FIXTURE,
-    y4mFixture(cameraTimeline(baselineFrameForSequence)),
+  await Promise.all(variants.map((variant, index) =>
+    writeFile(variant.path, y4mFixture(cameraTimeline(framesByVariant[index]!)))
+  ));
+}
+
+export default async function globalSetup(): Promise<void> {
+  await writeCameraFixtures(
+    ROBUST_PROFILE,
+    "camera-e2e.bin",
+    COLOR4_CAMERA_PAYLOAD,
+    0x4242,
+    [
+      {
+        label: "baseline",
+        renderer: (raster) => cameraRgba(raster),
+        path: COLOR4_CAMERA_FIXTURE,
+      },
+      {
+        label: "degraded",
+        renderer: (raster, sequence) => degradedCameraRgba(raster, sequence),
+        path: COLOR4_CAMERA_DEGRADED_FIXTURE,
+      },
+    ],
   );
-  await writeFile(
-    COLOR4_CAMERA_DEGRADED_FIXTURE,
-    y4mFixture(cameraTimeline(degradedFrameForSequence)),
+
+  // EXPERIMENTAL had no end-to-end coverage at all: every fake-camera project
+  // exercised ROBUST, so nothing caught a regression that only reached the
+  // denser profile. It uses the single-module glare rather than the baseline's
+  // multi-module highlight, because 16 parity symbols per shard cannot absorb
+  // the same damage 32 can.
+  await writeCameraFixtures(
+    EXPERIMENTAL_PROFILE,
+    "camera-e2e-experimental.bin",
+    COLOR4_EXPERIMENTAL_PAYLOAD,
+    // The LT degree distribution is seeded from the session id, so a schedule
+    // that peels for one session need not peel for another. This one makes
+    // sequences 1/2/3 redundant degree-two equations and sequence 0 the
+    // degree-one equation that starts the cascade, matching the schedule's
+    // intent; the probe below fails the build if that ever stops holding.
+    0x4300,
+    [
+      {
+        label: "experimental",
+        renderer: (raster) => {
+          const rgba = cameraRgba(raster, false, EXPERIMENTAL_CAMERA_QUAD);
+          addDegradedDataGlare(rgba);
+          return rgba;
+        },
+        path: COLOR4_CAMERA_EXPERIMENTAL_FIXTURE,
+      },
+    ],
   );
 }

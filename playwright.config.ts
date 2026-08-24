@@ -1,6 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 import {
   COLOR4_CAMERA_DEGRADED_FIXTURE,
+  COLOR4_CAMERA_EXPERIMENTAL_FIXTURE,
   COLOR4_CAMERA_FIXTURE,
 } from "./e2e/global-setup";
 
@@ -27,7 +28,7 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      testIgnore: /color4-degraded\.spec\.ts/,
+      testIgnore: /color4-(degraded|experimental)\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         permissions: ["camera"],
@@ -48,8 +49,19 @@ export default defineConfig({
       },
     },
     {
+      name: "chromium-color4-experimental",
+      testMatch: /color4-experimental\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        permissions: ["camera"],
+        launchOptions: {
+          args: fakeCameraArgs(COLOR4_CAMERA_EXPERIMENTAL_FIXTURE),
+        },
+      },
+    },
+    {
       name: "webkit",
-      testIgnore: /color4-degraded\.spec\.ts/,
+      testIgnore: /color4-(degraded|experimental)\.spec\.ts/,
       use: { ...devices["Desktop Safari"] },
     },
   ],

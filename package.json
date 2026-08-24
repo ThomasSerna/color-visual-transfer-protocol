@@ -17,7 +17,7 @@
     "build:standalone": "node -e \"require('node:fs').rmSync('dist-standalone',{recursive:true,force:true})\" && npm run typecheck && vite build --mode standalone-send && vite build --mode standalone-receive",
     "build:all": "npm run build && npm run build:standalone",
     "test:e2e": "playwright test",
-    "test:e2e:color4": "playwright test --project=chromium --project=chromium-color4-degraded --grep \"COLOR_4 camera\"",
+    "test:e2e:color4": "playwright test --project=chromium --project=chromium-color4-degraded --project=chromium-color4-experimental --grep \"COLOR_4 camera\"",
     "test:e2e:install": "playwright install chromium webkit",
     "preview": "vite preview",
     "icons": "node --import tsx build/make-icons.ts",
