@@ -137,13 +137,13 @@ let captureGen = 0;
 let done = false;
 let settingsWired = false;
 const manualCaptureWidths = new Map<CarrierChoice, string>();
+const manualCaptureFps = new Map<CarrierChoice, string>();
 const manualWorkers = new Map<CarrierChoice, string>();
 
 /** QR decode workers are cheap; a COLOR_4 vision worker carries all of OpenCV. */
 function defaultWorkerCount(carrier: CarrierChoice): number {
   return carrier === "color4" ? 1 : 2;
 }
-const manualCaptureFps = new Map<CarrierChoice, string>();
 let statsTimer: ReturnType<typeof setInterval> | undefined;
 let activeCarrier: CarrierChoice | null = null;
 let colorDecoder: Color4CameraDecoder | null = null;
@@ -184,7 +184,11 @@ const COLOR4_STABILITY_THRESHOLD = 0.025;
 
 const noSignal = new NoSignalHintTimer(NO_SIGNAL_FIRST_MS, NO_SIGNAL_DISMISSED_MS);
 /** Why recent COLOR_4 captures were unreadable, once enough of them agree. */
-const framingAdvice = new Color4FramingAdviceTracker();
+// COLOR_4-only, and constructed conditionally so it is not merely unused in the
+// QR-only standalone build but absent from it. Its advice strings name the
+// COLOR_4 carrier, and a live reference to the tracker was retaining them in an
+// artifact the carrier-isolation E2E requires to contain no COLOR_4 payload.
+const framingAdvice = __COLOR4_ENABLED__ ? new Color4FramingAdviceTracker() : undefined;
 const captureTimes: number[] = [];
 const decodeTimes: number[] = [];
 let latestCarrierDiagnostics: BrowserCarrierDiagnostics | undefined;
@@ -470,7 +474,7 @@ function renderNoSignalTips(): void {
 /** Framing advice is COLOR_4-only: the QR path measures none of these inputs. */
 function measuredFramingAdvice() {
   if (!__COLOR4_ENABLED__ || currentCarrier() !== "color4") return undefined;
-  return framingAdvice.advice;
+  return framingAdvice?.advice;
 }
 
 document.getElementById("no-signal-help")!.addEventListener("click", () => {
@@ -895,7 +899,7 @@ function submitColor4Frame(
       // The same measurements that feed the experiment counters are the only
       // evidence the user has for why nothing is decoding, so keep a rolling
       // verdict ready for the hint.
-      framingAdvice.observe({ stability: stability?.state, vision: diagnostics.vision });
+      framingAdvice?.observe({ stability: stability?.state, vision: diagnostics.vision });
       if (decoded.debug && visionDebugController) {
         visionDebugController.handleFrame({
           ...decoded.debug,
@@ -956,7 +960,7 @@ function captureFrame() {
       // A capture dropped before decoding never reaches the worker callback, so
       // record it here or a receiver that gates on stability would collect no
       // evidence at all about why it is stuck.
-      framingAdvice.observe({ stability: stability.state, vision: undefined });
+      framingAdvice?.observe({ stability: stability.state, vision: undefined });
       return;
     }
     if (
@@ -1078,7 +1082,7 @@ function onDecoded(bytes: Uint8Array) {
   if (header.k !== Math.ceil(header.totalLen / header.blockLen)) return;
   // The link demonstrably works, so whatever the earlier captures were
   // complaining about is history and must not resurface later in the transfer.
-  framingAdvice.reset();
+  framingAdvice?.reset();
   if (noSignal.frameDecoded()) {
     noSignalToast.hidden = true;
     // The dialog's premise ("nothing decoded") just became false mid-read.
