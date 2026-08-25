@@ -16,6 +16,7 @@ import type {
   VisionDetectionLimit,
   VisionDiagnostics,
   VisionSearchRegion,
+  VisionTemporalTrackingDiagnostics,
 } from "./color4-vision-types";
 import type {
   Color4ErasureBudgetFraction,
@@ -97,7 +98,19 @@ export interface Color4GeometryRequest {
 
 export interface Color4GeometrySnapshot {
   readonly candidates: number;
-  readonly diagnostics: VisionDiagnostics;
+  /**
+   * Present only for frames that actually ran detection.
+   *
+   * A tracked frame decodes no contours and no fiducials, so it has no contour
+   * counters, no fiducial matches, no optical metrics and no acquisition
+   * homography to report. Replaying the previous cold acquisition's numbers
+   * would fill the experiment reservoirs with one value repeated once per
+   * tracked frame, which is worse than reporting nothing: it reads as a
+   * measurement. Tracked frames send `tracking` instead.
+   */
+  readonly diagnostics?: VisionDiagnostics;
+  /** Present only for tracked frames; the gates that accepted this geometry. */
+  readonly tracking?: VisionTemporalTrackingDiagnostics;
   readonly frameRegion?: VisionSearchRegion;
   readonly debug?: VisionDebugArtifacts;
 }

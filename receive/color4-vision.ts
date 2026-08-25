@@ -11,6 +11,7 @@ import {
   DEFAULT_COLOR4_CANONICAL_SCALE,
   DEFAULT_COLOR4_DETECTION_DIMENSION,
 } from "../shared/receiver-defaults";
+import { canonicalModuleSampleWindow } from "../shared/color4/classifier";
 import type { CanonicalModuleSamples } from "../shared/color4/classifier";
 import type {
   VisionCandidateScore,
@@ -1803,7 +1804,7 @@ function deleteHomography(solution: HomographySolution | undefined): void {
 
 const TEMPORAL_CORNER_COUNT = 16;
 const TEMPORAL_MINIMUM_TRACKED_CORNERS = 12;
-const TEMPORAL_MAXIMUM_FORWARD_BACKWARD_P95_PX = 1.5;
+const TEMPORAL_MAXIMUM_FORWARD_BACKWARD_MAX_PX = 1.5;
 const TEMPORAL_MAXIMUM_RESIDUAL_MODULES = 0.5;
 const TEMPORAL_MINIMUM_AREA_RATIO = 0.75;
 const TEMPORAL_MAXIMUM_AREA_RATIO = 1.33;
@@ -1948,10 +1949,21 @@ function quadIsInside(quad: VisionQuad, width: number, height: number): boolean 
     finitePoint(point) && point.x >= 0 && point.y >= 0 && point.x <= width - 1 && point.y <= height - 1);
 }
 
-function percentile95(values: readonly number[]): number | undefined {
+/**
+ * Worst forward/backward error among the corners that tracked.
+ *
+ * This used to be spelled as a p95, but at least twelve of sixteen corners must
+ * track before the gate runs, and `ceil(n * 0.95) - 1` indexes the last element
+ * for every n in 12..20. It was always a maximum; naming it one keeps the gate
+ * and the documentation describing the same rule.
+ */
+function maximumOf(values: readonly number[]): number | undefined {
   if (values.length === 0) return undefined;
-  const sorted = [...values].sort((left, right) => left - right);
-  return sorted[Math.ceil(sorted.length * 0.95) - 1];
+  let maximum = values[0]!;
+  for (let index = 1; index < values.length; index++) {
+    if (values[index]! > maximum) maximum = values[index]!;
+  }
+  return maximum;
 }
 
 function paddedRegionFromQuad(
@@ -2024,9 +2036,10 @@ function temporalDiagnostics(
   const areaRatio = currentArea === undefined || previousArea <= 0
     ? undefined
     : currentArea / previousArea;
+  const forwardBackwardMaxPx = maximumOf(errors);
   return {
     trackedCorners: errors.length,
-    ...(percentile95(errors) === undefined ? {} : { forwardBackwardP95Px: percentile95(errors) }),
+    ...(forwardBackwardMaxPx === undefined ? {} : { forwardBackwardMaxPx }),
     ...(candidate.residualRmsModules === undefined
       ? {}
       : { residualRmsModules: candidate.residualRmsModules }),
@@ -2048,8 +2061,8 @@ export function validateVisionTemporalTracking(
 ): VisionTemporalTrackingResult {
   const minimumTrackedCorners = thresholds.minimumTrackedCorners ??
     TEMPORAL_MINIMUM_TRACKED_CORNERS;
-  const maximumForwardBackwardP95Px = thresholds.maximumForwardBackwardP95Px ??
-    TEMPORAL_MAXIMUM_FORWARD_BACKWARD_P95_PX;
+  const maximumForwardBackwardMaxPx = thresholds.maximumForwardBackwardMaxPx ??
+    TEMPORAL_MAXIMUM_FORWARD_BACKWARD_MAX_PX;
   const maximumResidualModules = thresholds.maximumResidualModules ??
     TEMPORAL_MAXIMUM_RESIDUAL_MODULES;
   const minimumAreaRatio = thresholds.minimumAreaRatio ?? TEMPORAL_MINIMUM_AREA_RATIO;
@@ -2066,7 +2079,7 @@ export function validateVisionTemporalTracking(
       candidate.forwardBackwardErrorsPx.length !== TEMPORAL_CORNER_COUNT ||
       !Number.isInteger(minimumTrackedCorners) || minimumTrackedCorners < 4 ||
       minimumTrackedCorners > TEMPORAL_CORNER_COUNT ||
-      !Number.isFinite(maximumForwardBackwardP95Px) || maximumForwardBackwardP95Px < 0 ||
+      !Number.isFinite(maximumForwardBackwardMaxPx) || maximumForwardBackwardMaxPx < 0 ||
       !Number.isFinite(maximumResidualModules) || maximumResidualModules < 0 ||
       !Number.isFinite(minimumAreaRatio) || minimumAreaRatio <= 0 ||
       !Number.isFinite(maximumAreaRatio) || maximumAreaRatio < minimumAreaRatio) {
@@ -2075,8 +2088,8 @@ export function validateVisionTemporalTracking(
   if (diagnostics.trackedCorners < minimumTrackedCorners) {
     return reject("TOO_FEW_TRACKED_CORNERS");
   }
-  if (diagnostics.forwardBackwardP95Px === undefined ||
-      diagnostics.forwardBackwardP95Px > maximumForwardBackwardP95Px) {
+  if (diagnostics.forwardBackwardMaxPx === undefined ||
+      diagnostics.forwardBackwardMaxPx > maximumForwardBackwardMaxPx) {
     return reject("FORWARD_BACKWARD_ERROR");
   }
   if (candidate.homography === undefined || candidate.frameQuad === undefined ||
@@ -2387,7 +2400,38 @@ export function trackVisionTemporalHintWithOpenCv(
 
 const COMPACT_SAMPLES_PER_MODULE_AXIS = 4;
 const COMPACT_REMAP_SIZE = TOTAL_MODULES * COMPACT_SAMPLES_PER_MODULE_AXIS;
-const COMPACT_SAMPLE_FRACTIONS = Object.freeze([1.5 / 6, 2.5 / 6, 3.5 / 6, 4.5 / 6]);
+
+/**
+ * True when a canonical scale's sample window fits the fixed compact grid.
+ *
+ * The remap plane is `TOTAL_MODULES * 4` on a side, so a scale whose window is
+ * not four pixels wide cannot reproduce the raster sampler's reduction. Scale 4
+ * is the real case: it insets one pixel per side and reduces over two.
+ */
+export function supportsCompactColor4Sampling(scale: VisionCanonicalScale): boolean {
+  return canonicalModuleSampleWindow(scale).span === COMPACT_SAMPLES_PER_MODULE_AXIS;
+}
+
+/**
+ * Where inside a module the compact sampler reads, in units of one module.
+ *
+ * These are the raster sampler's canonical pixel offsets divided by the scale,
+ * so both canonical inputs reduce over the same light. Getting this wrong is
+ * invisible in a decode that still succeeds and shows up only as lost margin,
+ * so it is derived rather than written down.
+ */
+function compactSampleFractions(scale: VisionCanonicalScale): readonly number[] {
+  const { inset, span } = canonicalModuleSampleWindow(scale);
+  if (span !== COMPACT_SAMPLES_PER_MODULE_AXIS) {
+    throw new RangeError(
+      `Canonical scale ${scale} reduces over ${span} pixels per module axis and cannot ` +
+      `use the ${COMPACT_SAMPLES_PER_MODULE_AXIS}-sample compact grid.`,
+    );
+  }
+  return Object.freeze(
+    Array.from({ length: span }, (_, offset) => (inset + offset) / scale),
+  );
+}
 
 function exactMedian16(
   values: Uint8Array,
@@ -2493,6 +2537,7 @@ export class Color4CompactSamplerWithOpenCv {
   private sourceRgb: CvMat | undefined;
   private remapped: CvMat | undefined;
   private mapKey: string | undefined;
+  private nativePlaneScale: VisionCanonicalScale | undefined;
   private nativeMapProjectionDisabled = false;
   private disposed = false;
   private samplingDiagnostics: VisionCompactSamplingDiagnostics | undefined;
@@ -2574,14 +2619,21 @@ export class Color4CompactSamplerWithOpenCv {
     this.emptyMap = undefined;
     this.projectedCoordinates = undefined;
     this.canonicalCoordinates = undefined;
+    this.nativePlaneScale = undefined;
   }
 
-  private ensureNativeProjectionMaps(): Readonly<{ map1: CvMat; map2: CvMat }> {
+  private ensureNativeProjectionMaps(
+    scale: VisionCanonicalScale,
+  ): Readonly<{ map1: CvMat; map2: CvMat }> {
     if (this.cv.CV_32FC1 === undefined || this.cv.perspectiveTransform === undefined) {
       throw new Error("Native projective remap construction is unavailable.");
     }
-    if (this.canonicalCoordinates === undefined ||
-        this.projectedCoordinates === undefined || this.emptyMap === undefined) {
+    // The plane holds unit-module coordinates so the scale can stay folded into
+    // the per-frame inverse transform, but the sub-module offsets themselves are
+    // scale-derived, so a scale change has to rebuild it.
+    if (this.canonicalCoordinates === undefined || this.projectedCoordinates === undefined ||
+        this.emptyMap === undefined || this.nativePlaneScale !== scale) {
+      const fractions = compactSampleFractions(scale);
       this.deleteNativeProjectionMaps();
       this.canonicalCoordinates = new this.cv.Mat(
         COMPACT_REMAP_SIZE,
@@ -2596,19 +2648,18 @@ export class Color4CompactSamplerWithOpenCv {
       }
       for (let outputY = 0; outputY < COMPACT_REMAP_SIZE; outputY++) {
         const moduleY = Math.floor(outputY / COMPACT_SAMPLES_PER_MODULE_AXIS);
-        const fractionY = COMPACT_SAMPLE_FRACTIONS[outputY % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+        const fractionY = fractions[outputY % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
         const canonicalY = moduleY + fractionY;
         const row = outputY * COMPACT_REMAP_SIZE;
         for (let outputX = 0; outputX < COMPACT_REMAP_SIZE; outputX++) {
           const moduleX = Math.floor(outputX / COMPACT_SAMPLES_PER_MODULE_AXIS);
-          const fractionX = COMPACT_SAMPLE_FRACTIONS[outputX % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+          const fractionX = fractions[outputX % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
           const index = (row + outputX) * 2;
-          // Unit-module coordinates make this plane reusable across canonical
-          // scales; the scale is folded into the per-frame inverse transform.
           coordinates![index] = moduleX + fractionX;
           coordinates![index + 1] = canonicalY;
         }
       }
+      this.nativePlaneScale = scale;
     }
     return { map1: this.projectedCoordinates, map2: this.emptyMap };
   }
@@ -2627,7 +2678,7 @@ export class Color4CompactSamplerWithOpenCv {
     if (!this.nativeMapProjectionDisabled && this.cv.perspectiveTransform !== undefined) {
       let inverseTransform: CvMat | undefined;
       try {
-        const nativeMaps = this.ensureNativeProjectionMaps();
+        const nativeMaps = this.ensureNativeProjectionMaps(hint.canonicalScale);
         const scaledInverse: VisionHomography = [
           canonicalToSource[0] * hint.canonicalScale,
           canonicalToSource[1] * hint.canonicalScale,
@@ -2660,17 +2711,18 @@ export class Color4CompactSamplerWithOpenCv {
       }
     }
     if (floatMap1 === undefined || floatMap2 === undefined) {
+      const fractions = compactSampleFractions(hint.canonicalScale);
       const { mapX, mapY } = this.ensureFloatMaps();
       const xs = mapX.data32F!;
       const ys = mapY.data32F!;
       for (let outputY = 0; outputY < COMPACT_REMAP_SIZE; outputY++) {
         const moduleY = Math.floor(outputY / COMPACT_SAMPLES_PER_MODULE_AXIS);
-        const fractionY = COMPACT_SAMPLE_FRACTIONS[outputY % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+        const fractionY = fractions[outputY % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
         const canonicalY = (moduleY + fractionY) * hint.canonicalScale;
         const row = outputY * COMPACT_REMAP_SIZE;
         for (let outputX = 0; outputX < COMPACT_REMAP_SIZE; outputX++) {
           const moduleX = Math.floor(outputX / COMPACT_SAMPLES_PER_MODULE_AXIS);
-          const fractionX = COMPACT_SAMPLE_FRACTIONS[outputX % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+          const fractionX = fractions[outputX % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
           const canonicalX = (moduleX + fractionX) * hint.canonicalScale;
           const source = projectHomography(canonicalToSource, canonicalX, canonicalY);
           const index = row + outputX;

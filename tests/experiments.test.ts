@@ -892,6 +892,10 @@ test("schema-v2 temporal telemetry is bounded, whitelisted and derives throughpu
   metrics.recordGeometryPath("tracked");
   metrics.recordGeometryPath("tracked");
   metrics.recordGeometryPath("fallback");
+  metrics.recordGeometryPath("legacy");
+  metrics.recordGeometryPath("private-path" as never);
+  metrics.recordLegacyFallbacks({ probes: 2, holds: 1 });
+  metrics.recordLegacyFallbacks({ probes: -1, holds: 1 });
   metrics.recordTransition();
   metrics.setWorkerCounts({ geometry: 1, classifier: 2 });
   metrics.setWorkerCounts({ geometry: 0, classifier: 99 });
@@ -925,6 +929,9 @@ test("schema-v2 temporal telemetry is bounded, whitelisted and derives throughpu
     coldAcquisitions: 1,
     trackedFrames: 2,
     trackingFallbacks: 1,
+    legacyFrames: 1,
+    legacyProbes: 2,
+    legacyHolds: 1,
     transitions: 1,
     geometryWorkers: 1,
     classifierWorkers: 2,

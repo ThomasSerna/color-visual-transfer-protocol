@@ -767,9 +767,25 @@ function medianOfScratch(scratch: Float64Array, length: number): number {
     : (window[middle - 1]! + window[middle]!) / 2;
 }
 
-function createRasterSampler(image: CanonicalRasterImage, scale: number): ModuleSampler {
+/**
+ * The sub-module window a canonical sample is reduced over.
+ *
+ * A module occupies `scale` canonical pixels whose centres are the integers
+ * `module * scale .. module * scale + scale - 1`, so dropping `inset` pixels on
+ * each side leaves a `span`-wide window centred on the module. Both canonical
+ * inputs must agree on this window or they classify different light: the raster
+ * sampler reads those pixels directly, and the geometry worker's compact
+ * sampler projects the same offsets through its homography.
+ */
+export function canonicalModuleSampleWindow(
+  scale: number,
+): Readonly<{ inset: number; span: number }> {
   const inset = Math.floor(scale / 4);
-  const span = Math.max(1, scale - 2 * inset);
+  return Object.freeze({ inset, span: Math.max(1, scale - 2 * inset) });
+}
+
+function createRasterSampler(image: CanonicalRasterImage, scale: number): ModuleSampler {
+  const { inset, span } = canonicalModuleSampleWindow(scale);
   // One scratch buffer per channel, reused across every module of this frame.
   const samples = span * span;
   const redScratch = new Float64Array(samples);

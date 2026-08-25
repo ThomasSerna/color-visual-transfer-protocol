@@ -43,10 +43,20 @@ fiducial errors by marker and maximum, homography method and residual,
 refinement attempts/applied, valid/new/duplicate LT frames, resolved blocks,
 decode latency, elapsed time and requested plus negotiated camera settings. For
 schema-v2 temporal runs also report bitmap/RGBA capture counts, reservations and
-drop causes, cold/tracked/fallback/transition counts, geometry/classifier worker
+drop causes, cold/tracked/fallback/legacy/transition counts, legacy probes and
+holds, geometry/classifier worker
 counts, restarts and busy-time utilization, tracking/sampling/guard/geometry/classifier p50/p95,
 distinct new frames per second, and estimated capacity
 `min(1000/geometryP95, classifierWorkers*1000/classifierP95)`.
+
+Detection counters, fiducial errors, optical metrics and homography residuals
+describe **acquisition frames only**: a tracked frame runs no detection, so it
+contributes none of them and reports its tracking gates instead — tracked
+corners, worst forward/backward error, residual and area ratio, as their own
+bounded distributions. Their sample counts add up to the submitted frames rather
+than each matching it. A run whose optical distributions report one value
+repeated once per submitted frame is reading a stale snapshot, not a
+measurement.
 
 When all four camera-stage fiducials are available, also report apparent frame
 width/height, pixels/module x/y and minimum, weakest fiducial width/height and

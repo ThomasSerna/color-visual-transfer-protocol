@@ -45,9 +45,16 @@ Live metrics identify the last completed stage and rejection reason, detected
 fiducials, worker p50/p95 timing and distinct new blocks/s. The exported
 experiment JSON keeps bounded histograms and timing reservoirs, not an unbounded
 frame log. COLOR_4 schema-v2 summaries also include capture paths, reservations,
-whitelisted drop causes, cold/tracked/fallback/transition counts, worker
-counts/restarts and the bounded tracking/sampling/guard/classifier timing
+whitelisted drop causes, cold/tracked/fallback/legacy/transition counts, legacy
+probes and holds, worker counts/restarts and the bounded
+tracking/sampling/guard/classifier timing distributions, plus the tracking-gate
 distributions. Capture identifiers and per-frame traces are not persisted.
+
+The detected-fiducial readout shows `N/16 tracked` while the temporal path is
+tracking, because a tracked frame decodes no fiducials at all. Optical, detection
+and homography figures come from acquisition frames only. Debug Vision itself
+runs the legacy full-warp pipeline on every frame, so it deliberately does not
+exercise the temporal path; use the exported tracking distributions for that.
 
 The classifier may also attach optional binary-structure diagnostics: bootstrap
 double/single/uncertain/contradictory vote counts and differential margins, plus

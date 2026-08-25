@@ -4,6 +4,7 @@ import {
   COLOR4_WORKER_WATCHDOG_MS,
   Color4CameraDecoder,
   Color4WorkerFailure,
+  LEGACY_HOLD_INITIAL_CAPTURES,
 } from "../receive/color4-carrier.ts";
 import type {
   Color4ClassifyRequest,
@@ -459,6 +460,63 @@ test("three non-transition rejections probe legacy and a failed probe resets tra
   assert.ok(resumed);
   assert.equal(resumed.mode, "fast");
   assert.equal(resumed.trackingGeneration, legacyProbe.trackingGeneration + 1);
+  decoder.cancelReservation(resumed);
+  decoder.dispose();
+});
+
+test("a successful legacy probe holds legacy for a bounded run and then resumes fast", {
+  concurrency: false,
+}, async () => {
+  const { decoder, geometry, classifiers } = await createHarness(1);
+
+  const rejectFast = async () => {
+    const token = decoder.tryReserveCapture();
+    assert.ok(token);
+    assert.equal(token.mode, "fast");
+    const pending = decoder.decodeReserved(token, imageFrame(60 + token.captureSequence));
+    await flushAsyncContinuation();
+    const request = requests(geometry, "geometry").at(-1);
+    assert.ok(request);
+    geometry.reply(geometryRejected(request));
+    assert.equal((await pending).status, "rejected");
+  };
+
+  for (let attempt = 0; attempt < 3; attempt++) await rejectFast();
+
+  // The probe decodes, so legacy takes over -- but only for a bounded run.
+  const probe = decoder.tryReserveCapture();
+  assert.ok(probe);
+  assert.equal(probe.mode, "legacy");
+  const probeResult = decoder.decodeReserved(probe, imageFrame(70));
+  await flushAsyncContinuation();
+  const probeRequest = requests(geometry, "geometry").at(-1);
+  assert.ok(probeRequest);
+  geometry.reply(geometryValid(probeRequest));
+  await flushAsyncContinuation();
+  const probeClassify = requests(classifiers[0]!, "classify").at(-1);
+  assert.ok(probeClassify);
+  classifiers[0]!.reply(classifierValid(probeClassify));
+  assert.equal((await probeResult).status, "valid");
+  assert.deepEqual(decoder.legacyFallbacks, { probes: 1, holds: 1, holding: true });
+
+  // Every capture inside the hold is legacy, and the hold is finite.
+  let heldCaptures = 0;
+  let resumed = decoder.tryReserveCapture();
+  assert.ok(resumed);
+  while (resumed.mode === "legacy") {
+    heldCaptures++;
+    assert.ok(heldCaptures <= LEGACY_HOLD_INITIAL_CAPTURES, "the legacy hold never expired");
+    decoder.cancelReservation(resumed);
+    const next = decoder.tryReserveCapture();
+    assert.ok(next);
+    resumed = next;
+  }
+  assert.equal(heldCaptures, LEGACY_HOLD_INITIAL_CAPTURES);
+  assert.equal(resumed.mode, "fast");
+  // Expiring the hold retires the geometry worker's state so the fast path
+  // restarts from a cold acquisition rather than from pre-trouble geometry.
+  assert.equal(resumed.trackingGeneration, probe.trackingGeneration + 1);
+  assert.equal(decoder.legacyFallbacks.holding, false);
   decoder.cancelReservation(resumed);
   decoder.dispose();
 });

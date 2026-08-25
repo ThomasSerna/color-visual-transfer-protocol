@@ -23,6 +23,7 @@ import {
   acquireColor4TemporalGeometryWithOpenCv,
   createVisionGrayscaleFrameWithOpenCv,
   normalizeColor4WithOpenCv,
+  supportsCompactColor4Sampling,
   trackVisionTemporalHintWithOpenCv,
   type OpenCvRuntime,
   type VisionGrayscaleFrame,
@@ -83,14 +84,15 @@ let openCvInitMs = 0;
 let searchRegion: import("./color4-vision").VisionSearchRegion | undefined;
 let previousTrackingGray: VisionGrayscaleFrame | undefined;
 let temporalHint: VisionTemporalHint | undefined;
-let temporalGeometry: Color4GeometrySnapshot | undefined;
 let compactSampler: Color4CompactSamplerWithOpenCv | undefined;
 
 function clearTemporalTracking(): void {
   previousTrackingGray = undefined;
   temporalHint = undefined;
-  temporalGeometry = undefined;
-  searchRegion = undefined;
+  // `searchRegion` deliberately survives. It answers "roughly where was the
+  // code", which a failed track does not invalidate, and acquisition clears it
+  // itself when it cannot find the code at all. Dropping it here made every
+  // cold and fallback frame re-threshold the whole camera plane.
 }
 
 async function loadOpenCv(): Promise<OpenCvRuntime> {
@@ -220,7 +222,7 @@ function stageTimings(
         }
       : { geometryTotal: localWorkerTotal }),
   };
-  if (normalized) {
+  if (normalized?.diagnostics) {
     const observed = normalized.diagnostics.timings;
     timings.grayscale = observed.grayscaleMs;
     timings.resize = observed.resizeMs;
@@ -317,6 +319,11 @@ function visionDiagnostics(
 ): BrowserVisionDiagnostics {
   const geometry = normalized?.diagnostics;
   const fiducials = geometry?.fiducials;
+  // Only the geometry worker's tracked snapshot carries this; the legacy and
+  // acquisition results in this union never do.
+  const tracking = normalized !== undefined && "tracking" in normalized
+    ? normalized.tracking
+    : undefined;
   const diagnosticReason = actionableDiagnosticReason(
     raster,
     classifier,
@@ -331,6 +338,7 @@ function visionDiagnostics(
     ...(rejectReason === undefined ? {} : { rejectReason }),
     ...(diagnosticReason === undefined ? {} : { diagnosticReason }),
     timings: stageTimings(request, normalized, classifier, unwrap, workerTotal),
+    ...(tracking === undefined ? {} : { tracking }),
     ...(geometry === undefined
       ? {}
       : {
@@ -870,14 +878,14 @@ async function runGeometry(request: Color4GeometryRequest): Promise<void> {
     const pixels = pixelsFromRequest(request);
     const cv = await loadOpenCv();
     compactSampler ??= new Color4CompactSamplerWithOpenCv(cv);
-    const forceLegacy = request.mode === "legacy" || request.debug.enabled || request.debug.snapshot;
+    const forceLegacy = request.mode === "legacy" || request.debug.enabled ||
+      request.debug.snapshot || !supportsCompactColor4Sampling(request.debug.canonicalScale);
     let currentGray: VisionGrayscaleFrame | undefined;
 
     if (
       !forceLegacy &&
       previousTrackingGray !== undefined &&
-      temporalHint !== undefined &&
-      temporalGeometry !== undefined
+      temporalHint !== undefined
     ) {
       const trackingStarted = performance.now();
       currentGray = createVisionGrayscaleFrameWithOpenCv(
@@ -904,27 +912,17 @@ async function runGeometry(request: Color4GeometryRequest): Promise<void> {
         guardMs += Math.max(0, performance.now() - guardStarted);
         geometryPath = "tracked";
         const geometryMs = Math.max(0, performance.now() - started);
+        // No contour, fiducial or optical measurement exists for a tracked
+        // frame, so none is reported. The LK gates that accepted this geometry
+        // are the real evidence and travel in their place.
         const geometry: Color4GeometrySnapshot = {
-          candidates: temporalGeometry.candidates,
-          diagnostics: {
-            ...temporalGeometry.diagnostics,
-            timings: {
-              grayscaleMs: 0,
-              resizeMs: 0,
-              thresholdMs: 0,
-              contoursMs: 0,
-              fiducialDecodeMs: 0,
-              homographyMs: 0,
-              refinementMs: 0,
-              totalMs: geometryMs,
-            },
-          },
+          candidates: 0,
+          tracking: tracked.diagnostics,
           ...(tracked.hint.frameRegion ? { frameRegion: tracked.hint.frameRegion } : {}),
         };
         if (guard.status === "valid") {
           previousTrackingGray = currentGray;
           temporalHint = tracked.hint;
-          temporalGeometry = geometry;
           searchRegion = tracked.hint.frameRegion;
           const rgb = samples.rgb.buffer;
           scope.postMessage(
@@ -1002,7 +1000,10 @@ async function runGeometry(request: Color4GeometryRequest): Promise<void> {
           request.width,
           request.height,
           pixels,
-          options,
+          {
+            ...options,
+            ...(previousRegion === undefined ? {} : { searchRegion: previousRegion }),
+          },
         );
     if (forceLegacy && previousRegion !== undefined && normalized.status === "rejected") {
       geometryPath = "fallback";
@@ -1107,7 +1108,6 @@ async function runGeometry(request: Color4GeometryRequest): Promise<void> {
         rgba: canonicalBuffer,
       };
     }
-    temporalGeometry = geometry;
     temporalHint = acquiredTemporalHint;
     if (!forceLegacy && temporalHint !== undefined) {
       previousTrackingGray = currentGray ?? createVisionGrayscaleFrameWithOpenCv(

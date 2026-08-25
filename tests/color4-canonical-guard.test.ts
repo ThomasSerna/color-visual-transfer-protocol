@@ -293,10 +293,13 @@ test("canonical guard is materially faster than full EXPERIMENTAL classification
     assert.equal(decodeCanonicalColor4Samples(samples).status, "valid");
     decodeDurations.push(performance.now() - startedAt);
   }
-  const guardP50 = median(guardDurations);
-  const decodeP50 = median(decodeDurations);
+  // Best-of-N: the minimum is the closest either run gets to the work itself,
+  // so a loaded machine cannot invert the comparison.
+  const guardBest = Math.min(...guardDurations);
+  const decodeBest = Math.min(...decodeDurations);
   assert.ok(
-    guardP50 <= decodeP50 * 0.7,
-    `guard p50 ${guardP50.toFixed(2)} ms; decode p50 ${decodeP50.toFixed(2)} ms`,
+    guardBest <= decodeBest * 0.7,
+    `guard best ${guardBest.toFixed(2)} ms (p50 ${median(guardDurations).toFixed(2)}); ` +
+      `decode best ${decodeBest.toFixed(2)} ms (p50 ${median(decodeDurations).toFixed(2)})`,
   );
 });
