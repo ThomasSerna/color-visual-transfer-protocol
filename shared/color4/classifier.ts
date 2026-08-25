@@ -56,6 +56,57 @@ export interface CanonicalRasterImage {
   readonly pixels: Uint8Array | Uint8ClampedArray;
 }
 
+/** Number of interleaved RGB values in one compact canonical module frame. */
+export const CANONICAL_MODULE_SAMPLE_VALUES = TOTAL_MODULES * TOTAL_MODULES * 3;
+
+/**
+ * One already-reduced RGB sample for every logical module in a canonical frame.
+ *
+ * The 172x172 grid includes the quiet zone. Values are finite device RGB in the
+ * inclusive range 0..255, stored row-major as
+ * `rgb[((logicalY * width + logicalX) * 3) + channel]`, where channels are R, G,
+ * and B. The geometry worker owns sub-module sampling and median reduction; the
+ * classifier consumes this compact view without re-reading a large RGBA warp.
+ */
+export interface CanonicalModuleSamples {
+  readonly width: number;
+  readonly height: number;
+  /** Tightly packed transferable storage (`byteOffset === 0`). */
+  readonly rgb: Float32Array<ArrayBuffer>;
+}
+
+function hasValidCanonicalModuleRgb(rgb: unknown): rgb is Float32Array<ArrayBuffer> {
+  if (
+    !(rgb instanceof Float32Array) ||
+    !(rgb.buffer instanceof ArrayBuffer) ||
+    rgb.byteOffset !== 0 ||
+    rgb.byteLength !== rgb.buffer.byteLength ||
+    rgb.length !== CANONICAL_MODULE_SAMPLE_VALUES
+  ) {
+    return false;
+  }
+  for (let index = 0; index < rgb.length; index++) {
+    const value = rgb[index]!;
+    if (!Number.isFinite(value) || value < 0 || value > 255) return false;
+  }
+  return true;
+}
+
+/**
+ * Validate and wrap a transferred compact RGB view without copying its buffer.
+ */
+export function createCanonicalModuleSamples(
+  rgb: Float32Array<ArrayBuffer>,
+): CanonicalModuleSamples {
+  if (!hasValidCanonicalModuleRgb(rgb)) {
+    throw new RangeError(
+      `Canonical COLOR_4 module samples need a tightly packed transferable Float32Array of ` +
+      `exactly ${CANONICAL_MODULE_SAMPLE_VALUES} finite RGB values in the range 0..255.`,
+    );
+  }
+  return Object.freeze({ width: TOTAL_MODULES, height: TOTAL_MODULES, rgb });
+}
+
 export interface LabColor {
   readonly l: number;
   readonly a: number;
@@ -208,6 +259,35 @@ export interface RejectedCanonicalRaster {
 }
 
 export type CanonicalRasterResult = ValidCanonicalRaster | RejectedCanonicalRaster;
+
+export interface ValidCanonicalColor4Guard {
+  readonly status: "valid";
+  readonly profile: Color4Profile;
+  readonly paletteId: 0 | 1;
+  readonly sequencePhase: 0 | 1 | 2 | 3;
+  readonly diagnostics: CanonicalRasterDiagnostics;
+}
+
+export interface TransitionCanonicalColor4Guard {
+  readonly status: "transition";
+  readonly reason: "phase_mismatch";
+  readonly profile: Color4Profile;
+  readonly paletteId: 0 | 1;
+  readonly sequencePhase: 0 | 1 | 2 | 3;
+  readonly diagnostics: CanonicalRasterDiagnostics;
+}
+
+export interface RejectedCanonicalColor4Guard {
+  readonly status: "rejected";
+  readonly reason: Exclude<CanonicalRasterRejectReason, "phase_mismatch">;
+  readonly diagnostics: CanonicalRasterDiagnostics;
+}
+
+/** Structural COLOR_4 decision made before data-cell classification or FEC. */
+export type CanonicalColor4GuardResult =
+  | ValidCanonicalColor4Guard
+  | TransitionCanonicalColor4Guard
+  | RejectedCanonicalColor4Guard;
 
 export interface DecodeCanonicalRasterOptions {
   /** Defaults to the normative COLOR4_PROFILES registry. */
@@ -392,9 +472,15 @@ function emptyClassifierDistribution(): ClassifierDistributionSummary {
   return Object.freeze({ count: 0, min: 0, p50: 0, p95: 0, max: 0 });
 }
 
-function classifierDistribution(values: readonly number[]): ClassifierDistributionSummary {
+type ClassifierDistributionValues = readonly number[] | Float64Array<ArrayBufferLike>;
+
+function classifierDistribution(values: ClassifierDistributionValues): ClassifierDistributionSummary {
   if (values.length === 0) return emptyClassifierDistribution();
-  const sorted = [...values].sort((left, right) => left - right);
+  // Classification already records these values in typed scratch buffers. Copy
+  // once into another typed buffer so percentile sorting does not box every
+  // number or mutate the per-cell diagnostics used by the caller.
+  const sorted = Float64Array.from(values);
+  sorted.sort();
   const percentile = (position: number): number =>
     sorted[Math.floor((sorted.length - 1) * position)]!;
   return Object.freeze({
@@ -402,7 +488,7 @@ function classifierDistribution(values: readonly number[]): ClassifierDistributi
     min: sorted[0]!,
     p50: percentile(0.5),
     p95: percentile(0.95),
-    max: sorted.at(-1)!,
+    max: sorted[sorted.length - 1]!,
   });
 }
 
@@ -609,20 +695,48 @@ function mixRgb(left: FloatRgb, right: FloatRgb, position: number): FloatRgb {
 
 /** Convert normalized sRGB (0..1 per channel) to CIE Lab using a D65 white. */
 export function normalizedRgbToLab(rgb: FloatRgb): LabColor {
-  const linear = rgb.map((channel) =>
-    channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4,
-  );
-  const x = linear[0]! * 0.4124564 + linear[1]! * 0.3575761 + linear[2]! * 0.1804375;
-  const y = linear[0]! * 0.2126729 + linear[1]! * 0.7151522 + linear[2]! * 0.072175;
-  const z = linear[0]! * 0.0193339 + linear[1]! * 0.119192 + linear[2]! * 0.9503041;
-  const transform = (component: number): number =>
-    component > 216 / 24389
-      ? Math.cbrt(component)
-      : (841 / 108) * component + 4 / 29;
-  const fx = transform(x / 0.95047);
-  const fy = transform(y);
-  const fz = transform(z / 1.08883);
+  const red = normalizedRgbChannelToLinear(rgb[0]);
+  const green = normalizedRgbChannelToLinear(rgb[1]);
+  const blue = normalizedRgbChannelToLinear(rgb[2]);
+  const x = red * 0.4124564 + green * 0.3575761 + blue * 0.1804375;
+  const y = red * 0.2126729 + green * 0.7151522 + blue * 0.072175;
+  const z = red * 0.0193339 + green * 0.119192 + blue * 0.9503041;
+  const fx = labTransform(x / 0.95047);
+  const fy = labTransform(y);
+  const fz = labTransform(z / 1.08883);
   return { l: 116 * fy - 16, a: 500 * (fx - fy), b: 200 * (fy - fz) };
+}
+
+function normalizedRgbChannelToLinear(channel: number): number {
+  return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+}
+
+function labTransform(component: number): number {
+  return component > 216 / 24389
+    ? Math.cbrt(component)
+    : (841 / 108) * component + 4 / 29;
+}
+
+/** Write one Lab triple without allocating the public object representation. */
+function writeNormalizedRgbToLab(
+  red: number,
+  green: number,
+  blue: number,
+  output: Float64Array,
+  offset: number,
+): void {
+  const linearRed = normalizedRgbChannelToLinear(red);
+  const linearGreen = normalizedRgbChannelToLinear(green);
+  const linearBlue = normalizedRgbChannelToLinear(blue);
+  const x = linearRed * 0.4124564 + linearGreen * 0.3575761 + linearBlue * 0.1804375;
+  const y = linearRed * 0.2126729 + linearGreen * 0.7151522 + linearBlue * 0.072175;
+  const z = linearRed * 0.0193339 + linearGreen * 0.119192 + linearBlue * 0.9503041;
+  const fx = labTransform(x / 0.95047);
+  const fy = labTransform(y);
+  const fz = labTransform(z / 1.08883);
+  output[offset] = 116 * fy - 16;
+  output[offset + 1] = 500 * (fx - fy);
+  output[offset + 2] = 200 * (fy - fz);
 }
 
 export function deltaE76(left: LabColor, right: LabColor): number {
@@ -653,7 +767,7 @@ function medianOfScratch(scratch: Float64Array, length: number): number {
     : (window[middle - 1]! + window[middle]!) / 2;
 }
 
-function createSampler(image: CanonicalRasterImage, scale: number): ModuleSampler {
+function createRasterSampler(image: CanonicalRasterImage, scale: number): ModuleSampler {
   const inset = Math.floor(scale / 4);
   const span = Math.max(1, scale - 2 * inset);
   // One scratch buffer per channel, reused across every module of this frame.
@@ -683,6 +797,18 @@ function createSampler(image: CanonicalRasterImage, scale: number): ModuleSample
   };
   return {
     scale,
+    sampleLogical,
+    sampleActive: (x, y) => sampleLogical(x + QUIET_MODULES, y + QUIET_MODULES),
+  };
+}
+
+function createModuleSampleSampler(samples: CanonicalModuleSamples): ModuleSampler {
+  const sampleLogical = (logicalX: number, logicalY: number): FloatRgb => {
+    const offset = (logicalY * samples.width + logicalX) * 3;
+    return [samples.rgb[offset]!, samples.rgb[offset + 1]!, samples.rgb[offset + 2]!];
+  };
+  return {
+    scale: 1,
     sampleLogical,
     sampleActive: (x, y) => sampleLogical(x + QUIET_MODULES, y + QUIET_MODULES),
   };
@@ -1444,20 +1570,30 @@ const DECISION_DIRECTED_LEFT_ANCHOR = 0.25;
 const DECISION_DIRECTED_RIGHT_ANCHOR = 0.75;
 
 type CentroidField = (position: number) => readonly LabColor[];
+const LAB_COMPONENTS = 3;
+const COLOR4_CENTROIDS = 4;
+const REFINEMENT_GROUPS = COLOR4_CENTROIDS * 2;
 
-function medianLab(values: readonly LabColor[]): LabColor {
-  return {
-    l: median(values.map((value) => value.l)),
-    a: median(values.map((value) => value.a)),
-    b: median(values.map((value) => value.b)),
-  };
+/** Four interleaved Lab centroids per data column. */
+type CentroidTable = Float64Array<ArrayBuffer>;
+
+interface CentroidRefinementScratch {
+  readonly counts: Int32Array<ArrayBuffer>;
+  readonly starts: Int32Array<ArrayBuffer>;
+  readonly cursors: Int32Array<ArrayBuffer>;
+  readonly groupedIndices: Int32Array<ArrayBuffer>;
+  readonly median: Float64Array<ArrayBuffer>;
+  readonly anchors: Float64Array<ArrayBuffer>;
 }
 
-function mixLab(left: LabColor, right: LabColor, position: number): LabColor {
+function createCentroidRefinementScratch(cellCount: number): CentroidRefinementScratch {
   return {
-    l: mix(left.l, right.l, position),
-    a: mix(left.a, right.a, position),
-    b: mix(left.b, right.b, position),
+    counts: new Int32Array(REFINEMENT_GROUPS),
+    starts: new Int32Array(REFINEMENT_GROUPS),
+    cursors: new Int32Array(REFINEMENT_GROUPS),
+    groupedIndices: new Int32Array(cellCount),
+    median: new Float64Array(cellCount),
+    anchors: new Float64Array(REFINEMENT_GROUPS * LAB_COMPONENTS),
   };
 }
 
@@ -1469,28 +1605,60 @@ function mixLab(left: LabColor, right: LabColor, position: number): LabColor {
  */
 function refineCentroids(
   labels: Uint8Array,
-  labs: readonly LabColor[],
-  positions: readonly number[],
-): CentroidField | undefined {
-  const halves: LabColor[][][] = [0, 1, 2, 3].map(() => [[], []]);
+  labs: Float64Array,
+  positions: Float64Array,
+  columnPositions: Float64Array,
+  scratch: CentroidRefinementScratch,
+): CentroidTable | undefined {
+  scratch.counts.fill(0);
   for (let index = 0; index < labels.length; index++) {
-    halves[labels[index]!]![positions[index]! < 0.5 ? 0 : 1]!.push(labs[index]!);
+    const group = labels[index]! * 2 + (positions[index]! < 0.5 ? 0 : 1);
+    scratch.counts[group] = scratch.counts[group]! + 1;
   }
-  const anchors: (readonly [LabColor, LabColor])[] = [];
-  for (const [left, right] of halves) {
-    if (
-      left!.length < DECISION_DIRECTED_MINIMUM_SAMPLES ||
-      right!.length < DECISION_DIRECTED_MINIMUM_SAMPLES
-    ) {
-      return undefined;
+  let start = 0;
+  for (let group = 0; group < REFINEMENT_GROUPS; group++) {
+    if (scratch.counts[group]! < DECISION_DIRECTED_MINIMUM_SAMPLES) return undefined;
+    scratch.starts[group] = start;
+    scratch.cursors[group] = start;
+    start += scratch.counts[group]!;
+  }
+
+  // Group cell indexes once, then reuse one typed median buffer for every
+  // class/half/channel combination. This replaces 24 mapped JS arrays per pass.
+  for (let index = 0; index < labels.length; index++) {
+    const group = labels[index]! * 2 + (positions[index]! < 0.5 ? 0 : 1);
+    const cursor = scratch.cursors[group]!;
+    scratch.groupedIndices[cursor] = index;
+    scratch.cursors[group] = cursor + 1;
+  }
+  for (let group = 0; group < REFINEMENT_GROUPS; group++) {
+    const count = scratch.counts[group]!;
+    const groupStart = scratch.starts[group]!;
+    for (let component = 0; component < LAB_COMPONENTS; component++) {
+      for (let item = 0; item < count; item++) {
+        const cellIndex = scratch.groupedIndices[groupStart + item]!;
+        scratch.median[item] = labs[cellIndex * LAB_COMPONENTS + component]!;
+      }
+      scratch.anchors[group * LAB_COMPONENTS + component] =
+        medianOfScratch(scratch.median, count);
     }
-    anchors.push([medianLab(left!), medianLab(right!)]);
   }
+
   const span = DECISION_DIRECTED_RIGHT_ANCHOR - DECISION_DIRECTED_LEFT_ANCHOR;
-  return (position) => {
+  const table = new Float64Array(columnPositions.length * COLOR4_CENTROIDS * LAB_COMPONENTS);
+  for (let column = 0; column < columnPositions.length; column++) {
+    const position = columnPositions[column]!;
     const t = clamp01((position - DECISION_DIRECTED_LEFT_ANCHOR) / span);
-    return anchors.map(([left, right]) => mixLab(left, right, t));
-  };
+    for (let candidate = 0; candidate < COLOR4_CENTROIDS; candidate++) {
+      const left = (candidate * 2) * LAB_COMPONENTS;
+      const right = left + LAB_COMPONENTS;
+      const output = (column * COLOR4_CENTROIDS + candidate) * LAB_COMPONENTS;
+      table[output] = mix(scratch.anchors[left]!, scratch.anchors[right]!, t);
+      table[output + 1] = mix(scratch.anchors[left + 1]!, scratch.anchors[right + 1]!, t);
+      table[output + 2] = mix(scratch.anchors[left + 2]!, scratch.anchors[right + 2]!, t);
+    }
+  }
+  return table;
 }
 
 /**
@@ -1505,47 +1673,141 @@ function refineCentroids(
  * results. Tabulating by column is arithmetically identical and computes each
  * one once.
  */
-type CentroidTable = readonly (readonly LabColor[])[];
-
 function tabulateCentroids(
   field: CentroidField,
-  columnPositions: readonly number[],
+  columnPositions: Float64Array,
 ): CentroidTable {
-  return columnPositions.map((position) => field(position));
+  const table = new Float64Array(columnPositions.length * COLOR4_CENTROIDS * LAB_COMPONENTS);
+  for (let column = 0; column < columnPositions.length; column++) {
+    const centroids = field(columnPositions[column]!);
+    for (let candidate = 0; candidate < COLOR4_CENTROIDS; candidate++) {
+      const centroid = centroids[candidate]!;
+      const offset = (column * COLOR4_CENTROIDS + candidate) * LAB_COMPONENTS;
+      table[offset] = centroid.l;
+      table[offset + 1] = centroid.a;
+      table[offset + 2] = centroid.b;
+    }
+  }
+  return table;
+}
+
+function centroidOffset(column: number, candidate: number): number {
+  return (column * COLOR4_CENTROIDS + candidate) * LAB_COMPONENTS;
+}
+
+function squaredLabDistance(
+  labs: Float64Array,
+  labOffset: number,
+  centroids: CentroidTable,
+  targetOffset: number,
+): number {
+  const deltaL = labs[labOffset]! - centroids[targetOffset]!;
+  const deltaA = labs[labOffset + 1]! - centroids[targetOffset + 1]!;
+  const deltaB = labs[labOffset + 2]! - centroids[targetOffset + 2]!;
+  return deltaL * deltaL + deltaA * deltaA + deltaB * deltaB;
+}
+
+function realLabDistance(
+  labs: Float64Array,
+  labOffset: number,
+  centroids: CentroidTable,
+  targetOffset: number,
+): number {
+  return Math.hypot(
+    labs[labOffset]! - centroids[targetOffset]!,
+    labs[labOffset + 1]! - centroids[targetOffset + 1]!,
+    labs[labOffset + 2]! - centroids[targetOffset + 2]!,
+  );
+}
+
+/** Select a label using squared dE; no square root is needed for labelling. */
+function nearestCentroidDibit(
+  labs: Float64Array,
+  labOffset: number,
+  centroids: CentroidTable,
+  column: number,
+): Dibit {
+  let bestSquared = Number.POSITIVE_INFINITY;
+  let dibit: Dibit = 0;
+  for (let candidate = 0; candidate < COLOR4_CENTROIDS; candidate++) {
+    const squared = squaredLabDistance(
+      labs,
+      labOffset,
+      centroids,
+      centroidOffset(column, candidate),
+    );
+    if (squared < bestSquared) {
+      bestSquared = squared;
+      dibit = candidate as Dibit;
+    }
+  }
+  return dibit;
+}
+
+/**
+ * Select with squared distances, then calculate real CIE76 only for the two
+ * winners because those are the only distances consumed by thresholds and
+ * diagnostics.
+ */
+function nearestCentroidDistances(
+  labs: Float64Array,
+  labOffset: number,
+  centroids: CentroidTable,
+  column: number,
+  distances: Float64Array,
+): Dibit {
+  let bestSquared = Number.POSITIVE_INFINITY;
+  let secondSquared = Number.POSITIVE_INFINITY;
+  let bestCandidate: Dibit = 0;
+  let secondCandidate: Dibit = 0;
+  for (let candidate = 0; candidate < COLOR4_CENTROIDS; candidate++) {
+    const squared = squaredLabDistance(
+      labs,
+      labOffset,
+      centroids,
+      centroidOffset(column, candidate),
+    );
+    if (squared < bestSquared) {
+      secondSquared = bestSquared;
+      secondCandidate = bestCandidate;
+      bestSquared = squared;
+      bestCandidate = candidate as Dibit;
+    } else if (squared < secondSquared) {
+      secondSquared = squared;
+      secondCandidate = candidate as Dibit;
+    }
+  }
+  distances[0] = realLabDistance(
+    labs,
+    labOffset,
+    centroids,
+    centroidOffset(column, bestCandidate),
+  );
+  distances[1] = realLabDistance(
+    labs,
+    labOffset,
+    centroids,
+    centroidOffset(column, secondCandidate),
+  );
+  return bestCandidate;
 }
 
 /** Mean distance from each cell to its winning centroid: lower is a better fit. */
 function meanWinningDistance(
-  labs: readonly LabColor[],
+  labs: Float64Array,
   columns: Int32Array,
   centroids: CentroidTable,
 ): number {
-  if (labs.length === 0) return 0;
+  const cells = columns.length;
+  if (cells === 0) return 0;
   let total = 0;
-  for (let index = 0; index < labs.length; index++) {
-    total += nearestCentroid(labs[index]!, centroids[columns[index]!]!).bestDeltaE;
+  for (let index = 0; index < cells; index++) {
+    const labOffset = index * LAB_COMPONENTS;
+    const column = columns[index]!;
+    const dibit = nearestCentroidDibit(labs, labOffset, centroids, column);
+    total += realLabDistance(labs, labOffset, centroids, centroidOffset(column, dibit));
   }
-  return total / labs.length;
-}
-
-function nearestCentroid(
-  lab: LabColor,
-  centroids: readonly LabColor[],
-): { dibit: Dibit; bestDeltaE: number; secondDeltaE: number } {
-  let best = Number.POSITIVE_INFINITY;
-  let second = Number.POSITIVE_INFINITY;
-  let dibit: Dibit = 0;
-  for (let candidate = 0; candidate < centroids.length; candidate++) {
-    const distance = deltaE76(lab, centroids[candidate]!);
-    if (distance < best) {
-      second = best;
-      best = distance;
-      dibit = candidate as Dibit;
-    } else if (distance < second) {
-      second = distance;
-    }
-  }
-  return { dibit, bestDeltaE: best, secondDeltaE: second };
+  return total / cells;
 }
 
 /** Classify one normalized RGB cell against four normalized RGB centroids. */
@@ -1556,30 +1818,28 @@ export function classifyLabCell(
   minimumGap: number,
 ): LabClassification {
   if (centroids.length !== 4) throw new RangeError("COLOR_4 needs exactly four centroids.");
-  const sampleLab = normalizedRgbToLab(sample);
-  const ranked = centroids
-    .map((centroid, dibit) => ({
-      dibit: dibit as Dibit,
-      distance: deltaE76(sampleLab, normalizedRgbToLab(centroid)),
-    }))
-    .sort((left, right) => left.distance - right.distance);
-  const best = ranked[0]!;
-  const second = ranked[1]!;
+  const sampleLab = new Float64Array(LAB_COMPONENTS);
+  writeNormalizedRgbToLab(sample[0], sample[1], sample[2], sampleLab, 0);
+  const centroidTable = new Float64Array(COLOR4_CENTROIDS * LAB_COMPONENTS);
+  for (let candidate = 0; candidate < COLOR4_CENTROIDS; candidate++) {
+    const centroid = centroids[candidate]!;
+    writeNormalizedRgbToLab(
+      centroid[0],
+      centroid[1],
+      centroid[2],
+      centroidTable,
+      candidate * LAB_COMPONENTS,
+    );
+  }
+  const distances = new Float64Array(2);
+  const dibit = nearestCentroidDistances(sampleLab, 0, centroidTable, 0, distances);
+  const bestDeltaE = distances[0]!;
+  const secondDeltaE = distances[1]!;
   return {
-    dibit: best.dibit,
-    erased: best.distance > maximumDeltaE || second.distance - best.distance < minimumGap,
-    bestDeltaE: best.distance,
-    secondDeltaE: second.distance,
-  };
-}
-
-function interpolatedAnchors(model: CalibrationModel, position: number): {
-  black: FloatRgb;
-  white: FloatRgb;
-} {
-  return {
-    black: mixRgb(model.left.K, model.right.K, position),
-    white: mixRgb(model.left.W, model.right.W, position),
+    dibit,
+    erased: bestDeltaE > maximumDeltaE || secondDeltaE - bestDeltaE < minimumGap,
+    bestDeltaE,
+    secondDeltaE,
   };
 }
 
@@ -1635,15 +1895,27 @@ function observeBinaryAnchorsByFiducial(
   });
 }
 
-/**
- * Decode a square, orientation-correct, homography-normalized COLOR_4 raster.
- * Camera location and perspective recovery intentionally live outside this
- * pure routine. The returned erasure indices feed unwrapColor4Frame directly.
- */
-export function decodeCanonicalColor4Raster(
-  image: CanonicalRasterImage,
+type CanonicalClassifierInputKind = "raster" | "moduleSamples";
+type CanonicalClassifierMode = "decode" | "guard";
+
+function decodeCanonicalColor4(
+  image: CanonicalRasterImage | CanonicalModuleSamples,
+  inputKind: CanonicalClassifierInputKind,
+  mode: "decode",
+  options?: DecodeCanonicalRasterOptions,
+): CanonicalRasterResult;
+function decodeCanonicalColor4(
+  image: CanonicalRasterImage | CanonicalModuleSamples,
+  inputKind: CanonicalClassifierInputKind,
+  mode: "guard",
+  options?: DecodeCanonicalRasterOptions,
+): CanonicalColor4GuardResult;
+function decodeCanonicalColor4(
+  image: CanonicalRasterImage | CanonicalModuleSamples,
+  inputKind: CanonicalClassifierInputKind,
+  mode: CanonicalClassifierMode,
   options: DecodeCanonicalRasterOptions = {},
-): CanonicalRasterResult {
+): CanonicalRasterResult | CanonicalColor4GuardResult {
   const values = diagnostics();
   const observing = options.observer !== undefined;
   const thresholds = resolveThresholds(options.thresholds);
@@ -1706,20 +1978,34 @@ export function decodeCanonicalColor4Raster(
     });
     stageStartedAt = readClock(options.clock);
   };
-  if (
-    !Number.isInteger(image.width) ||
-    !Number.isInteger(image.height) ||
-    image.width <= 0 ||
-    image.width !== image.height ||
-    image.width % TOTAL_MODULES !== 0 ||
-    image.pixels.length < image.width * image.height * 4
-  ) {
+  let sampler: ModuleSampler | undefined;
+  if (inputKind === "raster") {
+    const raster = image as CanonicalRasterImage;
+    if (
+      Number.isInteger(raster.width) &&
+      Number.isInteger(raster.height) &&
+      raster.width > 0 &&
+      raster.width === raster.height &&
+      raster.width % TOTAL_MODULES === 0 &&
+      raster.pixels.length >= raster.width * raster.height * 4
+    ) {
+      sampler = createRasterSampler(raster, raster.width / TOTAL_MODULES);
+    }
+  } else {
+    const samples = image as CanonicalModuleSamples;
+    if (
+      samples.width === TOTAL_MODULES &&
+      samples.height === TOTAL_MODULES &&
+      hasValidCanonicalModuleRgb(samples.rgb)
+    ) {
+      sampler = createModuleSampleSampler(samples);
+    }
+  }
+  if (sampler === undefined) {
     finishGeometry("rejected", "invalid_dimensions");
     return rejected("invalid_dimensions", values);
   }
-  const scale = image.width / TOTAL_MODULES;
-  values.moduleScale = scale;
-  const sampler = createSampler(image, scale);
+  values.moduleScale = sampler.scale;
   const collectedAnchors = collectBinaryAnchors(sampler);
   const anchors = createSpatialBinaryAnchorModel(collectedAnchors.byFiducial);
   const rgbAnchors = createSpatialRgbBinaryAnchorModel(collectedAnchors.rgbByFiducial);
@@ -1824,6 +2110,16 @@ export function decodeCanonicalColor4Raster(
     topPhase !== bootstrap.sequencePhase
   ) {
     finishBootstrap("rejected", "phase_mismatch", bootstrap, topPhase, bottomPhase);
+    if (mode === "guard") {
+      return Object.freeze({
+        status: "transition",
+        reason: "phase_mismatch",
+        profile,
+        paletteId,
+        sequencePhase: bootstrap.sequencePhase,
+        diagnostics: freezeDiagnostics(values),
+      });
+    }
     return rejected("phase_mismatch", values);
   }
   finishBootstrap("completed", undefined, bootstrap, topPhase, bottomPhase);
@@ -1879,6 +2175,15 @@ export function decodeCanonicalColor4Raster(
   if (calibrationRejected) {
     return rejected("calibration_failed", values);
   }
+  if (mode === "guard") {
+    return Object.freeze({
+      status: "valid",
+      profile,
+      paletteId,
+      sequencePhase: bootstrap.sequencePhase,
+      diagnostics: freezeDiagnostics(values),
+    });
+  }
 
   const dynamicMaximumDeltaE = Math.min(
     45,
@@ -1890,12 +2195,11 @@ export function decodeCanonicalColor4Raster(
   const codedBytes = new Uint8Array(profile.codedBytes);
   const erasures: number[] = [];
   const erasureCandidates: Color4ByteErasureCandidate[] = [];
-  const erasureCandidateScores: number[] = [];
+  const erasureCandidateScores = new Float64Array(profile.codedBytes);
+  let erasureCandidateCount = 0;
   const erasuresByShard = Array<number>(profile.shards).fill(0);
   const uncertainCellsByRow = Array<number>(profile.rows).fill(0);
   const uncertainCellsByColumn = Array<number>(profile.columns).fill(0);
-  const bestDeltaEValues: number[] = [];
-  const deltaEGapValues: number[] = [];
   const observedCells: RankedCellBuffer | undefined = !observingDetail
     ? undefined
     : { entries: [], leastIndex: 0, leastScore: Number.POSITIVE_INFINITY };
@@ -1907,16 +2211,31 @@ export function decodeCanonicalColor4Raster(
   // to label it, then against centroids re-estimated from those labels — and
   // re-reading pixels for each pass would cost more than the refinement saves.
   const cellCount = profile.columns * profile.rows;
+  const bestDeltaEValues = new Float64Array(cellCount);
+  const deltaEGapValues = new Float64Array(cellCount);
   // Everything that depends only on a cell's horizontal position is tabulated by
   // column once, rather than recomputed for each of the cells in that column.
-  const columnPosition: readonly number[] = Array.from(
-    { length: profile.columns },
-    (_, column) => profile.columns === 1 ? 0.5 : column / (profile.columns - 1),
-  );
-  const columnAnchors = columnPosition.map((position) => interpolatedAnchors(model, position));
-  const cellRaw: FloatRgb[] = new Array<FloatRgb>(cellCount);
-  const cellNormalized: FloatRgb[] = new Array<FloatRgb>(cellCount);
-  const cellLab: LabColor[] = new Array<LabColor>(cellCount);
+  const columnPosition = new Float64Array(profile.columns);
+  // Per column: black RGB followed by white RGB. These anchors and every data
+  // cell live in contiguous typed storage and are reused by all refinement
+  // passes and the final classification pass.
+  const columnAnchors = new Float64Array(profile.columns * 6);
+  for (let column = 0; column < profile.columns; column++) {
+    const position = profile.columns === 1 ? 0.5 : column / (profile.columns - 1);
+    columnPosition[column] = position;
+    const offset = column * 6;
+    columnAnchors[offset] = mix(model.left.K[0], model.right.K[0], position);
+    columnAnchors[offset + 1] = mix(model.left.K[1], model.right.K[1], position);
+    columnAnchors[offset + 2] = mix(model.left.K[2], model.right.K[2], position);
+    columnAnchors[offset + 3] = mix(model.left.W[0], model.right.W[0], position);
+    columnAnchors[offset + 4] = mix(model.left.W[1], model.right.W[1], position);
+    columnAnchors[offset + 5] = mix(model.left.W[2], model.right.W[2], position);
+  }
+  // Raw values are needed only while an observer is active (clipping and
+  // detailed cells); normalized values are retained only for detailed cells.
+  const cellRaw = observing ? new Float64Array(cellCount * 3) : undefined;
+  const cellNormalized = observingDetail ? new Float64Array(cellCount * 3) : undefined;
+  const cellLab = new Float64Array(cellCount * LAB_COMPONENTS);
   const cellPosition = new Float64Array(cellCount);
   const cellColumn = new Int32Array(cellCount);
   for (let index = 0; index < cellCount; index++) {
@@ -1924,11 +2243,37 @@ export function decodeCanonicalColor4Raster(
     const row = (index - column) / profile.columns;
     const position = columnPosition[column]!;
     const raw = colourSampler.sampleActive(layout.data.x + column, layout.data.y + row);
-    const cellAnchors = columnAnchors[column]!;
-    const normalized = normalizedWithAnchors(raw, cellAnchors.black, cellAnchors.white);
-    cellRaw[index] = raw;
-    cellNormalized[index] = normalized;
-    cellLab[index] = normalizedRgbToLab(normalized);
+    const anchorOffset = column * 6;
+    const normalizedRed = clamp01(
+      (raw[0] - columnAnchors[anchorOffset]!) /
+      Math.max(1, columnAnchors[anchorOffset + 3]! - columnAnchors[anchorOffset]!),
+    );
+    const normalizedGreen = clamp01(
+      (raw[1] - columnAnchors[anchorOffset + 1]!) /
+      Math.max(1, columnAnchors[anchorOffset + 4]! - columnAnchors[anchorOffset + 1]!),
+    );
+    const normalizedBlue = clamp01(
+      (raw[2] - columnAnchors[anchorOffset + 2]!) /
+      Math.max(1, columnAnchors[anchorOffset + 5]! - columnAnchors[anchorOffset + 2]!),
+    );
+    const valueOffset = index * 3;
+    if (cellRaw !== undefined) {
+      cellRaw[valueOffset] = raw[0];
+      cellRaw[valueOffset + 1] = raw[1];
+      cellRaw[valueOffset + 2] = raw[2];
+    }
+    if (cellNormalized !== undefined) {
+      cellNormalized[valueOffset] = normalizedRed;
+      cellNormalized[valueOffset + 1] = normalizedGreen;
+      cellNormalized[valueOffset + 2] = normalizedBlue;
+    }
+    writeNormalizedRgbToLab(
+      normalizedRed,
+      normalizedGreen,
+      normalizedBlue,
+      cellLab,
+      index * LAB_COMPONENTS,
+    );
     cellPosition[index] = position;
     cellColumn[index] = column;
   }
@@ -1945,20 +2290,31 @@ export function decodeCanonicalColor4Raster(
   // rather than assuming it keeps the change strictly non-regressive.
   let bestFit = meanWinningDistance(cellLab, cellColumn, centroidTable);
   const labels = new Uint8Array(cellCount);
-  const positions = Array.from(cellPosition);
+  const refinementScratch = createCentroidRefinementScratch(cellCount);
   for (let pass = 0; pass < DECISION_DIRECTED_PASSES; pass++) {
     for (let index = 0; index < cellCount; index++) {
-      labels[index] = nearestCentroid(cellLab[index]!, centroidTable[cellColumn[index]!]!).dibit;
+      labels[index] = nearestCentroidDibit(
+        cellLab,
+        index * LAB_COMPONENTS,
+        centroidTable,
+        cellColumn[index]!,
+      );
     }
-    const refined = refineCentroids(labels, cellLab, positions);
-    if (refined === undefined) break;
-    const refinedTable = tabulateCentroids(refined, columnPosition);
+    const refinedTable = refineCentroids(
+      labels,
+      cellLab,
+      cellPosition,
+      columnPosition,
+      refinementScratch,
+    );
+    if (refinedTable === undefined) break;
     const fit = meanWinningDistance(cellLab, cellColumn, refinedTable);
     if (fit >= bestFit) break;
     bestFit = fit;
     centroidTable = refinedTable;
   }
 
+  const nearestDistances = new Float64Array(2);
   for (let byteIndex = 0; byteIndex < codedBytes.length; byteIndex++) {
     let byte = 0;
     let byteErased = false;
@@ -1966,28 +2322,28 @@ export function decodeCanonicalColor4Raster(
     for (let dibitIndex = 0; dibitIndex < 4; dibitIndex++) {
       const column = cell % profile.columns;
       const row = Math.floor(cell / profile.columns);
-      const raw = cellRaw[cell]!;
-      const normalized = cellNormalized[cell]!;
-      const nearest = nearestCentroid(cellLab[cell]!, centroidTable[column]!);
-      const classified: LabClassification = {
-        dibit: nearest.dibit,
-        erased: nearest.bestDeltaE > dynamicMaximumDeltaE ||
-          nearest.secondDeltaE - nearest.bestDeltaE < dynamicMinimumGap,
-        bestDeltaE: nearest.bestDeltaE,
-        secondDeltaE: nearest.secondDeltaE,
-      };
-      const deltaEGap = classified.secondDeltaE - classified.bestDeltaE;
-      const distanceRejected = classified.bestDeltaE > dynamicMaximumDeltaE;
+      const dibit = nearestCentroidDistances(
+        cellLab,
+        cell * LAB_COMPONENTS,
+        centroidTable,
+        column,
+        nearestDistances,
+      );
+      const bestDeltaE = nearestDistances[0]!;
+      const secondDeltaE = nearestDistances[1]!;
+      const deltaEGap = secondDeltaE - bestDeltaE;
+      const distanceRejected = bestDeltaE > dynamicMaximumDeltaE;
       const gapRejected = deltaEGap < dynamicMinimumGap;
+      const erased = distanceRejected || gapRejected;
       const erasureScore = cellErasureCandidateScore(
-        classified.bestDeltaE,
+        bestDeltaE,
         deltaEGap,
         dynamicMaximumDeltaE,
         dynamicMinimumGap,
       );
       byteErasureScore = Math.max(byteErasureScore, erasureScore);
-      byte = (byte << 2) | classified.dibit;
-      if (classified.erased) {
+      byte = (byte << 2) | dibit;
+      if (erased) {
         byteErased = true;
         values.uncertainCells++;
         uncertainCellsByRow[row] = (uncertainCellsByRow[row] ?? 0) + 1;
@@ -1996,13 +2352,23 @@ export function decodeCanonicalColor4Raster(
       if (distanceRejected) values.distanceRejectedCells++;
       if (gapRejected) values.gapRejectedCells++;
       if (distanceRejected && gapRejected) values.bothRejectedCells++;
-      if (observing) {
-        const clipped = rawClippedChannels(raw);
+      if (observing && cellRaw !== undefined) {
+        const valueOffset = cell * 3;
+        const rawRed = cellRaw[valueOffset]!;
+        const rawGreen = cellRaw[valueOffset + 1]!;
+        const rawBlue = cellRaw[valueOffset + 2]!;
+        const clipped =
+          (rawRed <= 1 || rawRed >= 254 ? 1 : 0) +
+          (rawGreen <= 1 || rawGreen >= 254 ? 1 : 0) +
+          (rawBlue <= 1 || rawBlue >= 254 ? 1 : 0);
         clippedChannels += clipped;
-        if (observedCells !== undefined) {
+        if (observedCells !== undefined && cellNormalized !== undefined) {
+          const normalizedRed = cellNormalized[valueOffset]!;
+          const normalizedGreen = cellNormalized[valueOffset + 1]!;
+          const normalizedBlue = cellNormalized[valueOffset + 2]!;
           const score = cellObservationScore(
-            classified.erased,
-            classified.bestDeltaE,
+            erased,
+            bestDeltaE,
             deltaEGap,
             dynamicMinimumGap,
           );
@@ -2012,28 +2378,28 @@ export function decodeCanonicalColor4Raster(
             dibitIndex: dibitIndex as 0 | 1 | 2 | 3,
             column,
             row,
-            raw: cloneRgb(raw),
-            normalized: cloneRgb(normalized),
-            dibit: classified.dibit,
-            erased: classified.erased,
-            bestDeltaE: classified.bestDeltaE,
-            secondDeltaE: classified.secondDeltaE,
+            raw: [rawRed, rawGreen, rawBlue] as FloatRgb,
+            normalized: [normalizedRed, normalizedGreen, normalizedBlue] as FloatRgb,
+            dibit,
+            erased,
+            bestDeltaE,
+            secondDeltaE,
             deltaEGap,
             clippedChannels: clipped,
           }));
         }
       }
-      totalBestDeltaE += classified.bestDeltaE;
-      bestDeltaEValues.push(classified.bestDeltaE);
-      deltaEGapValues.push(deltaEGap);
-      values.maximumBestDeltaE = Math.max(values.maximumBestDeltaE, classified.bestDeltaE);
+      totalBestDeltaE += bestDeltaE;
+      bestDeltaEValues[cell] = bestDeltaE;
+      deltaEGapValues[cell] = deltaEGap;
+      values.maximumBestDeltaE = Math.max(values.maximumBestDeltaE, bestDeltaE);
       cell++;
     }
     codedBytes[byteIndex] = byte;
     if (byteErased) {
       erasures.push(byteIndex);
       erasureCandidates.push(Object.freeze({ index: byteIndex, score: byteErasureScore }));
-      erasureCandidateScores.push(byteErasureScore);
+      erasureCandidateScores[erasureCandidateCount++] = byteErasureScore;
       const shard = shardPosition(byteIndex, profile.shards).shard;
       erasuresByShard[shard] = (erasuresByShard[shard] ?? 0) + 1;
     }
@@ -2049,7 +2415,9 @@ export function decodeCanonicalColor4Raster(
   values.uncertainCellsByColumn = uncertainCellsByColumn;
   values.bestDeltaE = classifierDistribution(bestDeltaEValues);
   values.deltaEGap = classifierDistribution(deltaEGapValues);
-  values.erasureCandidateScore = classifierDistribution(erasureCandidateScores);
+  values.erasureCandidateScore = classifierDistribution(
+    erasureCandidateScores.subarray(0, erasureCandidateCount),
+  );
   values.meanBestDeltaE = totalBestDeltaE / bestDeltaEValues.length;
   assertCompletedClassificationDiagnostics(values, profile);
   const classificationTiming = observing
@@ -2083,4 +2451,46 @@ export function decodeCanonicalColor4Raster(
     byteErasureCandidates: Object.freeze(erasureCandidates),
     diagnostics: freezeDiagnostics(values),
   });
+}
+
+/**
+ * Decode a square, orientation-correct, homography-normalized COLOR_4 raster.
+ * Camera location and perspective recovery intentionally live outside this
+ * pure routine. The returned erasure indices feed unwrapColor4Frame directly.
+ */
+export function decodeCanonicalColor4Raster(
+  image: CanonicalRasterImage,
+  options: DecodeCanonicalRasterOptions = {},
+): CanonicalRasterResult {
+  return decodeCanonicalColor4(image, "raster", "decode", options);
+}
+
+/**
+ * Decode one compact RGB sample per canonical COLOR_4 module.
+ *
+ * This is semantically identical to `decodeCanonicalColor4Raster`: geometry,
+ * bootstrap, phase, calibration, colour classification, erasures, and
+ * diagnostics all run through the same classifier pipeline and thresholds.
+ */
+export function decodeCanonicalColor4Samples(
+  samples: CanonicalModuleSamples,
+  options: DecodeCanonicalRasterOptions = {},
+): CanonicalRasterResult {
+  return decodeCanonicalColor4(samples, "moduleSamples", "decode", options);
+}
+
+/**
+ * Validate compact canonical samples through every pre-payload stage.
+ *
+ * This runs the same fiducial, quiet-zone, bootstrap, timing-rail, phase-pilot,
+ * ISI, and calibration logic as the full decoder, then stops before sampling or
+ * classifying data cells. A disagreement between otherwise-decodable pilots is
+ * reported as `transition`, allowing callers to drop display transitions
+ * without treating geometry or tracking as failed.
+ */
+export function guardCanonicalColor4Samples(
+  samples: CanonicalModuleSamples,
+  options: DecodeCanonicalRasterOptions = {},
+): CanonicalColor4GuardResult {
+  return decodeCanonicalColor4(samples, "moduleSamples", "guard", options);
 }

@@ -11,6 +11,7 @@ import {
   DEFAULT_COLOR4_CANONICAL_SCALE,
   DEFAULT_COLOR4_DETECTION_DIMENSION,
 } from "../shared/receiver-defaults";
+import type { CanonicalModuleSamples } from "../shared/color4/classifier";
 import type {
   VisionCandidateScore,
   VisionCandidateStatus,
@@ -24,6 +25,9 @@ import type {
   VisionEffectiveConfig,
   VisionFiducialMatch,
   VisionHomographyMethod,
+  VisionHomography,
+  VisionGrayscaleFrame,
+  VisionCompactSamplingDiagnostics,
   VisionOpticalMetrics,
   VisionOptions,
   VisionPlane,
@@ -37,6 +41,13 @@ import type {
   VisionThresholdPass,
   VisionWarning,
   VisionWarpInterpolation,
+  VisionTemporalHint,
+  VisionTemporalHintInput,
+  VisionTemporalTrackCandidate,
+  VisionTemporalTrackingDiagnostics,
+  VisionTemporalTrackingResult,
+  VisionTemporalTrackingThresholds,
+  VisionTemporalAcquisitionResult,
 } from "./color4-vision-types";
 
 export type {
@@ -53,6 +64,9 @@ export type {
   VisionEffectiveConfig,
   VisionFiducialMatch,
   VisionHomographyMethod,
+  VisionHomography,
+  VisionGrayscaleFrame,
+  VisionCompactSamplingDiagnostics,
   VisionOpticalMetrics,
   VisionOptions,
   VisionPlane,
@@ -66,9 +80,18 @@ export type {
   VisionThresholdPass,
   VisionWarning,
   VisionWarpInterpolation,
+  VisionTemporalHint,
+  VisionTemporalHintInput,
+  VisionTemporalRejectReason,
+  VisionTemporalTrackCandidate,
+  VisionTemporalTrackingDiagnostics,
+  VisionTemporalTrackingResult,
+  VisionTemporalTrackingThresholds,
+  VisionTemporalAcquisitionResult,
+  ValidVisionTemporalAcquisitionResult,
 } from "./color4-vision-types";
 
-interface CvMat {
+export interface CvMat {
   rows: number;
   cols: number;
   data: Uint8Array;
@@ -87,14 +110,18 @@ interface CvMatVector {
 }
 
 export interface OpenCvRuntime {
-  Mat: new () => CvMat;
+  Mat: new (rows?: number, columns?: number, type?: unknown, fill?: unknown) => CvMat;
   MatVector: new () => CvMatVector;
   Size: new (width: number, height: number) => unknown;
   /** Needed only by the search-region crop; its absence disables that path. */
   Rect?: new (x: number, y: number, width: number, height: number) => unknown;
   Scalar: new (...values: number[]) => unknown;
   CV_32FC2: unknown;
+  CV_32FC1?: unknown;
+  CV_16SC2?: unknown;
+  CV_8UC1?: unknown;
   COLOR_RGBA2GRAY: number;
+  COLOR_RGBA2RGB?: number;
   INTER_AREA: number;
   INTER_LINEAR: number;
   INTER_NEAREST?: number;
@@ -148,6 +175,31 @@ export interface OpenCvRuntime {
     flags?: number,
     borderMode?: number,
     borderValue?: unknown,
+  ): void;
+  calcOpticalFlowPyrLK?(
+    previous: CvMat,
+    current: CvMat,
+    previousPoints: CvMat,
+    currentPoints: CvMat,
+    status: CvMat,
+    errors: CvMat,
+  ): void;
+  remap?(
+    source: CvMat,
+    destination: CvMat,
+    map1: CvMat,
+    map2: CvMat,
+    interpolation: number,
+    borderMode?: number,
+    borderValue?: unknown,
+  ): void;
+  convertMaps?(
+    map1: CvMat,
+    map2: CvMat,
+    destinationMap1: CvMat,
+    destinationMap2: CvMat,
+    destinationType: unknown,
+    nearestNeighbourInterpolation?: boolean,
   ): void;
 }
 
@@ -1749,13 +1801,1022 @@ function deleteHomography(solution: HomographySolution | undefined): void {
   solution?.sourcePoints.delete();
 }
 
-export function normalizeColor4WithOpenCv(
+const TEMPORAL_CORNER_COUNT = 16;
+const TEMPORAL_MINIMUM_TRACKED_CORNERS = 12;
+const TEMPORAL_MAXIMUM_FORWARD_BACKWARD_P95_PX = 1.5;
+const TEMPORAL_MAXIMUM_RESIDUAL_MODULES = 0.5;
+const TEMPORAL_MINIMUM_AREA_RATIO = 0.75;
+const TEMPORAL_MAXIMUM_AREA_RATIO = 1.33;
+/** LK needs only sixteen textured points; 960 keeps its pyramid below the frame budget. */
+const TEMPORAL_DEFAULT_TRACKING_DIMENSION: VisionDetectionLimit = 960;
+
+function homographyCoefficients(transform: CvMat): VisionHomography | undefined {
+  const source = (transform.data64F?.length ?? 0) >= 9
+    ? transform.data64F
+    : (transform.data32F?.length ?? 0) >= 9
+      ? transform.data32F
+      : undefined;
+  if (source === undefined) return undefined;
+  return normalizedHomography(source);
+}
+
+function normalizedHomography(values: ArrayLike<number>): VisionHomography | undefined {
+  if (values.length < 9) return undefined;
+  const copied = Array.from({ length: 9 }, (_, index) => Number(values[index]));
+  if (!copied.every(Number.isFinite)) return undefined;
+  const scale = Math.abs(copied[8]!) > 1e-12
+    ? copied[8]!
+    : Math.max(...copied.map(Math.abs));
+  if (!Number.isFinite(scale) || Math.abs(scale) <= 1e-12) return undefined;
+  const normalized = copied.map((value) => value / scale);
+  return [
+    normalized[0]!, normalized[1]!, normalized[2]!,
+    normalized[3]!, normalized[4]!, normalized[5]!,
+    normalized[6]!, normalized[7]!, normalized[8]!,
+  ];
+}
+
+function multiplyHomographies(
+  left: VisionHomography,
+  right: VisionHomography,
+): VisionHomography | undefined {
+  const values = new Array<number>(9).fill(0);
+  for (let row = 0; row < 3; row++) {
+    for (let column = 0; column < 3; column++) {
+      for (let inner = 0; inner < 3; inner++) {
+        values[row * 3 + column]! += left[row * 3 + inner]! * right[inner * 3 + column]!;
+      }
+    }
+  }
+  return normalizedHomography(values);
+}
+
+function inverseHomography(transform: VisionHomography): VisionHomography | undefined {
+  const [a, b, c, d, e, f, g, h, i] = transform;
+  const cofactor00 = e * i - f * h;
+  const cofactor01 = c * h - b * i;
+  const cofactor02 = b * f - c * e;
+  const cofactor10 = f * g - d * i;
+  const cofactor11 = a * i - c * g;
+  const cofactor12 = c * d - a * f;
+  const cofactor20 = d * h - e * g;
+  const cofactor21 = b * g - a * h;
+  const cofactor22 = a * e - b * d;
+  const determinant = a * cofactor00 + b * cofactor10 + c * cofactor20;
+  if (!Number.isFinite(determinant) || Math.abs(determinant) <= 1e-12) return undefined;
+  return normalizedHomography([
+    cofactor00 / determinant,
+    cofactor01 / determinant,
+    cofactor02 / determinant,
+    cofactor10 / determinant,
+    cofactor11 / determinant,
+    cofactor12 / determinant,
+    cofactor20 / determinant,
+    cofactor21 / determinant,
+    cofactor22 / determinant,
+  ]);
+}
+
+function projectHomography(
+  transform: VisionHomography,
+  x: number,
+  y: number,
+): VisionPoint | undefined {
+  const denominator = transform[6] * x + transform[7] * y + transform[8];
+  if (!Number.isFinite(denominator) || Math.abs(denominator) <= 1e-12) return undefined;
+  const point = {
+    x: (transform[0] * x + transform[1] * y + transform[2]) / denominator,
+    y: (transform[3] * x + transform[4] * y + transform[5]) / denominator,
+  };
+  return Number.isFinite(point.x) && Number.isFinite(point.y) ? point : undefined;
+}
+
+function frameQuadFromHomography(
+  sourceToCanonical: VisionHomography,
+  canonicalScale: VisionCanonicalScale,
+): VisionQuad | undefined {
+  const canonicalToSource = inverseHomography(sourceToCanonical);
+  if (canonicalToSource === undefined) return undefined;
+  const maximum = TOTAL_MODULES * canonicalScale - 1;
+  const points = [
+    projectHomography(canonicalToSource, 0, 0),
+    projectHomography(canonicalToSource, maximum, 0),
+    projectHomography(canonicalToSource, maximum, maximum),
+    projectHomography(canonicalToSource, 0, maximum),
+  ];
+  return points.every((point) => point !== undefined)
+    ? points as unknown as VisionQuad
+    : undefined;
+}
+
+function temporalCanonicalCorners(scale: VisionCanonicalScale): readonly VisionPoint[] {
+  return ORDERED_FIDUCIAL_IDS.flatMap((id) => canonicalMarkerQuad(id, scale));
+}
+
+function finitePoint(point: VisionPoint | undefined): point is VisionPoint {
+  return point !== undefined && Number.isFinite(point.x) && Number.isFinite(point.y);
+}
+
+function quadArea(quad: VisionQuad): number {
+  let doubled = 0;
+  for (let index = 0; index < 4; index++) {
+    const current = quad[index]!;
+    const next = quad[(index + 1) % 4]!;
+    doubled += current.x * next.y - current.y * next.x;
+  }
+  return Math.abs(doubled) / 2;
+}
+
+function quadIsConvex(quad: VisionQuad): boolean {
+  let sign = 0;
+  for (let index = 0; index < 4; index++) {
+    const first = quad[index]!;
+    const second = quad[(index + 1) % 4]!;
+    const third = quad[(index + 2) % 4]!;
+    const cross = (second.x - first.x) * (third.y - second.y) -
+      (second.y - first.y) * (third.x - second.x);
+    if (!Number.isFinite(cross) || Math.abs(cross) <= 1e-6) return false;
+    const currentSign = Math.sign(cross);
+    if (sign !== 0 && currentSign !== sign) return false;
+    sign = currentSign;
+  }
+  return true;
+}
+
+function quadIsInside(quad: VisionQuad, width: number, height: number): boolean {
+  return quad.every((point) =>
+    finitePoint(point) && point.x >= 0 && point.y >= 0 && point.x <= width - 1 && point.y <= height - 1);
+}
+
+function percentile95(values: readonly number[]): number | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.ceil(sorted.length * 0.95) - 1];
+}
+
+function paddedRegionFromQuad(
+  quad: VisionQuad,
+  width: number,
+  height: number,
+): VisionSearchRegion | undefined {
+  const left = Math.min(...quad.map((point) => point.x));
+  const right = Math.max(...quad.map((point) => point.x));
+  const top = Math.min(...quad.map((point) => point.y));
+  const bottom = Math.max(...quad.map((point) => point.y));
+  const padX = (right - left) * SEARCH_REGION_PADDING;
+  const padY = (bottom - top) * SEARCH_REGION_PADDING;
+  return clampSearchRegion({
+    x: left - padX,
+    y: top - padY,
+    width: right - left + 2 * padX,
+    height: bottom - top + 2 * padY,
+  }, width, height);
+}
+
+/** Build and validate cloneable temporal state from a cold acquisition. */
+export function createVisionTemporalHint(input: VisionTemporalHintInput): VisionTemporalHint {
+  const generation = input.generation ?? 0;
+  const trackingWidth = input.trackingWidth ?? input.sourceWidth;
+  const trackingHeight = input.trackingHeight ?? input.sourceHeight;
+  const canonicalScale = input.canonicalScale ?? DEFAULT_COLOR4_CANONICAL_SCALE;
+  if (!Number.isInteger(generation) || generation < 0 ||
+      !Number.isInteger(input.sourceWidth) || input.sourceWidth <= 0 ||
+      !Number.isInteger(input.sourceHeight) || input.sourceHeight <= 0 ||
+      !Number.isInteger(trackingWidth) || trackingWidth <= 0 ||
+      !Number.isInteger(trackingHeight) || trackingHeight <= 0 ||
+      input.corners.length !== TEMPORAL_CORNER_COUNT || !input.corners.every(finitePoint)) {
+    throw new RangeError("Invalid COLOR_4 temporal geometry.");
+  }
+  const homography = normalizedHomography(input.homography);
+  const frameQuad = homography === undefined
+    ? undefined
+    : frameQuadFromHomography(homography, canonicalScale);
+  if (homography === undefined || frameQuad === undefined || !quadIsConvex(frameQuad)) {
+    throw new RangeError("Invalid COLOR_4 temporal homography.");
+  }
+  const corners = input.corners.map(({ x, y }) => ({ x, y }));
+  const frameRegion = input.frameRegion === undefined
+    ? paddedRegionFromQuad(frameQuad, input.sourceWidth, input.sourceHeight)
+    : clampSearchRegion(input.frameRegion, input.sourceWidth, input.sourceHeight);
+  return {
+    version: 1,
+    generation,
+    sourceWidth: input.sourceWidth,
+    sourceHeight: input.sourceHeight,
+    trackingWidth,
+    trackingHeight,
+    canonicalScale,
+    corners,
+    homography,
+    frameQuad,
+    ...(frameRegion === undefined ? {} : { frameRegion }),
+  };
+}
+
+function temporalDiagnostics(
+  candidate: VisionTemporalTrackCandidate,
+  previous: VisionTemporalHint,
+): VisionTemporalTrackingDiagnostics {
+  const errors = candidate.forwardBackwardErrorsPx.filter((value, index) =>
+    candidate.tracked[index] === true && Number.isFinite(value));
+  const previousArea = quadArea(previous.frameQuad);
+  const currentArea = candidate.frameQuad === undefined ? undefined : quadArea(candidate.frameQuad);
+  const areaRatio = currentArea === undefined || previousArea <= 0
+    ? undefined
+    : currentArea / previousArea;
+  return {
+    trackedCorners: errors.length,
+    ...(percentile95(errors) === undefined ? {} : { forwardBackwardP95Px: percentile95(errors) }),
+    ...(candidate.residualRmsModules === undefined
+      ? {}
+      : { residualRmsModules: candidate.residualRmsModules }),
+    ...(candidate.residualMaxModules === undefined
+      ? {}
+      : { residualMaxModules: candidate.residualMaxModules }),
+    ...(areaRatio === undefined ? {} : { areaRatio }),
+  };
+}
+
+/**
+ * Apply all temporal safety gates without touching OpenCV. This is deliberately
+ * pure so replays and unit tests can make the fallback decision deterministically.
+ */
+export function validateVisionTemporalTracking(
+  previous: VisionTemporalHint,
+  candidate: VisionTemporalTrackCandidate,
+  thresholds: VisionTemporalTrackingThresholds = {},
+): VisionTemporalTrackingResult {
+  const minimumTrackedCorners = thresholds.minimumTrackedCorners ??
+    TEMPORAL_MINIMUM_TRACKED_CORNERS;
+  const maximumForwardBackwardP95Px = thresholds.maximumForwardBackwardP95Px ??
+    TEMPORAL_MAXIMUM_FORWARD_BACKWARD_P95_PX;
+  const maximumResidualModules = thresholds.maximumResidualModules ??
+    TEMPORAL_MAXIMUM_RESIDUAL_MODULES;
+  const minimumAreaRatio = thresholds.minimumAreaRatio ?? TEMPORAL_MINIMUM_AREA_RATIO;
+  const maximumAreaRatio = thresholds.maximumAreaRatio ?? TEMPORAL_MAXIMUM_AREA_RATIO;
+  const diagnostics = temporalDiagnostics(candidate, previous);
+  const reject = (
+    reason: Extract<VisionTemporalTrackingResult, { status: "rejected" }>["reason"],
+  ): VisionTemporalTrackingResult => ({ status: "rejected", reason, diagnostics, candidate });
+
+  if (candidate.sourceWidth !== previous.sourceWidth ||
+      candidate.sourceHeight !== previous.sourceHeight) return reject("FRAME_SIZE_CHANGED");
+  if (candidate.corners.length !== TEMPORAL_CORNER_COUNT ||
+      candidate.tracked.length !== TEMPORAL_CORNER_COUNT ||
+      candidate.forwardBackwardErrorsPx.length !== TEMPORAL_CORNER_COUNT ||
+      !Number.isInteger(minimumTrackedCorners) || minimumTrackedCorners < 4 ||
+      minimumTrackedCorners > TEMPORAL_CORNER_COUNT ||
+      !Number.isFinite(maximumForwardBackwardP95Px) || maximumForwardBackwardP95Px < 0 ||
+      !Number.isFinite(maximumResidualModules) || maximumResidualModules < 0 ||
+      !Number.isFinite(minimumAreaRatio) || minimumAreaRatio <= 0 ||
+      !Number.isFinite(maximumAreaRatio) || maximumAreaRatio < minimumAreaRatio) {
+    return reject("INVALID_TEMPORAL_INPUT");
+  }
+  if (diagnostics.trackedCorners < minimumTrackedCorners) {
+    return reject("TOO_FEW_TRACKED_CORNERS");
+  }
+  if (diagnostics.forwardBackwardP95Px === undefined ||
+      diagnostics.forwardBackwardP95Px > maximumForwardBackwardP95Px) {
+    return reject("FORWARD_BACKWARD_ERROR");
+  }
+  if (candidate.homography === undefined || candidate.frameQuad === undefined ||
+      !candidate.corners.every(finitePoint)) return reject("HOMOGRAPHY_FAILED");
+  if (diagnostics.residualRmsModules === undefined ||
+      diagnostics.residualMaxModules === undefined ||
+      !Number.isFinite(diagnostics.residualRmsModules) ||
+      !Number.isFinite(diagnostics.residualMaxModules) ||
+      diagnostics.residualRmsModules > maximumResidualModules ||
+      diagnostics.residualMaxModules > maximumResidualModules) {
+    return reject("HOMOGRAPHY_RESIDUAL");
+  }
+  if (!quadIsConvex(candidate.frameQuad)) return reject("FRAME_QUAD_NON_CONVEX");
+  if (!quadIsInside(candidate.frameQuad, candidate.sourceWidth, candidate.sourceHeight)) {
+    return reject("FRAME_QUAD_OUT_OF_BOUNDS");
+  }
+  if (diagnostics.areaRatio === undefined || diagnostics.areaRatio < minimumAreaRatio ||
+      diagnostics.areaRatio > maximumAreaRatio) return reject("FRAME_AREA_CHANGED");
+
+  const hint = createVisionTemporalHint({
+    generation: previous.generation + 1,
+    sourceWidth: candidate.sourceWidth,
+    sourceHeight: candidate.sourceHeight,
+    trackingWidth: candidate.trackingWidth ?? previous.trackingWidth,
+    trackingHeight: candidate.trackingHeight ?? previous.trackingHeight,
+    canonicalScale: previous.canonicalScale,
+    corners: candidate.corners,
+    homography: candidate.homography,
+  });
+  return { status: "tracked", hint, diagnostics };
+}
+
+/** Compatibility alias for callers that do not use the longer vision prefix. */
+export const validateTemporalTracking = validateVisionTemporalTracking;
+
+/** Convert an RGBA camera plane to a cloneable single-channel tracking plane. */
+export function createVisionGrayscaleFrameWithOpenCv(
   cv: OpenCvRuntime,
   width: number,
   height: number,
   pixels: Uint8ClampedArray,
-  options: VisionOptions = {},
-): VisionResult {
+  maximumDimension: VisionDetectionLimit = TEMPORAL_DEFAULT_TRACKING_DIMENSION,
+): VisionGrayscaleFrame {
+  if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0 ||
+      pixels.length !== width * height * 4) {
+    throw new RangeError("Invalid RGBA frame for COLOR_4 temporal tracking.");
+  }
+  let source: CvMat | undefined;
+  let gray: CvMat | undefined;
+  let resized: CvMat | undefined;
+  try {
+    const imagePixels: Uint8ClampedArray<ArrayBuffer> = pixels.buffer instanceof ArrayBuffer
+      ? new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength)
+      : Uint8ClampedArray.from(pixels);
+    source = cv.matFromImageData(new ImageData(imagePixels, width, height));
+    gray = new cv.Mat();
+    cv.cvtColor(source, gray, cv.COLOR_RGBA2GRAY);
+    if (maximumDimension !== "source" && Math.max(width, height) > maximumDimension) {
+      const scale = maximumDimension / Math.max(width, height);
+      const trackingWidth = Math.max(1, Math.round(width * scale));
+      const trackingHeight = Math.max(1, Math.round(height * scale));
+      resized = new cv.Mat();
+      cv.resize(
+        gray,
+        resized,
+        new cv.Size(trackingWidth, trackingHeight),
+        0,
+        0,
+        cv.INTER_AREA,
+      );
+      return {
+        sourceWidth: width,
+        sourceHeight: height,
+        width: trackingWidth,
+        height: trackingHeight,
+        pixels: Uint8Array.from(resized.data),
+      };
+    }
+    return {
+      sourceWidth: width,
+      sourceHeight: height,
+      width,
+      height,
+      pixels: Uint8Array.from(gray.data),
+    };
+  } finally {
+    resized?.delete();
+    gray?.delete();
+    source?.delete();
+  }
+}
+
+function temporalResidual(
+  sourcePoints: readonly VisionPoint[],
+  destinationPoints: readonly VisionPoint[],
+  transform: VisionHomography,
+  scale: VisionCanonicalScale,
+): Readonly<{ rmsModules: number; maxModules: number }> | undefined {
+  if (sourcePoints.length === 0 || sourcePoints.length !== destinationPoints.length) return undefined;
+  let squared = 0;
+  let maximum = 0;
+  for (let index = 0; index < sourcePoints.length; index++) {
+    const projected = projectHomography(transform, sourcePoints[index]!.x, sourcePoints[index]!.y);
+    if (projected === undefined) return undefined;
+    const distance = pointDistance(projected, destinationPoints[index]!) / scale;
+    squared += distance * distance;
+    maximum = Math.max(maximum, distance);
+  }
+  return { rmsModules: Math.sqrt(squared / sourcePoints.length), maxModules: maximum };
+}
+
+/**
+ * Track the 16 acquired corners with forward/backward pyramidal Lucas-Kanade.
+ * Every OpenCV allocation is local and released before returning; only the
+ * cloneable hint crosses the API boundary.
+ */
+export function trackVisionTemporalHintWithOpenCv(
+  cv: OpenCvRuntime,
+  previousGray: VisionGrayscaleFrame,
+  currentGray: VisionGrayscaleFrame,
+  previousHint: VisionTemporalHint,
+  thresholds: VisionTemporalTrackingThresholds = {},
+): VisionTemporalTrackingResult {
+  const emptyDiagnostics: VisionTemporalTrackingDiagnostics = { trackedCorners: 0 };
+  if (cv.calcOpticalFlowPyrLK === undefined || cv.findHomography === undefined ||
+      cv.CV_8UC1 === undefined) {
+    return { status: "rejected", reason: "OPENCV_LK_UNAVAILABLE", diagnostics: emptyDiagnostics };
+  }
+  if (previousGray.width !== currentGray.width || previousGray.height !== currentGray.height ||
+      previousGray.sourceWidth !== currentGray.sourceWidth ||
+      previousGray.sourceHeight !== currentGray.sourceHeight ||
+      previousGray.sourceWidth !== previousHint.sourceWidth ||
+      previousGray.sourceHeight !== previousHint.sourceHeight) {
+    return { status: "rejected", reason: "FRAME_SIZE_CHANGED", diagnostics: emptyDiagnostics };
+  }
+  const expectedPixels = previousGray.width * previousGray.height;
+  if (previousGray.pixels.length !== expectedPixels || currentGray.pixels.length !== expectedPixels ||
+      previousHint.corners.length !== TEMPORAL_CORNER_COUNT) {
+    return { status: "rejected", reason: "INVALID_TEMPORAL_INPUT", diagnostics: emptyDiagnostics };
+  }
+
+  let previousMat: CvMat | undefined;
+  let currentMat: CvMat | undefined;
+  let previousPoints: CvMat | undefined;
+  let currentPoints: CvMat | undefined;
+  let forwardStatus: CvMat | undefined;
+  let forwardErrors: CvMat | undefined;
+  let backwardPoints: CvMat | undefined;
+  let backwardStatus: CvMat | undefined;
+  let backwardErrors: CvMat | undefined;
+  let fitSource: CvMat | undefined;
+  let fitDestination: CvMat | undefined;
+  let fitTransform: CvMat | undefined;
+  try {
+    const trackingScaleX = previousGray.width / previousHint.sourceWidth;
+    const trackingScaleY = previousGray.height / previousHint.sourceHeight;
+    if (!Number.isFinite(trackingScaleX) || !Number.isFinite(trackingScaleY) ||
+        trackingScaleX <= 0 || trackingScaleY <= 0) {
+      return { status: "rejected", reason: "INVALID_TEMPORAL_INPUT", diagnostics: emptyDiagnostics };
+    }
+    const toTracking = (point: VisionPoint): VisionPoint => ({
+      x: (point.x + 0.5) * trackingScaleX - 0.5,
+      y: (point.y + 0.5) * trackingScaleY - 0.5,
+    });
+    const toSource = (point: VisionPoint): VisionPoint => ({
+      x: (point.x + 0.5) / trackingScaleX - 0.5,
+      y: (point.y + 0.5) / trackingScaleY - 0.5,
+    });
+    previousMat = new cv.Mat(previousGray.height, previousGray.width, cv.CV_8UC1);
+    currentMat = new cv.Mat(currentGray.height, currentGray.width, cv.CV_8UC1);
+    if (previousMat.data.length !== expectedPixels || currentMat.data.length !== expectedPixels) {
+      return { status: "rejected", reason: "INVALID_TEMPORAL_INPUT", diagnostics: emptyDiagnostics };
+    }
+    previousMat.data.set(previousGray.pixels);
+    currentMat.data.set(currentGray.pixels);
+    previousPoints = cv.matFromArray(
+      TEMPORAL_CORNER_COUNT,
+      1,
+      cv.CV_32FC2,
+      pointValues(previousHint.corners.map(toTracking)),
+    );
+    currentPoints = new cv.Mat();
+    forwardStatus = new cv.Mat();
+    forwardErrors = new cv.Mat();
+    cv.calcOpticalFlowPyrLK(
+      previousMat,
+      currentMat,
+      previousPoints,
+      currentPoints,
+      forwardStatus,
+      forwardErrors,
+    );
+    backwardPoints = new cv.Mat();
+    backwardStatus = new cv.Mat();
+    backwardErrors = new cv.Mat();
+    cv.calcOpticalFlowPyrLK(
+      currentMat,
+      previousMat,
+      currentPoints,
+      backwardPoints,
+      backwardStatus,
+      backwardErrors,
+    );
+
+    const forwardValues = currentPoints.data32F;
+    const backwardValues = backwardPoints.data32F;
+    if ((forwardValues?.length ?? 0) < TEMPORAL_CORNER_COUNT * 2 ||
+        (backwardValues?.length ?? 0) < TEMPORAL_CORNER_COUNT * 2 ||
+        forwardStatus.data.length < TEMPORAL_CORNER_COUNT ||
+        backwardStatus.data.length < TEMPORAL_CORNER_COUNT) {
+      return { status: "rejected", reason: "INVALID_TEMPORAL_INPUT", diagnostics: emptyDiagnostics };
+    }
+    const corners = Array.from({ length: TEMPORAL_CORNER_COUNT }, (_, index) => toSource({
+      x: forwardValues![index * 2]!,
+      y: forwardValues![index * 2 + 1]!,
+    }));
+    const tracked = Array.from({ length: TEMPORAL_CORNER_COUNT }, (_, index) =>
+      forwardStatus!.data[index] !== 0 && backwardStatus!.data[index] !== 0 &&
+      finitePoint(corners[index]));
+    const forwardBackwardErrorsPx = Array.from(
+      { length: TEMPORAL_CORNER_COUNT },
+      (_, index) => tracked[index]
+        ? Math.hypot(
+            backwardValues![index * 2]! - toTracking(previousHint.corners[index]!).x,
+            backwardValues![index * 2 + 1]! - toTracking(previousHint.corners[index]!).y,
+          )
+        : Number.POSITIVE_INFINITY,
+    );
+    const baseCandidate: VisionTemporalTrackCandidate = {
+      sourceWidth: currentGray.sourceWidth,
+      sourceHeight: currentGray.sourceHeight,
+      trackingWidth: currentGray.width,
+      trackingHeight: currentGray.height,
+      corners,
+      tracked,
+      forwardBackwardErrorsPx,
+    };
+    const preliminary = validateVisionTemporalTracking(previousHint, baseCandidate, thresholds);
+    if (preliminary.status === "rejected" &&
+        preliminary.reason !== "HOMOGRAPHY_FAILED") return preliminary;
+
+    const expectedCorners = temporalCanonicalCorners(previousHint.canonicalScale);
+    const validIndices = tracked.flatMap((isTracked, index) => isTracked ? [index] : []);
+    const sourceForFit = validIndices.map((index) => corners[index]!);
+    // Fit only the inter-frame motion. Composing that motion with the retained
+    // source-to-canonical H preserves a cold-acquisition refinement; fitting
+    // the tracked points directly back to ideal marker coordinates would
+    // silently discard that correction on the very next frame.
+    const destinationForFit = validIndices.map((index) => previousHint.corners[index]!);
+    fitSource = cv.matFromArray(validIndices.length, 1, cv.CV_32FC2, pointValues(sourceForFit));
+    fitDestination = cv.matFromArray(
+      validIndices.length,
+      1,
+      cv.CV_32FC2,
+      pointValues(destinationForFit),
+    );
+    fitTransform = cv.findHomography(fitSource, fitDestination, 0);
+    const interFrameTransform = homographyCoefficients(fitTransform);
+    const transform = interFrameTransform === undefined
+      ? undefined
+      : multiplyHomographies(previousHint.homography, interFrameTransform);
+    const inverse = transform === undefined ? undefined : inverseHomography(transform);
+    const residual = transform === undefined
+      ? undefined
+      : temporalResidual(
+          sourceForFit,
+          validIndices.map((index) => expectedCorners[index]!),
+          transform,
+          previousHint.canonicalScale,
+        );
+    const completedCorners = corners.map((point, index) => {
+      if (tracked[index] || inverse === undefined) return point;
+      return projectHomography(inverse, expectedCorners[index]!.x, expectedCorners[index]!.y) ?? point;
+    });
+    const frameQuad = transform === undefined
+      ? undefined
+      : frameQuadFromHomography(transform, previousHint.canonicalScale);
+    const candidate: VisionTemporalTrackCandidate = {
+      ...baseCandidate,
+      corners: completedCorners,
+      ...(transform === undefined ? {} : { homography: transform }),
+      ...(residual === undefined
+        ? {}
+        : {
+            residualRmsModules: residual.rmsModules,
+            residualMaxModules: residual.maxModules,
+          }),
+      ...(frameQuad === undefined ? {} : { frameQuad }),
+    };
+    return validateVisionTemporalTracking(previousHint, candidate, thresholds);
+  } catch {
+    return { status: "rejected", reason: "HOMOGRAPHY_FAILED", diagnostics: emptyDiagnostics };
+  } finally {
+    fitTransform?.delete();
+    fitDestination?.delete();
+    fitSource?.delete();
+    backwardErrors?.delete();
+    backwardStatus?.delete();
+    backwardPoints?.delete();
+    forwardErrors?.delete();
+    forwardStatus?.delete();
+    currentPoints?.delete();
+    previousPoints?.delete();
+    currentMat?.delete();
+    previousMat?.delete();
+  }
+}
+
+const COMPACT_SAMPLES_PER_MODULE_AXIS = 4;
+const COMPACT_REMAP_SIZE = TOTAL_MODULES * COMPACT_SAMPLES_PER_MODULE_AXIS;
+const COMPACT_SAMPLE_FRACTIONS = Object.freeze([1.5 / 6, 2.5 / 6, 3.5 / 6, 4.5 / 6]);
+
+function exactMedian16(
+  values: Uint8Array,
+  counts: Uint8Array,
+  occupied: Uint32Array,
+): number {
+  for (let index = 0; index < 16; index++) {
+    const value = values[index]!;
+    counts[value]!++;
+    occupied[value >>> 5]! |= 1 << (value & 31);
+  }
+  let cumulative = 0;
+  let lower = 0;
+  let upper = 0;
+  let lowerFound = false;
+  outer: for (let bucket = 0; bucket < 8; bucket++) {
+    let bits = occupied[bucket]!;
+    while (bits !== 0) {
+      const lowest = bits & -bits;
+      const value = (bucket << 5) + 31 - Math.clz32(lowest);
+      cumulative += counts[value]!;
+      if (!lowerFound && cumulative >= 8) {
+        lower = value;
+        lowerFound = true;
+      }
+      if (cumulative >= 9) {
+        upper = value;
+        break outer;
+      }
+      bits ^= lowest;
+    }
+  }
+  for (let index = 0; index < 16; index++) counts[values[index]!] = 0;
+  occupied.fill(0);
+  return (lower + upper) / 2;
+}
+
+interface CompactMedianScratch {
+  readonly red: Uint8Array;
+  readonly green: Uint8Array;
+  readonly blue: Uint8Array;
+  readonly counts: Uint8Array;
+  readonly occupied: Uint32Array;
+}
+
+function compactModuleMedians(
+  remapped: CvMat,
+  scratch: CompactMedianScratch,
+): Float32Array<ArrayBuffer> {
+  const pixelsPerPlane = COMPACT_REMAP_SIZE * COMPACT_REMAP_SIZE;
+  const channels = remapped.data.length >= pixelsPerPlane * 4
+    ? 4
+    : remapped.data.length >= pixelsPerPlane * 3
+      ? 3
+      : 0;
+  if (remapped.rows !== COMPACT_REMAP_SIZE || remapped.cols !== COMPACT_REMAP_SIZE ||
+      channels === 0) {
+    throw new Error("OpenCV returned an invalid compact COLOR_4 remap.");
+  }
+  const pixels = remapped.data;
+  const rgb = new Float32Array(TOTAL_MODULES * TOTAL_MODULES * 3);
+  const { red, green, blue, counts, occupied } = scratch;
+  for (let moduleY = 0; moduleY < TOTAL_MODULES; moduleY++) {
+    const sampleTop = moduleY * COMPACT_SAMPLES_PER_MODULE_AXIS;
+    for (let moduleX = 0; moduleX < TOTAL_MODULES; moduleX++) {
+      const sampleLeft = moduleX * COMPACT_SAMPLES_PER_MODULE_AXIS;
+      let sample = 0;
+      for (let offsetY = 0; offsetY < COMPACT_SAMPLES_PER_MODULE_AXIS; offsetY++) {
+        const row = (sampleTop + offsetY) * COMPACT_REMAP_SIZE;
+        for (let offsetX = 0; offsetX < COMPACT_SAMPLES_PER_MODULE_AXIS; offsetX++) {
+          const pixel = (row + sampleLeft + offsetX) * channels;
+          red[sample] = pixels[pixel]!;
+          green[sample] = pixels[pixel + 1]!;
+          blue[sample] = pixels[pixel + 2]!;
+          sample++;
+        }
+      }
+      const output = (moduleY * TOTAL_MODULES + moduleX) * 3;
+      rgb[output] = exactMedian16(red, counts, occupied);
+      rgb[output + 1] = exactMedian16(green, counts, occupied);
+      rgb[output + 2] = exactMedian16(blue, counts, occupied);
+    }
+  }
+  return rgb;
+}
+
+/**
+ * Stateful compact sampler for the geometry worker.
+ *
+ * Float maps and their fixed-point conversion are allocated once. Their values
+ * are updated only when the source-to-canonical homography changes, and all
+ * retained WASM objects are released by `dispose`.
+ */
+export class Color4CompactSamplerWithOpenCv {
+  private mapX: CvMat | undefined;
+  private mapY: CvMat | undefined;
+  private canonicalCoordinates: CvMat | undefined;
+  private projectedCoordinates: CvMat | undefined;
+  private emptyMap: CvMat | undefined;
+  private fixedMap1: CvMat | undefined;
+  private fixedMap2: CvMat | undefined;
+  private sourceRgba: CvMat | undefined;
+  private sourceRgb: CvMat | undefined;
+  private remapped: CvMat | undefined;
+  private mapKey: string | undefined;
+  private nativeMapProjectionDisabled = false;
+  private disposed = false;
+  private samplingDiagnostics: VisionCompactSamplingDiagnostics | undefined;
+  private readonly medianScratch: CompactMedianScratch = {
+    red: new Uint8Array(16),
+    green: new Uint8Array(16),
+    blue: new Uint8Array(16),
+    counts: new Uint8Array(256),
+    occupied: new Uint32Array(8),
+  };
+
+  constructor(private readonly cv: OpenCvRuntime) {
+    this.nativeMapProjectionDisabled = cv.perspectiveTransform === undefined ||
+      cv.CV_32FC1 === undefined;
+  }
+
+  get diagnostics(): VisionCompactSamplingDiagnostics | undefined {
+    return this.samplingDiagnostics === undefined ? undefined : { ...this.samplingDiagnostics };
+  }
+
+  private ensureFloatMaps(): Readonly<{ mapX: CvMat; mapY: CvMat }> {
+    if (this.cv.CV_32FC1 === undefined) {
+      throw new Error("OpenCV CV_32FC1 support is required for compact COLOR_4 sampling.");
+    }
+    if (this.mapX === undefined || this.mapY === undefined) {
+      this.mapX?.delete();
+      this.mapY?.delete();
+      this.mapX = new this.cv.Mat(COMPACT_REMAP_SIZE, COMPACT_REMAP_SIZE, this.cv.CV_32FC1);
+      this.mapY = new this.cv.Mat(COMPACT_REMAP_SIZE, COMPACT_REMAP_SIZE, this.cv.CV_32FC1);
+    }
+    if ((this.mapX.data32F?.length ?? 0) < COMPACT_REMAP_SIZE * COMPACT_REMAP_SIZE ||
+        (this.mapY.data32F?.length ?? 0) < COMPACT_REMAP_SIZE * COMPACT_REMAP_SIZE) {
+      throw new Error("OpenCV did not expose writable float remap planes.");
+    }
+    return { mapX: this.mapX, mapY: this.mapY };
+  }
+
+  private deleteSamplingMats(): void {
+    this.remapped?.delete();
+    this.sourceRgb?.delete();
+    this.sourceRgba?.delete();
+    this.remapped = undefined;
+    this.sourceRgb = undefined;
+    this.sourceRgba = undefined;
+  }
+
+  private sourceFrame(
+    width: number,
+    height: number,
+    pixels: Uint8ClampedArray,
+  ): CvMat {
+    const expectedBytes = width * height * 4;
+    if (this.sourceRgba !== undefined &&
+        (this.sourceRgba.cols !== width || this.sourceRgba.rows !== height ||
+          this.sourceRgba.data.length !== expectedBytes)) {
+      // Destination allocations are coupled to the input shape. A negotiated
+      // camera-resolution change replaces the complete reusable trio.
+      this.deleteSamplingMats();
+    }
+    if (this.sourceRgba === undefined) {
+      const imagePixels: Uint8ClampedArray<ArrayBuffer> = pixels.buffer instanceof ArrayBuffer
+        ? new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength)
+        : Uint8ClampedArray.from(pixels);
+      this.sourceRgba = this.cv.matFromImageData(new ImageData(imagePixels, width, height));
+      if (this.sourceRgba.data.length !== expectedBytes) {
+        this.deleteSamplingMats();
+        throw new Error("OpenCV returned an invalid reusable COLOR_4 source plane.");
+      }
+    } else {
+      this.sourceRgba.data.set(pixels);
+    }
+    return this.sourceRgba;
+  }
+
+  private deleteNativeProjectionMaps(): void {
+    this.emptyMap?.delete();
+    this.projectedCoordinates?.delete();
+    this.canonicalCoordinates?.delete();
+    this.emptyMap = undefined;
+    this.projectedCoordinates = undefined;
+    this.canonicalCoordinates = undefined;
+  }
+
+  private ensureNativeProjectionMaps(): Readonly<{ map1: CvMat; map2: CvMat }> {
+    if (this.cv.CV_32FC1 === undefined || this.cv.perspectiveTransform === undefined) {
+      throw new Error("Native projective remap construction is unavailable.");
+    }
+    if (this.canonicalCoordinates === undefined ||
+        this.projectedCoordinates === undefined || this.emptyMap === undefined) {
+      this.deleteNativeProjectionMaps();
+      this.canonicalCoordinates = new this.cv.Mat(
+        COMPACT_REMAP_SIZE,
+        COMPACT_REMAP_SIZE,
+        this.cv.CV_32FC2,
+      );
+      this.projectedCoordinates = new this.cv.Mat();
+      this.emptyMap = new this.cv.Mat();
+      const coordinates = this.canonicalCoordinates.data32F;
+      if ((coordinates?.length ?? 0) < COMPACT_REMAP_SIZE * COMPACT_REMAP_SIZE * 2) {
+        throw new Error("OpenCV did not expose a writable two-channel coordinate map.");
+      }
+      for (let outputY = 0; outputY < COMPACT_REMAP_SIZE; outputY++) {
+        const moduleY = Math.floor(outputY / COMPACT_SAMPLES_PER_MODULE_AXIS);
+        const fractionY = COMPACT_SAMPLE_FRACTIONS[outputY % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+        const canonicalY = moduleY + fractionY;
+        const row = outputY * COMPACT_REMAP_SIZE;
+        for (let outputX = 0; outputX < COMPACT_REMAP_SIZE; outputX++) {
+          const moduleX = Math.floor(outputX / COMPACT_SAMPLES_PER_MODULE_AXIS);
+          const fractionX = COMPACT_SAMPLE_FRACTIONS[outputX % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+          const index = (row + outputX) * 2;
+          // Unit-module coordinates make this plane reusable across canonical
+          // scales; the scale is folded into the per-frame inverse transform.
+          coordinates![index] = moduleX + fractionX;
+          coordinates![index + 1] = canonicalY;
+        }
+      }
+    }
+    return { map1: this.projectedCoordinates, map2: this.emptyMap };
+  }
+
+  private updateMaps(hint: VisionTemporalHint): boolean {
+    const key = [hint.canonicalScale, hint.sourceWidth, hint.sourceHeight, ...hint.homography]
+      .join(",");
+    const hasMaps = this.nativeMapProjectionDisabled
+      ? this.mapX !== undefined && this.mapY !== undefined
+      : this.projectedCoordinates !== undefined && this.emptyMap !== undefined;
+    if (key === this.mapKey && hasMaps) return true;
+    const canonicalToSource = inverseHomography(hint.homography);
+    if (canonicalToSource === undefined) throw new Error("Cannot invert COLOR_4 temporal homography.");
+    let floatMap1: CvMat | undefined;
+    let floatMap2: CvMat | undefined;
+    if (!this.nativeMapProjectionDisabled && this.cv.perspectiveTransform !== undefined) {
+      let inverseTransform: CvMat | undefined;
+      try {
+        const nativeMaps = this.ensureNativeProjectionMaps();
+        const scaledInverse: VisionHomography = [
+          canonicalToSource[0] * hint.canonicalScale,
+          canonicalToSource[1] * hint.canonicalScale,
+          canonicalToSource[2],
+          canonicalToSource[3] * hint.canonicalScale,
+          canonicalToSource[4] * hint.canonicalScale,
+          canonicalToSource[5],
+          canonicalToSource[6] * hint.canonicalScale,
+          canonicalToSource[7] * hint.canonicalScale,
+          canonicalToSource[8],
+        ];
+        inverseTransform = this.cv.matFromArray(
+          3,
+          3,
+          this.cv.CV_32FC1!,
+          Array.from(scaledInverse),
+        );
+        this.cv.perspectiveTransform(
+          this.canonicalCoordinates!,
+          this.projectedCoordinates!,
+          inverseTransform,
+        );
+        floatMap1 = nativeMaps.map1;
+        floatMap2 = nativeMaps.map2;
+      } catch {
+        this.nativeMapProjectionDisabled = true;
+        this.deleteNativeProjectionMaps();
+      } finally {
+        inverseTransform?.delete();
+      }
+    }
+    if (floatMap1 === undefined || floatMap2 === undefined) {
+      const { mapX, mapY } = this.ensureFloatMaps();
+      const xs = mapX.data32F!;
+      const ys = mapY.data32F!;
+      for (let outputY = 0; outputY < COMPACT_REMAP_SIZE; outputY++) {
+        const moduleY = Math.floor(outputY / COMPACT_SAMPLES_PER_MODULE_AXIS);
+        const fractionY = COMPACT_SAMPLE_FRACTIONS[outputY % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+        const canonicalY = (moduleY + fractionY) * hint.canonicalScale;
+        const row = outputY * COMPACT_REMAP_SIZE;
+        for (let outputX = 0; outputX < COMPACT_REMAP_SIZE; outputX++) {
+          const moduleX = Math.floor(outputX / COMPACT_SAMPLES_PER_MODULE_AXIS);
+          const fractionX = COMPACT_SAMPLE_FRACTIONS[outputX % COMPACT_SAMPLES_PER_MODULE_AXIS]!;
+          const canonicalX = (moduleX + fractionX) * hint.canonicalScale;
+          const source = projectHomography(canonicalToSource, canonicalX, canonicalY);
+          const index = row + outputX;
+          xs[index] = source?.x ?? -1;
+          ys[index] = source?.y ?? -1;
+        }
+      }
+      floatMap1 = mapX;
+      floatMap2 = mapY;
+    }
+
+    if (this.cv.convertMaps !== undefined && this.cv.CV_16SC2 !== undefined) {
+      try {
+        this.fixedMap1 ??= new this.cv.Mat();
+        this.fixedMap2 ??= new this.cv.Mat();
+        this.cv.convertMaps(
+          floatMap1,
+          floatMap2,
+          this.fixedMap1,
+          this.fixedMap2,
+          this.cv.CV_16SC2,
+          false,
+        );
+      } catch {
+        // Float maps remain a complete and correct OpenCV remap path.
+        this.fixedMap2?.delete();
+        this.fixedMap1?.delete();
+        this.fixedMap2 = undefined;
+        this.fixedMap1 = undefined;
+      }
+    } else {
+      this.fixedMap2?.delete();
+      this.fixedMap1?.delete();
+      this.fixedMap2 = undefined;
+      this.fixedMap1 = undefined;
+    }
+    this.mapKey = key;
+    return false;
+  }
+
+  sample(
+    width: number,
+    height: number,
+    pixels: Uint8ClampedArray,
+    hint: VisionTemporalHint,
+  ): CanonicalModuleSamples {
+    const samplingStarted = performance.now();
+    if (this.disposed) throw new Error("The compact COLOR_4 sampler has been disposed.");
+    if (this.cv.remap === undefined) {
+      throw new Error("OpenCV remap support is required for compact COLOR_4 sampling.");
+    }
+    if (width !== hint.sourceWidth || height !== hint.sourceHeight ||
+        pixels.length !== width * height * 4) {
+      throw new RangeError("The compact sampler frame does not match its temporal hint.");
+    }
+    const mapStarted = performance.now();
+    const mapReused = this.updateMaps(hint);
+    const mapMs = performance.now() - mapStarted;
+    const fixedPoint = this.fixedMap1 !== undefined && this.fixedMap2 !== undefined;
+    const sourceStarted = performance.now();
+    const source = this.sourceFrame(width, height, pixels);
+    let remapSource = source;
+    if (this.cv.COLOR_RGBA2RGB !== undefined) {
+      this.sourceRgb ??= new this.cv.Mat();
+      this.cv.cvtColor(source, this.sourceRgb, this.cv.COLOR_RGBA2RGB);
+      remapSource = this.sourceRgb;
+    }
+    const sourceMs = performance.now() - sourceStarted;
+    this.remapped ??= new this.cv.Mat();
+    const remapStarted = performance.now();
+    this.cv.remap(
+      remapSource,
+      this.remapped,
+      fixedPoint
+        ? this.fixedMap1!
+        : this.nativeMapProjectionDisabled
+          ? this.mapX!
+          : this.projectedCoordinates!,
+      fixedPoint
+        ? this.fixedMap2!
+        : this.nativeMapProjectionDisabled
+          ? this.mapY!
+          : this.emptyMap!,
+      interpolationFlag(this.cv, "cubic"),
+      this.cv.BORDER_CONSTANT,
+      new this.cv.Scalar(255, 255, 255, 255),
+    );
+    const remapMs = performance.now() - remapStarted;
+    const medianStarted = performance.now();
+    const rgb = compactModuleMedians(this.remapped, this.medianScratch);
+    const medianMs = performance.now() - medianStarted;
+    this.samplingDiagnostics = {
+      mapFormat: fixedPoint ? "fixed-point" : "float",
+      mapReused,
+      remapWidth: COMPACT_REMAP_SIZE,
+      remapHeight: COMPACT_REMAP_SIZE,
+      mapMs,
+      sourceMs,
+      remapMs,
+      medianMs,
+      totalMs: performance.now() - samplingStarted,
+    };
+    return { width: TOTAL_MODULES, height: TOTAL_MODULES, rgb };
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.deleteSamplingMats();
+    this.fixedMap2?.delete();
+    this.fixedMap1?.delete();
+    this.deleteNativeProjectionMaps();
+    this.mapY?.delete();
+    this.mapX?.delete();
+    this.fixedMap2 = undefined;
+    this.fixedMap1 = undefined;
+    this.mapY = undefined;
+    this.mapX = undefined;
+    this.mapKey = undefined;
+  }
+}
+
+/** One-shot wrapper; workers should retain a sampler instance to reuse maps. */
+export function sampleCanonicalColor4ModulesWithOpenCv(
+  cv: OpenCvRuntime,
+  width: number,
+  height: number,
+  pixels: Uint8ClampedArray,
+  hint: VisionTemporalHint,
+): CanonicalModuleSamples {
+  const sampler = new Color4CompactSamplerWithOpenCv(cv);
+  try {
+    return sampler.sample(width, height, pixels, hint);
+  } finally {
+    sampler.dispose();
+  }
+}
+
+function runColor4VisionWithOpenCv(
+  cv: OpenCvRuntime,
+  width: number,
+  height: number,
+  pixels: Uint8ClampedArray,
+  options: VisionOptions,
+  temporalOnly: boolean,
+): VisionResult | VisionTemporalAcquisitionResult {
   const canonicalScale: VisionCanonicalScale =
     options.canonicalScale ?? DEFAULT_COLOR4_CANONICAL_SCALE;
   const maxDetectionDimension: VisionDetectionLimit =
@@ -1776,6 +2837,7 @@ export function normalizeColor4WithOpenCv(
   let gray: CvMat | undefined;
   let solution: HomographySolution | undefined;
   let warped: CvMat | undefined;
+  let temporalTransform: VisionHomography | undefined;
   let clippedPixelFraction: number | undefined;
   let homographyStarted: number | undefined;
   let activeStage: "grayscale" | "detection" | "homography" = "grayscale";
@@ -1892,10 +2954,35 @@ export function normalizeColor4WithOpenCv(
     activeStage = "homography";
     homographyStarted = now();
     solution = homographyFor(cv, found.markers, canonicalScale, true);
+    temporalTransform = homographyCoefficients(solution.transform);
     homography.method = solution.method;
     if (solution.residual !== undefined) {
       homography.residualRmsModules = solution.residual.rmsModules;
       homography.residualMaxModules = solution.residual.maxModules;
+    }
+    if (temporalOnly) {
+      timings.homographyMs = elapsed(now, homographyStarted);
+      if (temporalTransform === undefined) {
+        throw new Error("OpenCV did not expose the acquired homography coefficients.");
+      }
+      const frameRegion = paddedSearchRegion(found.markers, width, height);
+      const temporalHint = createVisionTemporalHint({
+        generation: options.temporalGeneration,
+        sourceWidth: width,
+        sourceHeight: height,
+        canonicalScale,
+        corners: ORDERED_FIDUCIAL_IDS.flatMap((id) =>
+          orientedMarkerQuad(found.markers.get(id)!)),
+        homography: temporalTransform,
+        ...(frameRegion === undefined ? {} : { frameRegion }),
+      });
+      return {
+        status: "valid",
+        candidates: found.candidates,
+        temporalHint,
+        ...(frameRegion === undefined ? {} : { frameRegion }),
+        ...finish(false),
+      };
     }
     const canonicalSize = TOTAL_MODULES * canonicalScale;
     const interpolation = interpolationFlag(cv, warpInterpolation);
@@ -1944,6 +3031,10 @@ export function normalizeColor4WithOpenCv(
             homography.refinementResidualAfterMaxModules = after.maxModules;
           }
           if (correction && refinementImprovesHomography(before.rmsModules, after?.rmsModules)) {
+            const correctionTransform = homographyCoefficients(correction.transform);
+            temporalTransform = temporalTransform === undefined || correctionTransform === undefined
+              ? undefined
+              : multiplyHomographies(correctionTransform, temporalTransform);
             refined = new cv.Mat();
             cv.warpPerspective(
               warped,
@@ -1974,11 +3065,30 @@ export function normalizeColor4WithOpenCv(
     if (shouldCapturePlane(options, "warped")) planes.warped = planeFromMat(warped, 4);
     const canonicalPixels = Uint8ClampedArray.from(warped.data);
     const frameRegion = paddedSearchRegion(found.markers, width, height);
+    let temporalHint: VisionTemporalHint | undefined;
+    if (temporalTransform !== undefined) {
+      try {
+        temporalHint = createVisionTemporalHint({
+          generation: options.temporalGeneration,
+          sourceWidth: width,
+          sourceHeight: height,
+          canonicalScale,
+          corners: ORDERED_FIDUCIAL_IDS.flatMap((id) =>
+            orientedMarkerQuad(found.markers.get(id)!)),
+          homography: temporalTransform,
+          ...(frameRegion === undefined ? {} : { frameRegion }),
+        });
+      } catch {
+        // The canonical raster remains valid even if this runtime cannot expose
+        // a finite, serializable transform for the optional temporal fast path.
+      }
+    }
     return {
       status: "valid",
       candidates: found.candidates,
       image: { width: canonicalSize, height: canonicalSize, pixels: canonicalPixels },
       ...(frameRegion === undefined ? {} : { frameRegion }),
+      ...(temporalHint === undefined ? {} : { temporalHint }),
       ...finish(true),
     };
   } catch {
@@ -2008,4 +3118,31 @@ export function normalizeColor4WithOpenCv(
     gray?.delete();
     source?.delete();
   }
+}
+
+/** Legacy/debug normalization with the normative canonical RGBA raster. */
+export function normalizeColor4WithOpenCv(
+  cv: OpenCvRuntime,
+  width: number,
+  height: number,
+  pixels: Uint8ClampedArray,
+  options: VisionOptions = {},
+): VisionResult {
+  return runColor4VisionWithOpenCv(cv, width, height, pixels, options, false) as VisionResult;
+}
+
+/**
+ * Cold production acquisition that stops after detection and the 16-corner
+ * homography. The caller can feed its required hint directly to the compact
+ * sampler without first allocating or warping a 1032 x 1032 legacy raster.
+ */
+export function acquireColor4TemporalGeometryWithOpenCv(
+  cv: OpenCvRuntime,
+  width: number,
+  height: number,
+  pixels: Uint8ClampedArray,
+  options: VisionOptions = {},
+): VisionTemporalAcquisitionResult {
+  return runColor4VisionWithOpenCv(cv, width, height, pixels, options, true) as
+    VisionTemporalAcquisitionResult;
 }

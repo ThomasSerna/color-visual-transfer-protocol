@@ -61,7 +61,10 @@ import {
   savePreference,
   type ExperimentSummary,
 } from "../shared/experiments";
-import type { Color4CameraDecoder } from "./color4-carrier";
+import type {
+  Color4CameraDecoder,
+  Color4CaptureReservation,
+} from "./color4-carrier";
 import type { VisionDebugController } from "./color4-debug-ui";
 import type { QrLegacyCameraDecoder } from "./qr-carrier";
 import {
@@ -140,9 +143,9 @@ const manualCaptureWidths = new Map<CarrierChoice, string>();
 const manualCaptureFps = new Map<CarrierChoice, string>();
 const manualWorkers = new Map<CarrierChoice, string>();
 
-/** QR decode workers are cheap; a COLOR_4 vision worker carries all of OpenCV. */
+/** COLOR_4 owns one OpenCV worker; this controls its lightweight classifiers. */
 function defaultWorkerCount(carrier: CarrierChoice): number {
-  return carrier === "color4" ? 1 : 2;
+  return carrier === "color4" ? 2 : 2;
 }
 let statsTimer: ReturnType<typeof setInterval> | undefined;
 let activeCarrier: CarrierChoice | null = null;
@@ -176,9 +179,12 @@ let lastSubmittedStableIntervalEpoch: number | undefined;
  * later than `createImageBitmap` on WebKit, so both are probed. Cleared for the
  * session if this engine ever refuses a video bitmap at runtime.
  */
-let useBitmapCapture = __COLOR4_ENABLED__ &&
+const bitmapCaptureSupported = __COLOR4_ENABLED__ &&
   typeof createImageBitmap === "function" &&
   typeof OffscreenCanvas !== "undefined";
+let useBitmapCapture = bitmapCaptureSupported;
+let lastPresentedFrame = -1;
+let lastVideoCurrentTime = -1;
 
 const COLOR4_STABILITY_THRESHOLD = 0.025;
 
@@ -221,9 +227,8 @@ function applyCarrierControls(): void {
   }
   cfgWidth.value = manualCaptureWidths.get(carrier) ?? String(defaultCaptureWidth(carrier));
   cfgCapFps.value = manualCaptureFps.get(carrier) ?? String(defaultCaptureFps(carrier));
-  // Both carriers decode in a worker pool, but they want different defaults: a
-  // ZXing worker holds ~940 KB of WASM, a COLOR_4 vision worker holds a whole
-  // OpenCV build. COLOR_4 therefore starts at one and lets the user opt in.
+  // COLOR_4 always owns exactly one OpenCV instance; this selector controls
+  // only its lightweight TypeScript classifier/FEC pool (two by default).
   cfgWorkers.value = manualWorkers.get(carrier) ?? String(defaultWorkerCount(carrier));
   qrSettings.forEach((element) => { element.hidden = carrier !== "qr"; });
   colorSettings.forEach((element) => { element.hidden = carrier !== "color4"; });
@@ -369,6 +374,9 @@ function cancelActiveReceiver(message: string): void {
   decoder = null;
   streamKey = "";
   startTs = 0;
+  useBitmapCapture = bitmapCaptureSupported;
+  lastPresentedFrame = -1;
+  lastVideoCurrentTime = -1;
   done = false;
   negotiatedCamera = undefined;
   preview.style.display = "none";
@@ -562,6 +570,12 @@ async function start() {
       if (startGeneration !== captureGen) return;
       const paletteId = Number(cfgColorPalette!.value) === 1 ? 1 : 0;
       colorDecoder = module.createColor4Decoder(paletteId, Number(cfgWorkers.value));
+      colorDecoder.onWorkerRestart = (kind) => experiment?.recordWorkerRestart(kind);
+      colorDecoder.onFatal = (failure) => {
+        if (startGeneration !== captureGen || done) return;
+        persistExperiment(false, failure.message);
+        cancelActiveReceiver(`${failure.message} Tap Start camera to retry.`);
+      };
       startBtn.textContent = "Initializing COLOR_4 vision…";
       await colorDecoder.ready;
       if (startGeneration !== captureGen) {
@@ -659,6 +673,12 @@ async function start() {
     "receive",
     __COLOR4_ENABLED__ ? carrierId(requestedCarrier) : "QR_LEGACY",
   );
+  if (__COLOR4_ENABLED__ && requestedCarrier === "color4" && colorDecoder) {
+    experiment.setWorkerCounts({
+      geometry: colorDecoder.geometryWorkers,
+      classifier: colorDecoder.classifierWorkers,
+    });
+  }
   latestCarrierDiagnostics = undefined;
   if (__COLOR4_ENABLED__ && requestedCarrier === "color4") {
     visionDebugController?.setTransferActive(true);
@@ -716,7 +736,7 @@ function reportCameraSettings(note?: string) {
       : "";
   const colorWorkers = colorDecoder?.size ?? 0;
   const workers = __COLOR4_ENABLED__ && activeCarrier === "color4"
-    ? `${colorWorkers} COLOR_4 vision worker${colorWorkers === 1 ? "" : "s"}`
+    ? `1 geometry + ${colorWorkers} classifier worker${colorWorkers === 1 ? "" : "s"}`
     : `${qrDecoder?.size ?? 0} QR decode worker${qrDecoder?.size === 1 ? "" : "s"}`;
   cameraActual.textContent =
     `camera ${s.width}×${s.height}${widthNote} @ ${gotFps} fps${fpsNote} · ${workers} · ` +
@@ -762,9 +782,8 @@ async function applyReceiveSettings(
 ): Promise<void> {
   // finish() has already torn the pool down — don't resurrect it.
   if (done || generation !== captureGen) return;
-  // A QR worker can join or leave a live pool cheaply. A COLOR_4 worker has to
-  // load and initialize its own OpenCV build first, so a live change would
-  // stall the very pipeline it is meant to widen: it takes effect on restart.
+  // Pool topology is kept immutable for a capture session so reservations and
+  // watchdog ownership cannot change underneath an in-flight bitmap.
   if (activeCarrier === "qr") qrDecoder?.resize(workerCount);
   else if (colorDecoder && workerCount !== colorDecoder.size) {
     reportCameraSettings("worker count applies on the next Start camera");
@@ -810,14 +829,35 @@ async function applyReceiveSettings(
   reportCameraSettings();
 }
 
-type VideoRVFC = HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number };
+interface PresentedVideoFrameMetadata {
+  readonly presentedFrames: number;
+  readonly presentationTime?: number;
+  readonly expectedDisplayTime?: number;
+  readonly mediaTime: number;
+}
+
+type VideoRVFC = HTMLVideoElement & {
+  requestVideoFrameCallback?: (
+    cb: (now: number, metadata: PresentedVideoFrameMetadata) => void,
+  ) => number;
+};
 
 function scheduleFrame(gen: number) {
   if (done || gen !== captureGen) return;
   const v = video as VideoRVFC;
-  const next = () => {
+  const next = (now: number, metadata?: PresentedVideoFrameMetadata) => {
     if (done || gen !== captureGen) return;
-    captureFrame();
+    if (metadata) {
+      if (metadata.presentedFrames !== lastPresentedFrame) {
+        lastPresentedFrame = metadata.presentedFrames;
+        captureFrame(metadata.presentationTime ?? metadata.expectedDisplayTime ?? now);
+      }
+    } else if (video.currentTime !== lastVideoCurrentTime) {
+      // requestAnimationFrame can run at 60 Hz against a 30 Hz camera. Never
+      // reserve/copy the same decoded video frame twice on the fallback path.
+      lastVideoCurrentTime = video.currentTime;
+      captureFrame(now);
+    }
     scheduleFrame(gen);
   };
   if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(next);
@@ -861,13 +901,29 @@ function measureColor4Stability(): CaptureStabilityResult {
  */
 function submitColor4Frame(
   frame: { source: ImageData | ImageBitmap; timestamp: number },
+  reservation: Color4CaptureReservation,
+  reservedDecoder: Color4CameraDecoder,
   captureMs: number,
   capturedAt: number,
   decoderGeneration: number,
   stability: CaptureStabilityResult | undefined,
   alreadyRecordedQuality: boolean,
 ): void {
-  if (!colorDecoder) return;
+  if (
+    !colorDecoder ||
+    colorDecoder !== reservedDecoder ||
+    done ||
+    decoderGeneration !== captureGen ||
+    activeCarrier !== "color4"
+  ) {
+    if (!(frame.source instanceof ImageData)) frame.source.close();
+    reservedDecoder.cancelReservation(reservation);
+    if (decoderGeneration === captureGen && activeCarrier === "color4") {
+      experiment?.recordCaptureReservationCancelled();
+      experiment?.recordCaptureDrop("stale-session");
+    }
+    return;
+  }
   let qualityRecorded = alreadyRecordedQuality;
   // Claim the stable interval when the frame is dispatched, not when its
   // asynchronous result arrives. A rejection still consumes the interval;
@@ -881,7 +937,8 @@ function submitColor4Frame(
   // experiment view is coherent with the frame being handed to the worker.
   experiment?.recordVisionSubmission();
   const debugOptions = visionDebugController?.decodeOptions(capturedAt);
-  void colorDecoder.decode(
+  void reservedDecoder.decodeReserved(
+    reservation,
     frame,
     { captureMs, ...(debugOptions ? { debug: debugOptions } : {}) },
   ).then(
@@ -890,6 +947,14 @@ function submitColor4Frame(
       decodeTimes.push(performance.now());
       const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
       latestCarrierDiagnostics = diagnostics;
+      experiment?.recordGeometryPath(
+        decoded.geometryPath === "legacy" ? "fallback" : decoded.geometryPath,
+      );
+      if (
+        diagnostics.stage === "bootstrap" &&
+        (diagnostics.rejectReason === "sequence-phase-mismatch" ||
+          diagnostics.vision?.rejectReason === "phase_mismatch")
+      ) experiment?.recordTransition();
       if (!qualityRecorded) {
         experiment?.recordQualityClass(
           classifyColor4CaptureQuality(stability?.state, diagnostics.vision),
@@ -913,7 +978,7 @@ function submitColor4Frame(
       experiment?.setProfile(diagnostics.profile);
       experiment?.recordAttempt(decoded.status, diagnostics);
       if (decoded.status === "valid") {
-        onDecoded(decoded.innerFrame);
+        onDecoded(decoded.innerFrame, decoded.captureSequence, decoded.capturedAt);
       }
     },
     (error) => {
@@ -922,6 +987,14 @@ function submitColor4Frame(
       if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
       visionDebugController?.failSnapshot("Snapshot failed because the vision worker stopped.");
       experiment?.recordAttempt("rejected", { stage: "wire" });
+      const recoverable = error instanceof Error &&
+        "fatal" in error && (error as Error & { fatal?: boolean }).fatal === false;
+      if (recoverable) {
+        experiment?.recordCaptureDrop(
+          error.message.includes("exceeded") ? "watchdog" : "capture-failed",
+        );
+        return;
+      }
       const failureReason =
         error instanceof Error ? error.message : "The COLOR_4 vision worker stopped.";
       persistExperiment(false, failureReason);
@@ -930,7 +1003,7 @@ function submitColor4Frame(
   );
 }
 
-function captureFrame() {
+function captureFrame(presentationTimestamp = performance.now()) {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   if (!vw || !vh) return;
@@ -938,10 +1011,31 @@ function captureFrame() {
   experiment?.recordCapture();
   let stability: CaptureStabilityResult | undefined;
   let qualityRecorded = false;
+  let colorReservation: Color4CaptureReservation | undefined;
+  let reservedColorDecoder: Color4CameraDecoder | undefined;
   if (__COLOR4_ENABLED__ && activeCarrier === "color4") {
     if (!colorDecoder) return;
     if (!captureStability) return;
-    stability = measureColor4Stability();
+    reservedColorDecoder = colorDecoder;
+    colorReservation = reservedColorDecoder.tryReserveCapture();
+    if (!colorReservation) {
+      experiment?.recordSkippedWhileBusy();
+      experiment?.recordCaptureDrop(reservedColorDecoder.captureDropReason);
+      experiment?.recordQualityClass("UNKNOWN");
+      return;
+    }
+    experiment?.recordCaptureReservation();
+    try {
+      // The prefilter deliberately runs only after the atomic geometry+
+      // classifier reservation, so discarded callbacks cannot race a bitmap.
+      stability = measureColor4Stability();
+    } catch {
+      reservedColorDecoder.cancelReservation(colorReservation);
+      experiment?.recordCaptureReservationCancelled();
+      experiment?.recordCaptureDrop("capture-failed");
+      experiment?.recordQualityClass("UNKNOWN");
+      return;
+    }
     if (stability.state === "warmup") {
       experiment?.recordStabilityWarmupCapture();
       experiment?.recordQualityClass("UNKNOWN");
@@ -957,6 +1051,9 @@ function captureFrame() {
     }
     if (!stability.shouldSubmit) {
       if (stability.state === "unstable") experiment?.recordSkippedUnstable();
+      reservedColorDecoder.cancelReservation(colorReservation);
+      experiment?.recordCaptureReservationCancelled();
+      experiment?.recordCaptureDrop("prefilter-unstable");
       // A capture dropped before decoding never reaches the worker callback, so
       // record it here or a receiver that gates on stability would collect no
       // evidence at all about why it is stuck.
@@ -972,11 +1069,9 @@ function captureFrame() {
       experiment?.recordSkippedRedundantStable();
       experiment?.recordQualityClass("UNKNOWN");
       qualityRecorded = true;
-      return;
-    }
-    if (colorDecoder.busy) {
-      experiment?.recordSkippedWhileBusy();
-      if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
+      reservedColorDecoder.cancelReservation(colorReservation);
+      experiment?.recordCaptureReservationCancelled();
+      experiment?.recordCaptureDrop("prefilter-redundant");
       return;
     }
   } else {
@@ -994,37 +1089,47 @@ function captureFrame() {
   // camera. createImageBitmap costs about 1 ms and the worker reads the pixels
   // back for about 5 ms. The canvas path stays for engines without
   // OffscreenCanvas.
-  if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder && useBitmapCapture) {
+  if (
+    __COLOR4_ENABLED__ &&
+    activeCarrier === "color4" &&
+    reservedColorDecoder &&
+    colorReservation &&
+    useBitmapCapture
+  ) {
     const decoderGeneration = captureGen;
+    experiment?.recordCapturePath("bitmap");
     void createImageBitmap(video).then(
       (bitmap) => {
-        if (done || decoderGeneration !== captureGen || activeCarrier !== "color4" || !colorDecoder) {
+        if (
+          done ||
+          decoderGeneration !== captureGen ||
+          activeCarrier !== "color4" ||
+          colorDecoder !== reservedColorDecoder
+        ) {
           bitmap.close();
+          reservedColorDecoder.cancelReservation(colorReservation);
           return;
         }
-        // The busy check in captureFrame happened before this await, so another
-        // callback may have claimed the worker in between. Re-check rather than
-        // letting decode() reject and tear the receiver down.
-        if (colorDecoder.busy) {
-          bitmap.close();
-          experiment?.recordSkippedWhileBusy();
-          if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
-          return;
-        }
-        const capturedAt = performance.now();
+        const captureFinished = performance.now();
         submitColor4Frame(
-          { source: bitmap, timestamp: capturedAt },
-          Math.max(0, capturedAt - captureStarted),
-          capturedAt,
+          { source: bitmap, timestamp: presentationTimestamp },
+          colorReservation,
+          reservedColorDecoder,
+          Math.max(0, captureFinished - captureStarted),
+          presentationTimestamp,
           decoderGeneration,
           stability,
           qualityRecorded,
         );
       },
       () => {
-        // A single refused bitmap is not evidence the engine lacks the API, but
-        // repeated failures would stall the receiver silently. Fall back for the
-        // rest of the session and let the next callback use the canvas.
+        reservedColorDecoder.cancelReservation(colorReservation);
+        if (decoderGeneration !== captureGen || activeCarrier !== "color4") return;
+        experiment?.recordCaptureReservationCancelled();
+        experiment?.recordCaptureDrop("bitmap-failed");
+        if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
+        // The route is reset on every Start; the next distinct video callback
+        // uses RGBA without retrying or holding this failed reservation.
         useBitmapCapture = false;
       },
     );
@@ -1034,16 +1139,36 @@ function captureFrame() {
     grab.width = vw;
     grab.height = vh;
   }
-  const ctx = grab.getContext("2d", { willReadFrequently: true })!;
-  ctx.drawImage(video, 0, 0);
-  const img = ctx.getImageData(0, 0, vw, vh);
-  const capturedAt = performance.now();
-  const captureMs = Math.max(0, capturedAt - captureStarted);
-  if (__COLOR4_ENABLED__ && activeCarrier === "color4" && colorDecoder) {
+  if (reservedColorDecoder && colorReservation) experiment?.recordCapturePath("rgba");
+  let img: ImageData;
+  try {
+    const ctx = grab.getContext("2d", { willReadFrequently: true });
+    if (!ctx) throw new Error("The capture canvas has no 2D context.");
+    ctx.drawImage(video, 0, 0);
+    img = ctx.getImageData(0, 0, vw, vh);
+  } catch {
+    if (reservedColorDecoder && colorReservation) {
+      reservedColorDecoder.cancelReservation(colorReservation);
+      experiment?.recordCaptureReservationCancelled();
+      experiment?.recordCaptureDrop("capture-failed");
+      if (!qualityRecorded) experiment?.recordQualityClass("UNKNOWN");
+    }
+    return;
+  }
+  const captureFinished = performance.now();
+  const captureMs = Math.max(0, captureFinished - captureStarted);
+  if (
+    __COLOR4_ENABLED__ &&
+    activeCarrier === "color4" &&
+    reservedColorDecoder &&
+    colorReservation
+  ) {
     submitColor4Frame(
-      { source: img, timestamp: capturedAt },
+      { source: img, timestamp: presentationTimestamp },
+      colorReservation,
+      reservedColorDecoder,
       captureMs,
-      capturedAt,
+      presentationTimestamp,
       captureGen,
       stability,
       qualityRecorded,
@@ -1075,7 +1200,7 @@ function captureFrame() {
   }
 }
 
-function onDecoded(bytes: Uint8Array) {
+function onDecoded(bytes: Uint8Array, captureSequence?: number, capturedAt?: number) {
   const parsed = parseFrame(bytes);
   if (!parsed || done) return;
   const { header, block } = parsed;
@@ -1098,7 +1223,11 @@ function onDecoded(bytes: Uint8Array) {
     progressEl.style.display = "block";
     progressStatus.style.display = "flex";
   }
+  const framesBefore = decoder.framesNew;
   decoder.addFrame(header.seq, block);
+  if (decoder.framesNew > framesBefore && captureSequence !== undefined) {
+    experiment?.recordNewFrame(captureSequence, capturedAt ?? performance.now());
+  }
   updateProgressEstimate();
 
   if (decoder.isComplete) {
@@ -1400,6 +1529,10 @@ function updateStats() {
   const perSecond = (a: number[]) => a.length / (STATS_WINDOW_MS / 1000);
   metric("m-cap").textContent = perSecond(captureTimes).toFixed(0);
   metric("m-dec").textContent = perSecond(decodeTimes).toFixed(1);
+  const currentSummary = experimentSnapshot(false) ?? latestExperiment;
+  metric("m-new-rate").textContent = currentSummary?.newFramesPerSecond === undefined
+    ? "—"
+    : currentSummary.newFramesPerSecond.toFixed(1);
   const measured = experiment ?? latestExperiment;
   if (measured) {
     metric("m-carrier").textContent = `${measured.validFrames}/${measured.carrierRejected}`;
@@ -1417,7 +1550,7 @@ function updateStats() {
     metric("m-fiducials").textContent = fiducials
       ? `${(["TL", "TR", "BR", "BL"] as const).filter((id) => fiducials[id]?.found).length}/4`
       : "—";
-    const visionSummary = experimentSnapshot(false)?.vision ?? latestExperiment?.vision;
+    const visionSummary = currentSummary?.vision;
     const workerTiming = visionSummary?.timingsMs.workerTotal;
     metric("m-pipeline").textContent = workerTiming
       ? `${workerTiming.p50.toFixed(0)}/${workerTiming.p95.toFixed(0)} ms${

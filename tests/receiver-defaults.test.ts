@@ -37,4 +37,9 @@ test("receiver HTML sources its camera and vision selections from build tokens",
   ]) {
     assert.match(html, new RegExp(`%${token}%`));
   }
+  assert.match(
+    html,
+    /id="cfg-debug-tx"[^>]*>.*?<option>15<\/option>/,
+    "physical experiment conditions must support the 15 fps COLOR_4 milestone",
+  );
 });

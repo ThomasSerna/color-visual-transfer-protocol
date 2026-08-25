@@ -37,8 +37,10 @@ summaries, never transfer contents.
 ## Diagnostics and measurement export
 
 **Live diagnostics** becomes **Transfer summary** when reception stops. It
-shows capture/decode fps, goodput, elapsed time, new/duplicate frames, K, block
-length, accepted/rejected carrier frames and RS corrections/erasures.
+shows capture/decode fps, distinct **new blocks/s**, goodput, elapsed time,
+new/duplicate frames, K, block length, accepted/rejected carrier frames and RS
+corrections/erasures. Decode fps counts completed attempts; new blocks/s is the
+useful distinct-frame rate and is measured between the first and last new frame.
 
 **Export measurements** downloads JSON containing the current run and stored
 history. Each summary includes negotiated camera resolution/fps, captures,
@@ -47,9 +49,13 @@ uncertain cells, RS corrections/failures, CRC failures, valid/new/duplicate
 frames, solved blocks, decode-latency statistics, container bitrate and file
 goodput when available. COLOR_4 runs additionally record stability warmup,
 stable/unstable captures, vision submissions, unstable/redundant-stable skips
-and the bounded normalized stability-score distribution. **Clear history**
-deletes these summaries but not app preferences. Use this export for paired
-QR/COLOR_4 benchmark runs.
+and the bounded normalized stability-score distribution. Schema-v2 summaries
+can also include bitmap/RGBA capture counts, reservations and whitelisted drop
+causes, cold/tracked/fallback/transition counts, worker counts/restarts/utilization, bounded
+tracking/sampling/guard/classifier timings, distinct-frame rate and estimated
+pipeline capacity. Existing schema-v1 history is exported unchanged alongside
+new runs. **Clear history** deletes these summaries but not app preferences. Use
+this export for paired QR/COLOR_4 benchmark runs.
 
 ## Receive settings
 
@@ -67,6 +73,7 @@ are authoritative.
 | QR capture fps | 60 | unsupported rates are disabled; some devices negotiate 30 |
 | COLOR_4 capture fps | 30 | selectable 15 or 30; resolution and stability take priority over 60 |
 | QR decode workers | 2 | independent ZXing workers; busy workers discard captures |
+| COLOR_4 classifier workers | 2 | selectable 1–3; OpenCV geometry remains a single temporal worker |
 | COLOR_4 palette | KCMY | must match the sender; KRGB is Labs only |
 
 For a numeric COLOR_4 width, startup first requests that width and FPS exactly.
@@ -77,9 +84,11 @@ by camera capabilities. A failed maximum upgrade is not fatal. Camera height
 remains an ideal 4:3 hint because not every sensor exposes that shape at every
 width.
 
-COLOR_4 uses one OpenCV vision worker and keeps only one image in flight. If it
-is busy, the next capture is deliberately discarded; this protects latency and
-memory, and the fountain layer absorbs the loss.
+COLOR_4 uses one stateful OpenCV geometry worker feeding two lightweight
+classifier/FEC workers by default. A capture reserves geometry and one
+classifier slot before any prefilter or bitmap allocation. There is no queued
+camera frame: if either stage lacks capacity, the new callback is deliberately
+discarded, protecting latency and memory while the fountain layer absorbs loss.
 
 Before that worker, COLOR_4 measures motion using a 64×48 BT.709-luma
 fingerprint. It compares 8×8 blocks, uses normalized p90 mean absolute error,

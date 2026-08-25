@@ -109,6 +109,12 @@ export async function expectColor4CameraReconstruction(
       duplicateFrames: number;
       resolvedBlocks: number;
       crcFailures: number;
+      temporalPipeline?: {
+        drops?: Partial<Record<
+          "reservation-unavailable" | "geometry-busy" | "classifier-busy",
+          number
+        >>;
+      };
     }>;
   };
   expect(metrics.current).toBeUndefined();
@@ -133,7 +139,10 @@ export async function expectColor4CameraReconstruction(
   expect(
     (metrics.history[0]!.stableCaptures ?? 0) +
       (metrics.history[0]!.unstableCaptures ?? 0) +
-      (metrics.history[0]!.stabilityWarmupCaptures ?? 0),
+      (metrics.history[0]!.stabilityWarmupCaptures ?? 0) +
+      (metrics.history[0]!.temporalPipeline?.drops?.["reservation-unavailable"] ?? 0) +
+      (metrics.history[0]!.temporalPipeline?.drops?.["geometry-busy"] ?? 0) +
+      (metrics.history[0]!.temporalPipeline?.drops?.["classifier-busy"] ?? 0),
   ).toBe(metrics.history[0]!.captures);
   if (options.prefilterMode === "enabled") {
     expect(metrics.history[0]!.skippedUnstable).toBeGreaterThan(0);

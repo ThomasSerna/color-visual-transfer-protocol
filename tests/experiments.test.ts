@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  estimatePipelineCapacityFps,
   ExperimentMetrics,
   makeExperimentExport,
   workerP95ExceedsTxFrameInterval,
@@ -174,7 +175,7 @@ test("vision timing reservoirs stay bounded and legacy summaries remain optional
       stage: "geometry",
       vision: {
         rejectReason: "ONLY_3_FIDUCIALS",
-        timings: { contours: index },
+        timings: { contours: index, tracking: index, classifier: index },
       },
     });
   }
@@ -182,6 +183,9 @@ test("vision timing reservoirs stay bounded and legacy summaries remain optional
   assert.equal(vision.timingsMs.contours?.count, 256);
   assert.equal(vision.timingsMs.contours?.min, 44);
   assert.equal(vision.timingsMs.contours?.max, 299);
+  assert.equal(vision.timingsMs.tracking?.count, 256);
+  assert.equal(vision.timingsMs.tracking?.min, 44);
+  assert.equal(vision.timingsMs.classifier?.p95, 286);
   assert.equal(vision.rejectReasons.ONLY_3_FIDUCIALS, 300);
   assert.equal(metrics.snapshot({ success: false, now: 1 }).erasureBytesPerAttempt?.count, 256);
 
@@ -315,7 +319,7 @@ test("photometric canonical diagnostics aggregate as optional schema-v1 distribu
 
   const summary = metrics.snapshot({ success: false, now: 1 });
   const canonical = summary.vision?.canonical;
-  assert.equal(summary.schemaVersion, 1);
+  assert.equal(summary.schemaVersion, 2);
   assert.equal(canonical?.bootstrapSampling?.doubleVoteColumns?.count, 2);
   assert.equal(canonical?.bootstrapSampling?.doubleVoteColumns?.average, 19);
   assert.equal(canonical?.bootstrapSampling?.minimumDifferentialLuma?.min, 16);
@@ -383,7 +387,7 @@ test("classifier confidence telemetry persists bounded aggregates without payloa
 
   const summary = metrics.snapshot({ success: false, now: 1 });
   const classification = summary.vision?.canonical?.classification;
-  assert.equal(summary.schemaVersion, 1);
+  assert.equal(summary.schemaVersion, 2);
   assert.deepEqual(classification?.distanceRejectedCells, {
     count: 2,
     average: 8,
@@ -565,7 +569,7 @@ test("COLOR_4 erasure-policy telemetry persists only bounded aggregate counts", 
 
   const summary = metrics.snapshot({ success: false, now: 1 });
   const policy = summary.color4ErasurePolicy;
-  assert.equal(summary.schemaVersion, 1);
+  assert.equal(summary.schemaVersion, 2);
   assert.deepEqual(policy?.selectedPolicies, {
     "classifier-budgeted": 1,
     "hard-decision": 1,
@@ -872,11 +876,95 @@ test("worker p95 warning uses the expected transmitter-frame interval", () => {
   );
 });
 
-test("experiment export has a pinned, portable envelope", () => {
+test("schema-v2 temporal telemetry is bounded, whitelisted and derives throughput", () => {
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", "EXPERIMENTAL", 0);
+  metrics.recordCapturePath("bitmap");
+  metrics.recordCapturePath("bitmap");
+  metrics.recordCapturePath("rgba");
+  metrics.recordCapturePath("private-camera-name" as never);
+  metrics.recordCaptureReservation();
+  metrics.recordCaptureReservation();
+  metrics.recordCaptureReservationCancelled();
+  metrics.recordCaptureDrop("classifier-busy");
+  metrics.recordCaptureDrop("bitmap-failed");
+  metrics.recordCaptureDrop("private-drop-detail" as never);
+  metrics.recordGeometryPath("cold");
+  metrics.recordGeometryPath("tracked");
+  metrics.recordGeometryPath("tracked");
+  metrics.recordGeometryPath("fallback");
+  metrics.recordTransition();
+  metrics.setWorkerCounts({ geometry: 1, classifier: 2 });
+  metrics.setWorkerCounts({ geometry: 0, classifier: 99 });
+  metrics.recordWorkerRestart("geometry");
+  metrics.recordWorkerRestart("classifier");
+  metrics.recordWorkerRestart("private-worker" as never);
+  metrics.recordNewFrame(10, 1_200);
+  metrics.recordNewFrame(11, 1_000);
+  metrics.recordNewFrame(12, 1_100);
+  metrics.recordNewFrame(12, 9_000);
+  metrics.recordNewFrame(Number.NaN, 1_300);
+  metrics.recordAttempt("valid", {
+    vision: {
+      timings: {
+        tracking: 20,
+        sampling: 45,
+        guard: 5,
+        geometryTotal: 80,
+        classifier: 160,
+      },
+    },
+  });
+
+  const summary = metrics.snapshot({ success: true, now: 2_000, newFrames: 3 });
+  assert.equal(summary.schemaVersion, 2);
+  assert.deepEqual(summary.temporalPipeline, {
+    capturePaths: { bitmap: 2, rgba: 1 },
+    reservations: 2,
+    reservationCancellations: 1,
+    drops: { "classifier-busy": 1, "bitmap-failed": 1 },
+    coldAcquisitions: 1,
+    trackedFrames: 2,
+    trackingFallbacks: 1,
+    transitions: 1,
+    geometryWorkers: 1,
+    classifierWorkers: 2,
+    geometryUtilization: 0.04,
+    classifierUtilization: 0.04,
+    geometryWorkerRestarts: 1,
+    classifierWorkerRestarts: 1,
+  });
+  assert.equal(summary.vision?.timingsMs.tracking?.p95, 20);
+  assert.equal(summary.vision?.timingsMs.sampling?.p95, 45);
+  assert.equal(summary.vision?.timingsMs.guard?.p95, 5);
+  assert.equal(summary.vision?.timingsMs.classifier?.p95, 160);
+  assert.equal(summary.newFramesPerSecond, 10);
+  assert.equal(summary.estimatedCapacityFps, 12.5);
+  const serialized = JSON.stringify(summary);
+  assert.equal(serialized.includes("captureSequence"), false);
+  assert.equal(serialized.includes("private-"), false);
+});
+
+test("pipeline capacity stays optional for incomplete or invalid measurements", () => {
+  assert.equal(estimatePipelineCapacityFps(80, 160, 2), 12.5);
+  assert.equal(estimatePipelineCapacityFps(undefined, 160, 2), undefined);
+  assert.equal(estimatePipelineCapacityFps(80, undefined, 2), undefined);
+  assert.equal(estimatePipelineCapacityFps(0, 160, 2), undefined);
+  assert.equal(estimatePipelineCapacityFps(80, Number.NaN, 2), undefined);
+  assert.equal(estimatePipelineCapacityFps(80, 160, 0), undefined);
+
+  const metrics = new ExperimentMetrics("receive", "COLOR_4", "EXPERIMENTAL", 0);
+  metrics.recordNewFrame(1, 100);
+  const summary = metrics.snapshot({ success: false, now: 200, newFrames: 1 });
+  assert.equal("newFramesPerSecond" in summary, false);
+  assert.equal("estimatedCapacityFps" in summary, false);
+  assert.equal(summary.temporalPipeline, undefined);
+});
+
+test("experiment export has a pinned, portable v2 envelope", () => {
   const exported = makeExperimentExport([], undefined, new Date("2026-08-08T12:00:00Z"));
   assert.deepEqual(exported, {
     schema: "decimen-experiment-export",
-    version: 1,
+    version: 2,
     exportedAt: "2026-08-08T12:00:00.000Z",
     current: undefined,
     history: [],
@@ -921,7 +1009,7 @@ test("schema-v1 IndexedDB summaries without vision remain export compatible", ()
     new Date("2026-08-08T12:00:00Z"),
   );
 
-  assert.equal(exported.version, 1);
+  assert.equal(exported.version, 2);
   assert.equal(exported.history[0], legacy);
   assert.equal("vision" in exported.history[0]!, false);
   assert.equal("stableCaptures" in exported.history[0]!, false);

@@ -14,6 +14,8 @@ import type {
   VisionDebugArtifacts,
   VisionDebugView,
   VisionDetectionLimit,
+  VisionDiagnostics,
+  VisionSearchRegion,
 } from "./color4-vision-types";
 import type {
   Color4ErasureBudgetFraction,
@@ -33,7 +35,11 @@ export interface Color4WorkerDebugOptions {
 export interface Color4WorkerInitRequest {
   readonly kind: "init";
   readonly id: number;
+  /** Omitted by older tests/consumers, where the worker remains self-contained. */
+  readonly role?: Color4WorkerRole;
 }
+
+export type Color4WorkerRole = "combined" | "geometry" | "classifier";
 
 /**
  * One captured frame, in whichever representation the receiver could produce.
@@ -66,7 +72,75 @@ export interface Color4WorkerDecodeRequest {
   readonly debug: Color4WorkerDebugOptions;
 }
 
-export type Color4WorkerRequest = Color4WorkerInitRequest | Color4WorkerDecodeRequest;
+/**
+ * Capture sent to the single OpenCV owner.  Unlike `decode`, this request stops
+ * after geometry and canonical sampling so another, OpenCV-free worker can run
+ * classification/FEC in parallel with acquisition of the next camera frame.
+ */
+export interface Color4GeometryRequest {
+  readonly kind: "geometry";
+  readonly id: number;
+  readonly captureSequence: number;
+  readonly trackingGeneration: number;
+  /** Classifier capacity reserved atomically with this geometry capture. */
+  readonly classifierSlot: number;
+  readonly width: number;
+  readonly height: number;
+  readonly source: Color4WorkerFrameSource;
+  readonly paletteId: Color4PaletteId;
+  readonly capturedAt: number;
+  readonly captureMs: number;
+  readonly debug: Color4WorkerDebugOptions;
+  /** `legacy` is an explicit probe after repeated quick-path rejections. */
+  readonly mode: "fast" | "legacy";
+}
+
+export interface Color4GeometrySnapshot {
+  readonly candidates: number;
+  readonly diagnostics: VisionDiagnostics;
+  readonly frameRegion?: VisionSearchRegion;
+  readonly debug?: VisionDebugArtifacts;
+}
+
+export type Color4CanonicalSource =
+  | {
+      readonly kind: "samples";
+      readonly width: number;
+      readonly height: number;
+      readonly rgb: ArrayBuffer;
+    }
+  | {
+      readonly kind: "raster";
+      readonly width: number;
+      readonly height: number;
+      readonly rgba: ArrayBuffer;
+    };
+
+/** Compact hand-off consumed by a lightweight TypeScript classifier worker. */
+export interface Color4ClassifyRequest {
+  readonly kind: "classify";
+  readonly id: number;
+  readonly captureSequence: number;
+  readonly trackingGeneration: number;
+  readonly classifierSlot: number;
+  readonly paletteId: Color4PaletteId;
+  readonly capturedAt: number;
+  readonly captureMs: number;
+  readonly debug: Color4WorkerDebugOptions;
+  readonly geometry: Color4GeometrySnapshot;
+  readonly geometryPath: "cold" | "tracked" | "fallback" | "legacy";
+  readonly geometryMs: number;
+  readonly trackingMs: number;
+  readonly samplingMs: number;
+  readonly guardMs: number;
+  readonly canonical: Color4CanonicalSource;
+}
+
+export type Color4WorkerRequest =
+  | Color4WorkerInitRequest
+  | Color4WorkerDecodeRequest
+  | Color4GeometryRequest
+  | Color4ClassifyRequest;
 
 export interface Color4WorkerUnwrapAttemptDiagnostics
   extends BrowserColor4UnwrapAttemptDiagnostics {
@@ -133,13 +207,51 @@ export interface Color4WorkerReadyResponse {
   readonly kind: "ready";
   readonly id: number;
   readonly opencvInitMs: number;
+  readonly role?: Color4WorkerRole;
 }
+
+export interface Color4GeometryValidResponse {
+  readonly kind: "geometry-result";
+  readonly id: number;
+  readonly captureSequence: number;
+  readonly trackingGeneration: number;
+  readonly classifierSlot: number;
+  readonly status: "valid";
+  readonly geometryPath: "cold" | "tracked" | "fallback" | "legacy";
+  readonly geometryMs: number;
+  readonly trackingMs: number;
+  readonly samplingMs: number;
+  readonly guardMs: number;
+  readonly geometry: Color4GeometrySnapshot;
+  readonly canonical: Color4CanonicalSource;
+}
+
+export interface Color4GeometryRejectedResponse {
+  readonly kind: "geometry-result";
+  readonly id: number;
+  readonly captureSequence: number;
+  readonly trackingGeneration: number;
+  readonly classifierSlot: number;
+  readonly status: "rejected";
+  readonly geometryPath: "cold" | "tracked" | "fallback" | "legacy";
+  readonly reason: RejectReason;
+  readonly diagnostics: Color4WorkerDiagnostics;
+  readonly debug?: Color4WorkerDebugFrame;
+}
+
+export type Color4GeometryResponse =
+  | Color4GeometryValidResponse
+  | Color4GeometryRejectedResponse;
 
 interface Color4WorkerResultBase {
   readonly kind: "result";
   readonly id: number;
   readonly diagnostics: Color4WorkerDiagnostics;
   readonly debug?: Color4WorkerDebugFrame;
+  readonly captureSequence?: number;
+  readonly trackingGeneration?: number;
+  readonly classifierSlot?: number;
+  readonly geometryPath?: "cold" | "tracked" | "fallback" | "legacy";
 }
 
 export interface Color4WorkerValidResponse extends Color4WorkerResultBase {
@@ -154,5 +266,6 @@ export interface Color4WorkerRejectedResponse extends Color4WorkerResultBase {
 
 export type Color4WorkerResponse =
   | Color4WorkerReadyResponse
+  | Color4GeometryResponse
   | Color4WorkerValidResponse
   | Color4WorkerRejectedResponse;

@@ -22,11 +22,12 @@ Three pages, one shared core, a handful of single-purpose build plugins. No fram
 - `carrier.ts` — the `QR_LEGACY` / `COLOR_4` encoder and decoder boundary.
 - `color4/` — profile registry, outer PDU, CRC/FEC/interleaving/whitening,
   frozen physical layout and canonical raster codec.
-- `experiments.ts` — counters, latency summaries and JSON export;
-  only completed summaries and user preferences may enter IndexedDB.
+- `experiments.ts` — schema-v2 bounded counters, latency summaries, temporal
+  pipeline capacity/rate derivation and JSON export; schema-v1 IndexedDB runs
+  remain readable and are exported unchanged.
 - `display.ts` — QR display-size fitting against the viewport.
 - `platform.ts` — `isIOS`/`isAndroid` sniffs and camera capability probing (torch, continuous focus, max fps). Policy: probe wherever probeable; sniff only for unprobeable behavior.
-- `worker-pool.ts` — QR decode worker pool; busy workers drop frames, the fountain absorbs it. COLOR_4 keeps its own pool in `receive/color4-carrier.ts`, because its workers exchange diagnostics and debug artifacts rather than bare bytes, and each carries a full OpenCV instance (so it defaults to one worker where QR defaults to two).
+- `worker-pool.ts` — QR decode worker pool; busy workers drop frames, the fountain absorbs it. COLOR_4 owns a split temporal pipeline in `receive/color4-carrier.ts`: one stateful OpenCV geometry worker feeds a configurable pool of lightweight classifier/FEC workers.
 - `no-signal.ts` — pure timing policy for the "Nothing happening?" hint (short first delay, longer after dismissal).
 - `progress.ts` — frames-collected progress estimation and fountain-overhead model.
 - `send-settings.ts` — canonical tx settings lists; the sender's dropdowns and the no-signal advice both render from it.

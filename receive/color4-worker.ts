@@ -1,10 +1,17 @@
 import {
   decodeCanonicalColor4Raster,
+  guardCanonicalColor4Samples,
+  type CanonicalColor4GuardResult,
   type CanonicalRasterObservation,
   type CanonicalRasterResult,
   type RejectReason,
   type Color4UnwrapObservation,
 } from "../shared/color4";
+import {
+  decodeCanonicalColor4Samples,
+  type CanonicalModuleSamples,
+  type CanonicalRasterImage,
+} from "../shared/color4/classifier";
 import type {
   BrowserCarrierDiagnostics,
   BrowserVisionDiagnostics,
@@ -12,9 +19,16 @@ import type {
   VisionTimingKey,
 } from "../shared/carrier";
 import {
+  Color4CompactSamplerWithOpenCv,
+  acquireColor4TemporalGeometryWithOpenCv,
+  createVisionGrayscaleFrameWithOpenCv,
   normalizeColor4WithOpenCv,
+  trackVisionTemporalHintWithOpenCv,
   type OpenCvRuntime,
+  type VisionGrayscaleFrame,
   type VisionResult,
+  type VisionTemporalAcquisitionResult,
+  type VisionTemporalHint,
 } from "./color4-vision";
 import { color4SequencePhaseMatches } from "./color4-binding";
 import { canonicalDiagnosticReason, fecDiagnosticReason } from "./color4-diagnostic-reason";
@@ -24,8 +38,11 @@ import {
 } from "./color4-erasure-policy";
 import type {
   Color4WorkerDebugFrame,
+  Color4ClassifyRequest,
   Color4WorkerDecodeRequest,
   Color4WorkerDiagnostics,
+  Color4GeometryRequest,
+  Color4GeometrySnapshot,
   Color4WorkerRequest,
   Color4WorkerResponse,
 } from "./color4-worker-protocol";
@@ -34,6 +51,17 @@ type RequiredStage = Exclude<BrowserCarrierDiagnostics["stage"], undefined>;
 type MutableDiagnostics = {
   -readonly [Key in keyof Color4WorkerDiagnostics]: Color4WorkerDiagnostics[Key];
 };
+type DecodeMetadataRequest =
+  | Color4WorkerDecodeRequest
+  | Color4GeometryRequest
+  | Color4ClassifyRequest;
+type GeometryFrameRequest = Color4WorkerDecodeRequest | Color4GeometryRequest;
+type WorkerVisionResult =
+  | VisionResult
+  | VisionTemporalAcquisitionResult
+  | (Color4GeometrySnapshot & { readonly status: "valid" });
+type CanonicalInput = CanonicalRasterImage | CanonicalModuleSamples;
+type CanonicalDiagnosticResult = CanonicalRasterResult | CanonicalColor4GuardResult;
 
 const scope = self as unknown as {
   onmessage: ((event: MessageEvent<Color4WorkerRequest>) => void) | null;
@@ -48,13 +76,22 @@ let openCvInitMs = 0;
  *
  * Thresholding and contour extraction are the bulk of cold acquisition and cost
  * whatever the searched area costs. Two devices held still put the code in the
- * same place frame after frame, so remembering it turns most frames into a
- * search over a fraction of the pixels. The hint is dropped as soon as a frame
- * fails to locate the code — the scene has changed, and the next frame should
- * look everywhere. Each worker in the pool keeps its own hint and converges
- * independently.
+ * same place frame after frame. The sole OpenCV geometry worker owns this state;
+ * classifier workers never import OpenCV or retain temporal photometry. The
+ * hint is dropped as soon as geometry or the structural guard proves it stale.
  */
 let searchRegion: import("./color4-vision").VisionSearchRegion | undefined;
+let previousTrackingGray: VisionGrayscaleFrame | undefined;
+let temporalHint: VisionTemporalHint | undefined;
+let temporalGeometry: Color4GeometrySnapshot | undefined;
+let compactSampler: Color4CompactSamplerWithOpenCv | undefined;
+
+function clearTemporalTracking(): void {
+  previousTrackingGray = undefined;
+  temporalHint = undefined;
+  temporalGeometry = undefined;
+  searchRegion = undefined;
+}
 
 async function loadOpenCv(): Promise<OpenCvRuntime> {
   if (openCvPromise) return openCvPromise;
@@ -93,7 +130,7 @@ function classifierStage(reason: string): RequiredStage {
 }
 
 function actionableDiagnosticReason(
-  raster: CanonicalRasterResult | undefined,
+  raster: CanonicalDiagnosticResult | undefined,
   classifier: readonly CanonicalRasterObservation[],
   unwrap: readonly Color4UnwrapObservation[],
   rejectReason: string | undefined,
@@ -162,15 +199,26 @@ export function color4ErasurePolicyDiagnostics(policy: Color4ErasurePolicyResult
 }
 
 function stageTimings(
-  request: Color4WorkerDecodeRequest,
-  normalized: VisionResult | undefined,
+  request: DecodeMetadataRequest,
+  normalized: WorkerVisionResult | undefined,
   classifier: readonly CanonicalRasterObservation[],
   unwrap: readonly Color4UnwrapObservation[],
   workerTotal: number,
 ): Partial<Record<VisionTimingKey, number>> {
+  const localWorkerTotal = workerTotal;
+  const totalWorker = localWorkerTotal + (request.kind === "classify" ? request.geometryMs : 0);
   const timings: Partial<Record<VisionTimingKey, number>> = {
     capture: request.captureMs,
-    workerTotal,
+    workerTotal: totalWorker,
+    ...(request.kind === "classify"
+      ? {
+          geometryTotal: request.geometryMs,
+          tracking: request.trackingMs,
+          sampling: request.samplingMs,
+          guard: request.guardMs,
+          classifier: localWorkerTotal,
+        }
+      : { geometryTotal: localWorkerTotal }),
   };
   if (normalized) {
     const observed = normalized.diagnostics.timings;
@@ -257,9 +305,9 @@ export function canonicalVisionDiagnostics(
 }
 
 function visionDiagnostics(
-  request: Color4WorkerDecodeRequest,
-  normalized: VisionResult | undefined,
-  raster: CanonicalRasterResult | undefined,
+  request: DecodeMetadataRequest,
+  normalized: WorkerVisionResult | undefined,
+  raster: CanonicalDiagnosticResult | undefined,
   classifier: readonly CanonicalRasterObservation[],
   unwrap: readonly Color4UnwrapObservation[],
   workerTotal: number,
@@ -337,9 +385,9 @@ function visionDiagnostics(
 }
 
 function baseDiagnostics(
-  request: Color4WorkerDecodeRequest,
-  raster: CanonicalRasterResult | undefined,
-  normalized: VisionResult | undefined,
+  request: DecodeMetadataRequest,
+  raster: CanonicalDiagnosticResult | undefined,
+  normalized: WorkerVisionResult | undefined,
   classifier: readonly CanonicalRasterObservation[],
   unwrap: readonly Color4UnwrapObservation[],
   started: number,
@@ -347,7 +395,8 @@ function baseDiagnostics(
   diagnosticUnwrap: readonly Color4UnwrapObservation[] = unwrap,
   saturatedErasureShards: readonly number[] = [],
 ): MutableDiagnostics {
-  const elapsed = Math.max(0, performance.now() - started);
+  const localElapsed = Math.max(0, performance.now() - started);
+  const elapsed = localElapsed + (request.kind === "classify" ? request.geometryMs : 0);
   return {
     profile: raster?.status === "valid" ? raster.profile.name : undefined,
     stage: raster?.status === "rejected" ? classifierStage(raster.reason) : "wire",
@@ -372,7 +421,7 @@ function baseDiagnostics(
       raster,
       classifier,
       unwrap,
-      elapsed,
+      localElapsed,
       rejectReason,
       diagnosticUnwrap,
       saturatedErasureShards,
@@ -396,9 +445,9 @@ function updateReject(
 }
 
 function debugFrame(
-  request: Color4WorkerDecodeRequest,
-  normalized: VisionResult | undefined,
-  raster: CanonicalRasterResult | undefined,
+  request: DecodeMetadataRequest,
+  normalized: WorkerVisionResult | undefined,
+  raster: CanonicalDiagnosticResult | undefined,
   classifier: readonly CanonicalRasterObservation[],
   unwrap: readonly Color4UnwrapObservation[],
 ): Color4WorkerDebugFrame | undefined {
@@ -440,13 +489,28 @@ function transferables(
 }
 
 function postRejected(
-  request: Color4WorkerDecodeRequest,
+  request: DecodeMetadataRequest,
   reason: RejectReason,
   diagnostics: MutableDiagnostics,
   debug: Color4WorkerDebugFrame | undefined,
 ): void {
   scope.postMessage(
-    { kind: "result", id: request.id, status: "rejected", reason, diagnostics, ...(debug ? { debug } : {}) },
+    {
+      kind: "result",
+      id: request.id,
+      status: "rejected",
+      reason,
+      diagnostics,
+      ...(request.kind === "classify"
+        ? {
+            captureSequence: request.captureSequence,
+            trackingGeneration: request.trackingGeneration,
+            classifierSlot: request.classifierSlot,
+            geometryPath: request.geometryPath,
+          }
+        : {}),
+      ...(debug ? { debug } : {}),
+    },
     transferables(debug),
   );
 }
@@ -458,7 +522,7 @@ function postRejected(
 let bitmapCanvas: OffscreenCanvas | undefined;
 let bitmapContext: OffscreenCanvasRenderingContext2D | undefined;
 
-function pixelsFromRequest(request: Color4WorkerDecodeRequest): Uint8ClampedArray {
+function pixelsFromRequest(request: GeometryFrameRequest): Uint8ClampedArray {
   if (request.source.kind === "rgba") return new Uint8ClampedArray(request.source.rgba);
   const { bitmap } = request.source;
   try {
@@ -479,54 +543,78 @@ function pixelsFromRequest(request: Color4WorkerDecodeRequest): Uint8ClampedArra
   }
 }
 
-async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
+async function decode(
+  request: Color4WorkerDecodeRequest | Color4ClassifyRequest,
+): Promise<void> {
   const started = performance.now();
   const classifierObservations: CanonicalRasterObservation[] = [];
   const unwrapObservations: Color4UnwrapObservation[] = [];
-  let normalized: VisionResult | undefined;
+  let normalized: WorkerVisionResult | undefined;
   let raster: CanonicalRasterResult | undefined;
   const observerDetail = request.debug.snapshot ||
     (request.debug.emitPlane && request.debug.view === "calibration");
   try {
-    // Inside the try: a canvas that refuses a 2D context is a rejected frame,
-    // not a dead worker that tears the whole receiver down.
-    const pixels = pixelsFromRequest(request);
-    // Camera input always traverses geometry. Inferring a canonical fixture
-    // from square dimensions could bypass homography on a legitimate square
-    // camera mode whose width happened to be a multiple of 172.
-    const cv = await loadOpenCv();
-    normalized = normalizeColor4WithOpenCv(cv, request.width, request.height, pixels, {
-      canonicalScale: request.debug.canonicalScale,
-      maxDetectionDimension: request.debug.maxDetectionDimension,
-      debug: request.debug.enabled,
-      snapshot: request.debug.snapshot,
-      ...(request.debug.emitPlane ? { debugView: request.debug.view } : {}),
-      ...(searchRegion === undefined ? {} : { searchRegion }),
-    });
-    searchRegion = normalized.status === "valid" ? normalized.frameRegion : undefined;
-    if (normalized.status === "rejected") {
-      const diagnostics = baseDiagnostics(
-        request,
-        undefined,
-        normalized,
-        classifierObservations,
-        unwrapObservations,
-        started,
-        normalized.reason,
-      );
-      updateReject(diagnostics, "geometry", normalized.reason);
-      postRejected(
-        request,
-        "invalid-inner-frame",
-        diagnostics,
-        debugFrame(request, normalized, undefined, classifierObservations, unwrapObservations),
-      );
-      return;
+    let canonical: CanonicalInput;
+    if (request.kind === "decode") {
+      // Inside the try: a canvas that refuses a 2D context is a rejected frame,
+      // not a dead worker that tears the whole receiver down.
+      const pixels = pixelsFromRequest(request);
+      // The compatibility request remains self-contained for tests and callers
+      // that have not adopted the split geometry/classifier protocol.
+      const cv = await loadOpenCv();
+      const acquired = normalizeColor4WithOpenCv(cv, request.width, request.height, pixels, {
+        canonicalScale: request.debug.canonicalScale,
+        maxDetectionDimension: request.debug.maxDetectionDimension,
+        debug: request.debug.enabled,
+        snapshot: request.debug.snapshot,
+        ...(request.debug.emitPlane ? { debugView: request.debug.view } : {}),
+        ...(searchRegion === undefined ? {} : { searchRegion }),
+      });
+      normalized = acquired;
+      searchRegion = normalized.status === "valid" ? normalized.frameRegion : undefined;
+      if (acquired.status === "rejected") {
+        const diagnostics = baseDiagnostics(
+          request,
+          undefined,
+          normalized,
+          classifierObservations,
+          unwrapObservations,
+          started,
+          acquired.reason,
+        );
+        updateReject(diagnostics, "geometry", acquired.reason);
+        postRejected(
+          request,
+          "invalid-inner-frame",
+          diagnostics,
+          debugFrame(request, normalized, undefined, classifierObservations, unwrapObservations),
+        );
+        return;
+      }
+      canonical = acquired.image;
+    } else {
+      normalized = { status: "valid", ...request.geometry };
+      canonical = request.canonical.kind === "samples"
+        ? {
+            width: request.canonical.width,
+            height: request.canonical.height,
+            rgb: new Float32Array(request.canonical.rgb),
+          }
+        : {
+            width: request.canonical.width,
+            height: request.canonical.height,
+            pixels: new Uint8ClampedArray(request.canonical.rgba),
+          };
     }
-    raster = decodeCanonicalColor4Raster(normalized.image, {
+    raster = "rgb" in canonical
+      ? decodeCanonicalColor4Samples(canonical, {
+          observer: (observation) => classifierObservations.push(observation),
+          observerDetail,
+        })
+      : decodeCanonicalColor4Raster(canonical, {
       observer: (observation) => classifierObservations.push(observation),
       observerDetail,
-    });
+        });
     if (raster.status === "rejected") {
       const diagnostics = baseDiagnostics(
         request,
@@ -658,6 +746,14 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
         status: "valid",
         innerFrame: innerFrame.buffer,
         diagnostics,
+        ...(request.kind === "classify"
+          ? {
+              captureSequence: request.captureSequence,
+              trackingGeneration: request.trackingGeneration,
+              classifierSlot: request.classifierSlot,
+              geometryPath: request.geometryPath,
+            }
+          : {}),
         ...(debug ? { debug } : {}),
       },
       transferables(debug, innerFrame.buffer),
@@ -683,15 +779,424 @@ async function decode(request: Color4WorkerDecodeRequest): Promise<void> {
   }
 }
 
+let activeTrackingGeneration = 0;
+
+function geometryTransferables(
+  canonical: ArrayBuffer | undefined,
+  debug: Color4WorkerDebugFrame | undefined,
+): Transferable[] {
+  return transferables(debug, canonical);
+}
+
+function addGeometryPipelineTimings(
+  diagnostics: MutableDiagnostics,
+  trackingMs: number,
+  samplingMs: number,
+  guardMs: number,
+): void {
+  if (!diagnostics.vision) return;
+  diagnostics.vision = {
+    ...diagnostics.vision,
+    timings: {
+      ...diagnostics.vision.timings,
+      tracking: trackingMs,
+      sampling: samplingMs,
+      guard: guardMs,
+    },
+  };
+}
+
+function postGeometryGuardRejection(
+  request: Color4GeometryRequest,
+  normalized: WorkerVisionResult,
+  guard: Exclude<CanonicalColor4GuardResult, { readonly status: "valid" }>,
+  geometryPath: "cold" | "tracked" | "fallback" | "legacy",
+  started: number,
+  classifier: readonly CanonicalRasterObservation[],
+  unwrap: readonly Color4UnwrapObservation[],
+  trackingMs: number,
+  samplingMs: number,
+  guardMs: number,
+): void {
+  const diagnostics = baseDiagnostics(
+    request,
+    guard,
+    normalized,
+    classifier,
+    unwrap,
+    started,
+    guard.reason,
+  );
+  updateReject(diagnostics, classifierStage(guard.reason), guard.reason);
+  addGeometryPipelineTimings(diagnostics, trackingMs, samplingMs, guardMs);
+  const debug = debugFrame(request, normalized, guard, classifier, unwrap);
+  scope.postMessage(
+    {
+      kind: "geometry-result",
+      id: request.id,
+      captureSequence: request.captureSequence,
+      trackingGeneration: request.trackingGeneration,
+      classifierSlot: request.classifierSlot,
+      status: "rejected",
+      geometryPath,
+      reason: "invalid-inner-frame",
+      diagnostics,
+      ...(debug ? { debug } : {}),
+    },
+    geometryTransferables(undefined, debug),
+  );
+}
+
+/**
+ * Own all OpenCV state in one temporal worker and hand only canonical data to
+ * the lightweight pool.  A failed hinted acquisition is retried over the full
+ * frame before this capture is rejected, so a camera jump does not cost an
+ * additional video-frame interval.
+ */
+async function runGeometry(request: Color4GeometryRequest): Promise<void> {
+  const started = performance.now();
+  const classifierObservations: CanonicalRasterObservation[] = [];
+  const unwrapObservations: Color4UnwrapObservation[] = [];
+  let normalized: VisionResult | VisionTemporalAcquisitionResult | undefined;
+  let geometryPath: "cold" | "tracked" | "fallback" | "legacy" = "cold";
+  let trackingMs = 0;
+  let samplingMs = 0;
+  let guardMs = 0;
+  try {
+    if (request.trackingGeneration !== activeTrackingGeneration) {
+      activeTrackingGeneration = request.trackingGeneration;
+      clearTemporalTracking();
+    }
+    const pixels = pixelsFromRequest(request);
+    const cv = await loadOpenCv();
+    compactSampler ??= new Color4CompactSamplerWithOpenCv(cv);
+    const forceLegacy = request.mode === "legacy" || request.debug.enabled || request.debug.snapshot;
+    let currentGray: VisionGrayscaleFrame | undefined;
+
+    if (
+      !forceLegacy &&
+      previousTrackingGray !== undefined &&
+      temporalHint !== undefined &&
+      temporalGeometry !== undefined
+    ) {
+      const trackingStarted = performance.now();
+      currentGray = createVisionGrayscaleFrameWithOpenCv(
+        cv,
+        request.width,
+        request.height,
+        pixels,
+      );
+      const tracked = trackVisionTemporalHintWithOpenCv(
+        cv,
+        previousTrackingGray,
+        currentGray,
+        temporalHint,
+      );
+      trackingMs = Math.max(0, performance.now() - trackingStarted);
+      if (tracked.status === "tracked") {
+        const samplingStarted = performance.now();
+        const samples = compactSampler.sample(request.width, request.height, pixels, tracked.hint);
+        samplingMs = Math.max(0, performance.now() - samplingStarted);
+        const guardStarted = performance.now();
+        const guard = guardCanonicalColor4Samples(samples, {
+          observer: (observation) => classifierObservations.push(observation),
+        });
+        guardMs += Math.max(0, performance.now() - guardStarted);
+        geometryPath = "tracked";
+        const geometryMs = Math.max(0, performance.now() - started);
+        const geometry: Color4GeometrySnapshot = {
+          candidates: temporalGeometry.candidates,
+          diagnostics: {
+            ...temporalGeometry.diagnostics,
+            timings: {
+              grayscaleMs: 0,
+              resizeMs: 0,
+              thresholdMs: 0,
+              contoursMs: 0,
+              fiducialDecodeMs: 0,
+              homographyMs: 0,
+              refinementMs: 0,
+              totalMs: geometryMs,
+            },
+          },
+          ...(tracked.hint.frameRegion ? { frameRegion: tracked.hint.frameRegion } : {}),
+        };
+        if (guard.status === "valid") {
+          previousTrackingGray = currentGray;
+          temporalHint = tracked.hint;
+          temporalGeometry = geometry;
+          searchRegion = tracked.hint.frameRegion;
+          const rgb = samples.rgb.buffer;
+          scope.postMessage(
+            {
+              kind: "geometry-result",
+              id: request.id,
+              captureSequence: request.captureSequence,
+              trackingGeneration: request.trackingGeneration,
+              classifierSlot: request.classifierSlot,
+              status: "valid",
+              geometryPath,
+              geometryMs,
+              trackingMs,
+              samplingMs,
+              guardMs,
+              geometry,
+              canonical: {
+                kind: "samples",
+                width: samples.width,
+                height: samples.height,
+                rgb,
+              },
+            },
+            [rgb],
+          );
+          return;
+        }
+        if (guard.status === "transition") {
+          // A mixed display refresh is not evidence that geometry moved. Keep
+          // the last stable gray/homography and simply wait for a new capture.
+          postGeometryGuardRejection(
+            request,
+            { status: "valid", ...geometry },
+            guard,
+            geometryPath,
+            started,
+            classifierObservations,
+            unwrapObservations,
+            trackingMs,
+            samplingMs,
+            guardMs,
+          );
+          return;
+        }
+        // Structural failure may be a bad tracked homography even when LK's
+        // geometric gates passed. Reacquire once over these exact same pixels.
+        geometryPath = "fallback";
+        clearTemporalTracking();
+      } else {
+        // A failed gate never leaks a doubtful homography. Acquire over the full
+        // same camera frame and replace all temporal state below.
+        geometryPath = "fallback";
+        clearTemporalTracking();
+      }
+    }
+
+    const previousRegion = searchRegion;
+    const options = {
+      canonicalScale: request.debug.canonicalScale,
+      maxDetectionDimension: request.debug.maxDetectionDimension,
+      debug: request.debug.enabled,
+      snapshot: request.debug.snapshot,
+      temporalGeneration: request.trackingGeneration,
+      ...(request.debug.emitPlane ? { debugView: request.debug.view } : {}),
+    } as const;
+    if (forceLegacy) geometryPath = "legacy";
+    else if (geometryPath !== "fallback") geometryPath = "cold";
+    normalized = forceLegacy
+      ? normalizeColor4WithOpenCv(cv, request.width, request.height, pixels, {
+          ...options,
+          ...(previousRegion === undefined ? {} : { searchRegion: previousRegion }),
+        })
+      : acquireColor4TemporalGeometryWithOpenCv(
+          cv,
+          request.width,
+          request.height,
+          pixels,
+          options,
+        );
+    if (forceLegacy && previousRegion !== undefined && normalized.status === "rejected") {
+      geometryPath = "fallback";
+      normalized = normalizeColor4WithOpenCv(cv, request.width, request.height, pixels, options);
+    }
+    searchRegion = normalized.status === "valid" ? normalized.frameRegion : undefined;
+    if (normalized.status === "rejected") {
+      clearTemporalTracking();
+      const diagnostics = baseDiagnostics(
+        request,
+        undefined,
+        normalized,
+        classifierObservations,
+        unwrapObservations,
+        started,
+        normalized.reason,
+      );
+      updateReject(diagnostics, "geometry", normalized.reason);
+      addGeometryPipelineTimings(diagnostics, trackingMs, samplingMs, guardMs);
+      const debug = debugFrame(
+        request,
+        normalized,
+        undefined,
+        classifierObservations,
+        unwrapObservations,
+      );
+      scope.postMessage(
+        {
+          kind: "geometry-result",
+          id: request.id,
+          captureSequence: request.captureSequence,
+          trackingGeneration: request.trackingGeneration,
+          classifierSlot: request.classifierSlot,
+          status: "rejected",
+          geometryPath,
+          reason: "invalid-inner-frame",
+          diagnostics,
+          ...(debug ? { debug } : {}),
+        },
+        geometryTransferables(undefined, debug),
+      );
+      return;
+    }
+
+    const geometry: Color4GeometrySnapshot = {
+      candidates: normalized.candidates,
+      diagnostics: normalized.diagnostics,
+      ...(normalized.frameRegion ? { frameRegion: normalized.frameRegion } : {}),
+      ...(normalized.debug ? { debug: normalized.debug } : {}),
+    };
+    let canonical:
+      | { kind: "samples"; width: number; height: number; rgb: ArrayBuffer }
+      | { kind: "raster"; width: number; height: number; rgba: ArrayBuffer };
+    let canonicalBuffer: ArrayBuffer;
+    const acquiredTemporalHint = normalized.temporalHint;
+    if (!forceLegacy && acquiredTemporalHint !== undefined) {
+      const samplingStarted = performance.now();
+      const samples = compactSampler.sample(
+        request.width,
+        request.height,
+        pixels,
+        acquiredTemporalHint,
+      );
+      samplingMs = Math.max(0, performance.now() - samplingStarted);
+      const guardStarted = performance.now();
+      const guard = guardCanonicalColor4Samples(samples, {
+        observer: (observation) => classifierObservations.push(observation),
+      });
+      guardMs += Math.max(0, performance.now() - guardStarted);
+      if (guard.status !== "valid") {
+        if (guard.status === "rejected") clearTemporalTracking();
+        postGeometryGuardRejection(
+          request,
+          normalized,
+          guard,
+          geometryPath,
+          started,
+          classifierObservations,
+          unwrapObservations,
+          trackingMs,
+          samplingMs,
+          guardMs,
+        );
+        return;
+      }
+      canonicalBuffer = samples.rgb.buffer;
+      canonical = {
+        kind: "samples",
+        width: samples.width,
+        height: samples.height,
+        rgb: canonicalBuffer,
+      };
+    } else {
+      if (!("image" in normalized)) {
+        throw new Error("Legacy COLOR_4 acquisition did not produce a canonical raster.");
+      }
+      canonicalBuffer = Uint8ClampedArray.from(normalized.image.pixels).buffer;
+      canonical = {
+        kind: "raster",
+        width: normalized.image.width,
+        height: normalized.image.height,
+        rgba: canonicalBuffer,
+      };
+    }
+    temporalGeometry = geometry;
+    temporalHint = acquiredTemporalHint;
+    if (!forceLegacy && temporalHint !== undefined) {
+      previousTrackingGray = currentGray ?? createVisionGrayscaleFrameWithOpenCv(
+        cv,
+        request.width,
+        request.height,
+        pixels,
+      );
+    } else if (forceLegacy) {
+      previousTrackingGray = undefined;
+      temporalHint = undefined;
+    }
+    const geometryMs = Math.max(0, performance.now() - started);
+    scope.postMessage(
+      {
+        kind: "geometry-result",
+        id: request.id,
+        captureSequence: request.captureSequence,
+        trackingGeneration: request.trackingGeneration,
+        classifierSlot: request.classifierSlot,
+        status: "valid",
+        geometryPath,
+        geometryMs,
+        trackingMs,
+        samplingMs,
+        guardMs,
+        geometry,
+        canonical,
+      },
+      geometryTransferables(canonicalBuffer, normalized.debug
+        ? debugFrame(request, normalized, undefined, classifierObservations, unwrapObservations)
+        : undefined),
+    );
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    clearTemporalTracking();
+    const diagnostics = baseDiagnostics(
+      request,
+      undefined,
+      normalized,
+      classifierObservations,
+      unwrapObservations,
+      started,
+      reason,
+    );
+    updateReject(diagnostics, "geometry", reason);
+    addGeometryPipelineTimings(diagnostics, trackingMs, samplingMs, guardMs);
+    const debug = debugFrame(
+      request,
+      normalized,
+      undefined,
+      classifierObservations,
+      unwrapObservations,
+    );
+    scope.postMessage(
+      {
+        kind: "geometry-result",
+        id: request.id,
+        captureSequence: request.captureSequence,
+        trackingGeneration: request.trackingGeneration,
+        classifierSlot: request.classifierSlot,
+        status: "rejected",
+        geometryPath,
+        reason: "invalid-inner-frame",
+        diagnostics,
+        ...(debug ? { debug } : {}),
+      },
+      geometryTransferables(undefined, debug),
+    );
+  }
+}
+
 scope.onmessage = (event) => {
   if (event.data.kind === "init") {
-    const { id } = event.data;
+    const { id, role = "combined" } = event.data;
+    if (role === "classifier") {
+      scope.postMessage({ kind: "ready", id, role, opencvInitMs: 0 });
+      return;
+    }
     void loadOpenCv().then(
-      () => scope.postMessage({ kind: "ready", id, opencvInitMs: openCvInitMs }),
+      () => scope.postMessage({ kind: "ready", id, role, opencvInitMs: openCvInitMs }),
       (error) => {
         throw error;
       },
     );
+    return;
+  }
+  if (event.data.kind === "geometry") {
+    void runGeometry(event.data);
     return;
   }
   void decode(event.data);

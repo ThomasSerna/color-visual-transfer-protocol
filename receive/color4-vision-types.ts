@@ -54,6 +54,8 @@ export interface VisionOptions {
    * either way so corner precision does not depend on the crop.
    */
   readonly searchRegion?: VisionSearchRegion;
+  /** Generation assigned to a newly acquired serializable temporal hint. */
+  readonly temporalGeneration?: number;
 }
 
 export interface VisionPoint {
@@ -62,6 +64,133 @@ export interface VisionPoint {
 }
 
 export type VisionQuad = readonly [VisionPoint, VisionPoint, VisionPoint, VisionPoint];
+
+/** Row-major, source-to-canonical 3 x 3 projective transform. */
+export type VisionHomography = readonly [
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+];
+
+/**
+ * Cloneable geometry retained by the temporal worker between camera frames.
+ *
+ * `corners` always contains the four oriented corners for TL, TR, BR and BL,
+ * in that order. Keeping this object free of OpenCV handles is intentional: a
+ * worker can report it in diagnostics, persist it in a replay, or replace its
+ * local state after a full acquisition without leaking WASM allocations.
+ */
+export interface VisionTemporalHint {
+  readonly version: 1;
+  readonly generation: number;
+  readonly sourceWidth: number;
+  readonly sourceHeight: number;
+  readonly trackingWidth: number;
+  readonly trackingHeight: number;
+  readonly canonicalScale: VisionCanonicalScale;
+  readonly corners: readonly VisionPoint[];
+  readonly homography: VisionHomography;
+  readonly frameQuad: VisionQuad;
+  readonly frameRegion?: VisionSearchRegion;
+}
+
+export interface VisionTemporalHintInput {
+  readonly generation?: number;
+  readonly sourceWidth: number;
+  readonly sourceHeight: number;
+  readonly trackingWidth?: number;
+  readonly trackingHeight?: number;
+  readonly canonicalScale?: VisionCanonicalScale;
+  readonly corners: readonly VisionPoint[];
+  readonly homography: readonly number[];
+  readonly frameRegion?: VisionSearchRegion;
+}
+
+/** A cloneable one-channel image used as input to temporal optical flow. */
+export interface VisionGrayscaleFrame {
+  /** Dimensions of the camera plane from which this tracking image was derived. */
+  readonly sourceWidth: number;
+  readonly sourceHeight: number;
+  /** Dimensions of the (possibly downscaled) single-channel tracking plane. */
+  readonly width: number;
+  readonly height: number;
+  readonly pixels: Uint8Array;
+}
+
+export type VisionTemporalRejectReason =
+  | "OPENCV_LK_UNAVAILABLE"
+  | "INVALID_TEMPORAL_INPUT"
+  | "FRAME_SIZE_CHANGED"
+  | "TOO_FEW_TRACKED_CORNERS"
+  | "FORWARD_BACKWARD_ERROR"
+  | "HOMOGRAPHY_FAILED"
+  | "HOMOGRAPHY_RESIDUAL"
+  | "FRAME_QUAD_NON_CONVEX"
+  | "FRAME_QUAD_OUT_OF_BOUNDS"
+  | "FRAME_AREA_CHANGED";
+
+export interface VisionTemporalTrackCandidate {
+  readonly sourceWidth: number;
+  readonly sourceHeight: number;
+  readonly trackingWidth?: number;
+  readonly trackingHeight?: number;
+  readonly corners: readonly VisionPoint[];
+  readonly tracked: readonly boolean[];
+  readonly forwardBackwardErrorsPx: readonly number[];
+  readonly homography?: VisionHomography;
+  readonly residualRmsModules?: number;
+  readonly residualMaxModules?: number;
+  readonly frameQuad?: VisionQuad;
+}
+
+export interface VisionTemporalTrackingThresholds {
+  readonly minimumTrackedCorners?: number;
+  readonly maximumForwardBackwardP95Px?: number;
+  readonly maximumResidualModules?: number;
+  readonly minimumAreaRatio?: number;
+  readonly maximumAreaRatio?: number;
+}
+
+export interface VisionTemporalTrackingDiagnostics {
+  readonly trackedCorners: number;
+  readonly forwardBackwardP95Px?: number;
+  readonly residualRmsModules?: number;
+  readonly residualMaxModules?: number;
+  readonly areaRatio?: number;
+}
+
+export type VisionTemporalTrackingResult =
+  | Readonly<{
+      status: "tracked";
+      hint: VisionTemporalHint;
+      diagnostics: VisionTemporalTrackingDiagnostics;
+    }>
+  | Readonly<{
+      status: "rejected";
+      reason: VisionTemporalRejectReason;
+      diagnostics: VisionTemporalTrackingDiagnostics;
+      candidate?: VisionTemporalTrackCandidate;
+    }>;
+
+export interface VisionCompactSamplingDiagnostics {
+  /** Fixed-point maps are preferred when `convertMaps` is available. */
+  readonly mapFormat: "fixed-point" | "float";
+  /** True when an identical homography reused the preceding map. */
+  readonly mapReused: boolean;
+  readonly remapWidth: number;
+  readonly remapHeight: number;
+  readonly mapMs: number;
+  readonly sourceMs: number;
+  readonly remapMs: number;
+  readonly medianMs: number;
+  readonly totalMs: number;
+}
 
 export interface VisionFiducialMatch {
   readonly id: FiducialId;
@@ -268,6 +397,15 @@ export interface ValidVisionResult extends VisionResultBase {
   readonly image: CanonicalRasterImage;
   /** Where the code was found, padded and clamped, for the next `searchRegion`. */
   readonly frameRegion?: VisionSearchRegion;
+  /** Serializable acquisition state suitable for the temporal vision path. */
+  readonly temporalHint?: VisionTemporalHint;
+}
+
+/** Cold geometry acquisition for the production compact-sampling path. */
+export interface ValidVisionTemporalAcquisitionResult extends VisionResultBase {
+  readonly status: "valid";
+  readonly temporalHint: VisionTemporalHint;
+  readonly frameRegion?: VisionSearchRegion;
 }
 
 export interface RejectedVisionResult extends VisionResultBase {
@@ -276,3 +414,6 @@ export interface RejectedVisionResult extends VisionResultBase {
 }
 
 export type VisionResult = ValidVisionResult | RejectedVisionResult;
+export type VisionTemporalAcquisitionResult =
+  | ValidVisionTemporalAcquisitionResult
+  | RejectedVisionResult;

@@ -42,10 +42,12 @@ default: it measures every capture but does not drop one for instability.
 locked for the run and is included in its exported conditions.
 
 Live metrics identify the last completed stage and rejection reason, detected
-fiducials, and worker p50/p95 timing. The exported experiment JSON keeps bounded
-histograms and timing reservoirs, not an unbounded frame log. COLOR_4 summaries
-also include warmup/stable/unstable captures, vision submissions, unstable and
-redundant-stable skips, and the bounded stability-score distribution.
+fiducials, worker p50/p95 timing and distinct new blocks/s. The exported
+experiment JSON keeps bounded histograms and timing reservoirs, not an unbounded
+frame log. COLOR_4 schema-v2 summaries also include capture paths, reservations,
+whitelisted drop causes, cold/tracked/fallback/transition counts, worker
+counts/restarts and the bounded tracking/sampling/guard/classifier timing
+distributions. Capture identifiers and per-frame traces are not persisted.
 
 The classifier may also attach optional binary-structure diagnostics: bootstrap
 double/single/uncertain/contradictory vote counts and differential margins, plus
@@ -248,6 +250,13 @@ classification and RS behavior, but cannot support claims about camera input,
 OpenCV contours/fiducials, homography, or physical end-to-end success.
 
 ## Follow-up matrix
+
+The temporal EXPERIMENTAL milestone is a separate release gate: on Android
+Chrome and iPhone Safari, run three consecutive 1 MiB incompressible transfers
+with EXPERIMENTAL/KCMY at 15 fps, fullscreen/max brightness, 0.5 m and 0°.
+Each output must pass SHA-256; the platform median must be at least 10 new
+blocks/s, with geometry/sampling p95 ≤80 ms, classifier p95 ≤160 ms and exported
+capacity ≥12 frames/s. Follow with a 15-minute no-growth soak per platform.
 
 After valid frames are observed repeatedly in the A–E protocol, complete six
 transfers under the frozen ROBUST/KCMY baseline: three runs of one

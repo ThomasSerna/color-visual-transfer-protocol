@@ -323,17 +323,35 @@ constraint:
 - any frame that fails to locate the code discards the region.
 
 Outcomes are reported through the existing vision warnings as
-`GEOMETRY_SEARCH_REGION_APPLIED` and `GEOMETRY_SEARCH_REGION_MISSED`. A receiver
-running several vision workers gives each its own region; they converge
-independently and share no state.
+`GEOMETRY_SEARCH_REGION_APPLIED` and `GEOMETRY_SEARCH_REGION_MISSED`. This ROI
+path remains the legacy/debug fallback. Production fast mode instead retains a
+single generation-scoped temporal state: the previous grayscale plane, sixteen
+oriented fiducial corners, homography, frame quad and ROI.
+
+After cold acquisition, pyramidal Lucas–Kanade tracks those corners with a
+forward/backward check. Tracking is accepted only with at least 12/16 corners,
+forward/backward p95 at most 1.5 detection pixels, homography residual at most
+0.5 modules, a convex in-frame quad and area ratio in `[0.75, 1.33]`. Any failed
+gate triggers full acquisition on that same captured frame and replaces the
+state; a doubtful homography is never forwarded.
 
 ### Decode concurrency
 
-The number of COLOR_4 vision workers is receiver policy. Frames are independent
-— the fountain decoder needs no ordering and cares which frames arrive only
-through their count — so a receiver may decode several concurrently. Each worker
-carries its own OpenCV instance, so the reference receiver defaults to one and
-treats more as an explicit choice on hardware that can afford the memory.
+The reference receiver owns exactly one temporal OpenCV geometry worker and one
+to three OpenCV-free TypeScript classifier/FEC workers (two by default). A page
+callback atomically reserves geometry plus one classifier slot before the 64×48
+prefilter or bitmap creation. Geometry has no queue: when either stage has no
+capacity, the newest callback is discarded instead of retaining an old frame.
+Each job carries a capture sequence, tracking generation and reserved slot so a
+late response cannot cross sessions or contaminate another capture.
+
+Tracked geometry remaps a compact 688×688 sampling plane with cubic interpolation
+and reusable fixed-point maps. Sixteen samples at offsets
+`{1.5,2.5,3.5,4.5}/6` are reduced to an exact per-channel median, yielding a
+172×172 interleaved `Float32` RGB module grid. Debug and snapshot requests retain
+the comparable legacy scale-6 warp. Classification, erasure selection, RS,
+CRC32C, identity and phase rules are identical for both inputs and keep all
+photometric calibration frame-local.
 
 Where the engine provides `createImageBitmap` and `OffscreenCanvas`, captures
 reach the worker as a transferred `ImageBitmap` rather than a pixel buffer read

@@ -146,9 +146,9 @@ test("the COLOR_4 camera receiver exposes carrier-specific settings", async ({ p
   await expect(page.locator("#cfg-capfps option[value='15']")).not.toHaveAttribute("hidden", "");
   await expect(page.locator("#cfg-capfps option[value='60']")).toHaveAttribute("hidden", "");
   // COLOR_4 decodes in a worker pool too, but each of its workers carries a
-  // whole OpenCV build, so it starts at one and lets the user opt in.
+  // COLOR_4 owns one OpenCV geometry worker plus two lightweight classifiers.
   await expect(page.locator("#cfg-workers")).toBeVisible();
-  await expect(page.locator("#cfg-workers")).toHaveValue("1");
+  await expect(page.locator("#cfg-workers")).toHaveValue("2");
   await expect(page.locator("details:has(> summary:text-is('Debug Vision'))")).toBeVisible();
   await expect(page.locator("#cfg-vision-debug")).not.toBeChecked();
   expect(errors).toEqual([]);
@@ -427,7 +427,7 @@ test("a consumed COLOR_4 camera debug snapshot survives camera teardown", async 
           kind?: unknown;
           debug?: { snapshot?: unknown };
         } | undefined;
-        if (request?.kind === "decode") {
+        if (request?.kind === "geometry") {
           const posts = Number(document.documentElement.dataset.snapshotDecodePosts ?? "0");
           document.documentElement.dataset.snapshotDecodePosts = String(posts + 1);
           if (request.debug?.snapshot === true) {

@@ -67,6 +67,7 @@
               <div class="metrics" id="metrics" style="display: none">
                 <div class="metric"><div class="k">capture fps</div><div class="v" id="m-cap">—</div></div>
                 <div class="metric"><div class="k">decode fps</div><div class="v amber" id="m-dec">—</div></div>
+                <div class="metric"><div class="k">new blocks/s</div><div class="v amber" id="m-new-rate">—</div></div>
                 <div class="metric"><div class="k">goodput</div><div class="v amber" id="m-rate">—</div></div>
                 <div class="metric"><div class="k">elapsed</div><div class="v" id="m-time">—</div></div>
                 <div class="metric"><div class="k">frames new/dup</div><div class="v" id="m-frames">—</div></div>
@@ -137,7 +138,7 @@
                 <legend>Physical test metadata</legend>
                 <div class="row">
                   <label>run label<input id="cfg-debug-label" type="text" maxlength="80" placeholder="baseline-01" /></label>
-                  <label>TX fps<select id="cfg-debug-tx"><option>1</option><option>2</option><option selected>5</option><option>10</option></select></label>
+                  <label>TX fps<select id="cfg-debug-tx"><option>1</option><option>2</option><option selected>5</option><option>10</option><option>15</option></select></label>
                   <label>expected profile<select id="cfg-debug-profile"><option value="ROBUST" selected>ROBUST</option><option value="EXPERIMENTAL">EXPERIMENTAL</option><option value="">unknown</option></select></label>
                   <label>stability prefilter<select id="cfg-debug-prefilter"><option value="observe" selected>observe (shadow)</option><option value="enabled">enabled</option></select></label>
                   <label>distance<select id="cfg-debug-distance"><option>0.3</option><option selected>0.5</option><option>1</option></select></label>

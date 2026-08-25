@@ -41,7 +41,12 @@ rejection reason. Candidate indices, full ranked lists, coded bytes and payload
 must not appear in an experiment export. Also report RS corrections, CRC failures,
 fiducial errors by marker and maximum, homography method and residual,
 refinement attempts/applied, valid/new/duplicate LT frames, resolved blocks,
-decode latency, elapsed time and requested plus negotiated camera settings.
+decode latency, elapsed time and requested plus negotiated camera settings. For
+schema-v2 temporal runs also report bitmap/RGBA capture counts, reservations and
+drop causes, cold/tracked/fallback/transition counts, geometry/classifier worker
+counts, restarts and busy-time utilization, tracking/sampling/guard/geometry/classifier p50/p95,
+distinct new frames per second, and estimated capacity
+`min(1000/geometryP95, classifierWorkers*1000/classifierP95)`.
 
 When all four camera-stage fiducials are available, also report apparent frame
 width/height, pixels/module x/y and minimum, weakest fiducial width/height and
@@ -53,6 +58,14 @@ when available and use the formulas in the
 The base homography-fit residual and the optional refinement residuals before
 and after correction are separate distributions; do not combine them into one
 percentile series.
+
+New runs use experiment-summary and export envelope schema v2. Existing
+schema-v1 IndexedDB summaries remain readable and are copied into v2 exports
+without rewriting or discarding their original fields. `newFramesPerSecond` is
+`(N - 1) * 1000 / (lastNewFrameMs - firstNewFrameMs)` for at least two distinct
+valid frames. `estimatedCapacityFps` is
+`min(1000 / geometryP95Ms, classifierWorkers * 1000 / classifierP95Ms)` and is
+omitted whenever either positive finite p95 or the worker count is unavailable.
 
 Report both:
 
@@ -88,6 +101,21 @@ failed and aborted runs. Compare valid-frame rate, stage/reason distribution,
 stability/submission ratios, worker p50/p95 and optical metrics. A request that
 negotiates another width/FPS is not equivalent to the named variant; retain the
 run as evidence but label it with the actual mode.
+
+## EXPERIMENTAL 15 fps temporal milestone
+
+On Android Chrome and iPhone Safari separately, freeze the sender at
+COLOR_4 EXPERIMENTAL, KCMY, 15 fps, fullscreen and maximum brightness. Use a
+1 MiB incompressible payload, 0.5 m, 0°, receiver capture 1920@30 and prefilter
+`observe`; record the actually negotiated camera mode. Complete three consecutive
+transfers per platform with byte-identical output and SHA-256 verification.
+The platform median must reach at least 10 distinct new frames/s, geometry plus
+sampling p95 at most 80 ms, classifier p95 at most 160 ms and estimated capacity
+at least 12 frames/s. Run a 15-minute soak on each platform and reject sustained
+growth in OpenCV Mats, bitmaps, transferable buffers or heap after warm-up.
+
+This remains a manual hardware gate. A synthetic replay or desktop fake camera
+can prove exactness and scheduling, but cannot satisfy the six device runs.
 
 ## Real-capture replay gate
 

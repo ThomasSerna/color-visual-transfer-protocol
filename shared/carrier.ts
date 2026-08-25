@@ -24,6 +24,21 @@ export type CarrierChoice = "qr" | "color4";
 export type BrowserColor4ErasurePolicy = "classifier-budgeted" | "hard-decision";
 export type BrowserColor4ErasureBudgetFraction = 1 | 0.75 | 0.5 | 0;
 
+/** Persistence-safe labels for the temporal receiver's bounded counters. */
+export type BrowserCapturePath = "bitmap" | "rgba";
+export type BrowserCaptureDropReason =
+  | "reservation-unavailable"
+  | "geometry-busy"
+  | "classifier-busy"
+  | "prefilter-unstable"
+  | "prefilter-redundant"
+  | "bitmap-failed"
+  | "capture-failed"
+  | "stale-session"
+  | "watchdog";
+export type BrowserGeometryPath = "cold" | "tracked" | "fallback";
+export type BrowserWorkerKind = "geometry" | "classifier";
+
 /**
  * Aggregate-only worker contract. It deliberately exposes counts by shard,
  * never erased-byte positions, ranked candidates, coded bytes or payload data.
@@ -49,10 +64,15 @@ export type VisionTimingKey =
   | "fiducialDecode"
   | "homography"
   | "refinement"
+  | "tracking"
+  | "sampling"
+  | "guard"
+  | "geometryTotal"
   | "canonicalGeometry"
   | "bootstrapPhase"
   | "calibration"
   | "classification"
+  | "classifier"
   | "rs"
   | "crc"
   | "wire"

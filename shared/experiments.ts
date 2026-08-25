@@ -1,9 +1,13 @@
 import type {
+  BrowserCaptureDropReason,
+  BrowserCapturePath,
   BrowserCarrierDiagnostics,
   BrowserColor4ErasureBudgetFraction,
   BrowserColor4ErasurePolicy,
   BrowserColor4UnwrapAttemptDiagnostics,
+  BrowserGeometryPath,
   BrowserVisionDiagnostics,
+  BrowserWorkerKind,
   CarrierId,
   VisionBootstrapSamplingDiagnostics,
   VisionDetectionDiagnostics,
@@ -19,6 +23,23 @@ const VERSION = 1;
 const PREFERENCES = "preferences";
 const RUNS = "runs";
 const MAX_STORED_RUNS = 100;
+const MAX_NEW_FRAME_SEQUENCE_DEDUPE = 4_096;
+const MAX_WORKERS = 16;
+const CAPTURE_PATHS = ["bitmap", "rgba"] as const satisfies readonly BrowserCapturePath[];
+const CAPTURE_DROP_REASONS = [
+  "reservation-unavailable",
+  "geometry-busy",
+  "classifier-busy",
+  "prefilter-unstable",
+  "prefilter-redundant",
+  "bitmap-failed",
+  "capture-failed",
+  "stale-session",
+  "watchdog",
+] as const satisfies readonly BrowserCaptureDropReason[];
+const GEOMETRY_PATHS = ["cold", "tracked", "fallback"] as const satisfies
+  readonly BrowserGeometryPath[];
+const WORKER_KINDS = ["geometry", "classifier"] as const satisfies readonly BrowserWorkerKind[];
 const BOOTSTRAP_SAMPLING_METRICS = [
   "doubleVoteColumns",
   "singleVoteColumns",
@@ -152,7 +173,7 @@ export interface VisionExperimentClassificationSummary {
 
 export interface VisionExperimentConditions {
   readonly label?: string;
-  readonly expectedTxFps?: 1 | 2 | 5 | 10;
+  readonly expectedTxFps?: 1 | 2 | 5 | 10 | 15;
   readonly expectedProfile?: "ROBUST" | "EXPERIMENTAL";
   readonly prefilterMode?: "observe" | "enabled";
   readonly distanceM?: 0.3 | 0.5 | 1;
@@ -247,8 +268,33 @@ export interface Color4ErasurePolicyExperimentSummary {
   readonly attempts?: readonly Color4ErasurePolicyAttemptExperimentSummary[];
 }
 
+/**
+ * Aggregate-only temporal-pipeline telemetry. Every categorical key comes from
+ * a fixed whitelist; capture identifiers, image data and per-frame logs are
+ * deliberately excluded.
+ */
+export interface TemporalPipelineExperimentSummary {
+  readonly capturePaths: Readonly<Partial<Record<BrowserCapturePath, number>>>;
+  readonly reservations: number;
+  readonly reservationCancellations: number;
+  readonly drops: Readonly<Partial<Record<BrowserCaptureDropReason, number>>>;
+  readonly coldAcquisitions: number;
+  readonly trackedFrames: number;
+  readonly trackingFallbacks: number;
+  readonly transitions: number;
+  readonly geometryWorkers?: number;
+  readonly classifierWorkers?: number;
+  /** Busy wall-time divided by one geometry worker's available wall-time. */
+  readonly geometryUtilization?: number;
+  /** Aggregate classifier busy wall-time divided by workers × wall-time. */
+  readonly classifierUtilization?: number;
+  readonly geometryWorkerRestarts: number;
+  readonly classifierWorkerRestarts: number;
+}
+
 export interface ExperimentSummary {
-  schemaVersion: 1;
+  /** Version 1 remains accepted when reading existing IndexedDB records. */
+  schemaVersion: 1 | 2;
   startedAt: string;
   finishedAt?: string;
   direction: ExperimentDirection;
@@ -290,6 +336,12 @@ export interface ExperimentSummary {
   /** Distribution of erasure bytes per carrier attempt; absent in legacy records. */
   erasureBytesPerAttempt?: TimingDistribution;
   decodeLatencyMs: TimingDistribution;
+  /** Temporal receiver aggregates; absent from stored schema-v1 summaries. */
+  temporalPipeline?: TemporalPipelineExperimentSummary;
+  /** Distinct valid frames per second, measured from first to last arrival. */
+  newFramesPerSecond?: number;
+  /** min(geometry capacity, aggregate classifier capacity). */
+  estimatedCapacityFps?: number;
   /** Aggregate-only COLOR_4 erasure-policy telemetry; absent in older schema-v1 records. */
   color4ErasurePolicy?: Color4ErasurePolicyExperimentSummary;
   vision?: VisionExperimentSummary;
@@ -300,7 +352,7 @@ export interface ExperimentSummary {
 
 export interface ExperimentExport {
   schema: "decimen-experiment-export";
-  version: 1;
+  version: 2;
   exportedAt: string;
   current?: ExperimentSummary;
   history: ExperimentSummary[];
@@ -322,6 +374,28 @@ export function workerP95ExceedsTxFrameInterval(
     workerP95Ms >= 0 &&
     expectedTxFps > 0 &&
     workerP95Ms > 1_000 / expectedTxFps;
+}
+
+/**
+ * Conservative throughput ceiling for the split geometry/classifier pipeline.
+ * Missing, zero or non-finite measurements stay absent instead of producing a
+ * misleading Infinity/NaN in persisted exports.
+ */
+export function estimatePipelineCapacityFps(
+  geometryP95Ms: number | undefined,
+  classifierP95Ms: number | undefined,
+  classifierWorkers: number | undefined,
+): number | undefined {
+  if (geometryP95Ms === undefined || classifierP95Ms === undefined ||
+      classifierWorkers === undefined ||
+      !Number.isFinite(geometryP95Ms) || !Number.isFinite(classifierP95Ms) ||
+      geometryP95Ms <= 0 || classifierP95Ms <= 0 ||
+      !Number.isInteger(classifierWorkers) || classifierWorkers <= 0 ||
+      classifierWorkers > MAX_WORKERS) return undefined;
+  return Math.min(
+    1_000 / geometryP95Ms,
+    (classifierWorkers * 1_000) / classifierP95Ms,
+  );
 }
 
 export class ExperimentMetrics {
@@ -347,6 +421,26 @@ export class ExperimentMetrics {
   validFrames = 0;
   carrierRejected = 0;
   erasureBytes = 0;
+  private temporalPipelineSeen = false;
+  private readonly capturePaths = new Map<BrowserCapturePath, number>();
+  private captureReservations = 0;
+  private captureReservationCancellations = 0;
+  private readonly captureDrops = new Map<BrowserCaptureDropReason, number>();
+  private coldAcquisitions = 0;
+  private trackedFrames = 0;
+  private trackingFallbacks = 0;
+  private transitions = 0;
+  private geometryWorkers: number | undefined;
+  private classifierWorkers: number | undefined;
+  private geometryWorkerRestarts = 0;
+  private classifierWorkerRestarts = 0;
+  private geometryBusyMs = 0;
+  private classifierBusyMs = 0;
+  private readonly recentNewFrameSequences = new Set<number>();
+  private readonly recentNewFrameSequenceOrder: number[] = [];
+  private uniqueNewFrameEvents = 0;
+  private firstNewFrameAtMs: number | undefined;
+  private lastNewFrameAtMs: number | undefined;
   private readonly latencySamples: number[] = [];
   private readonly erasureSamples: number[] = [];
   private readonly stabilityScoreSamples: number[] = [];
@@ -471,6 +565,80 @@ export class ExperimentMetrics {
 
   recordCapture(): void {
     this.captures++;
+  }
+
+  recordCapturePath(path: BrowserCapturePath): void {
+    if (!isCapturePath(path)) return;
+    this.temporalPipelineSeen = true;
+    this.increment(this.capturePaths, path);
+  }
+
+  recordCaptureReservation(): void {
+    this.temporalPipelineSeen = true;
+    this.captureReservations++;
+  }
+
+  recordCaptureReservationCancelled(): void {
+    this.temporalPipelineSeen = true;
+    this.captureReservationCancellations++;
+  }
+
+  recordCaptureDrop(reason: BrowserCaptureDropReason): void {
+    if (!isCaptureDropReason(reason)) return;
+    this.temporalPipelineSeen = true;
+    this.increment(this.captureDrops, reason);
+  }
+
+  recordGeometryPath(path: BrowserGeometryPath): void {
+    if (!isGeometryPath(path)) return;
+    this.temporalPipelineSeen = true;
+    if (path === "cold") this.coldAcquisitions++;
+    else if (path === "tracked") this.trackedFrames++;
+    else this.trackingFallbacks++;
+  }
+
+  recordTransition(): void {
+    this.temporalPipelineSeen = true;
+    this.transitions++;
+  }
+
+  setWorkerCounts(input: { geometry: number; classifier: number }): void {
+    const geometry = validWorkerCount(input.geometry) ? input.geometry : undefined;
+    const classifier = validWorkerCount(input.classifier) ? input.classifier : undefined;
+    if (geometry === undefined && classifier === undefined) return;
+    this.temporalPipelineSeen = true;
+    if (geometry !== undefined) this.geometryWorkers = geometry;
+    if (classifier !== undefined) this.classifierWorkers = classifier;
+  }
+
+  recordWorkerRestart(kind: BrowserWorkerKind): void {
+    if (!isWorkerKind(kind)) return;
+    this.temporalPipelineSeen = true;
+    if (kind === "geometry") this.geometryWorkerRestarts++;
+    else this.classifierWorkerRestarts++;
+  }
+
+  /**
+   * Records a distinct, valid receiver capture. The bounded sequence cache
+   * protects against a repeated callback without persisting capture IDs.
+   */
+  recordNewFrame(captureSequence: number, timestampMs = Date.now()): void {
+    if (!Number.isSafeInteger(captureSequence) || captureSequence < 0 ||
+        !Number.isFinite(timestampMs) || timestampMs < 0 ||
+        this.recentNewFrameSequences.has(captureSequence)) return;
+    this.recentNewFrameSequences.add(captureSequence);
+    this.recentNewFrameSequenceOrder.push(captureSequence);
+    if (this.recentNewFrameSequenceOrder.length > MAX_NEW_FRAME_SEQUENCE_DEDUPE) {
+      const expired = this.recentNewFrameSequenceOrder.shift();
+      if (expired !== undefined) this.recentNewFrameSequences.delete(expired);
+    }
+    this.uniqueNewFrameEvents++;
+    this.firstNewFrameAtMs = this.firstNewFrameAtMs === undefined
+      ? timestampMs
+      : Math.min(this.firstNewFrameAtMs, timestampMs);
+    this.lastNewFrameAtMs = this.lastNewFrameAtMs === undefined
+      ? timestampMs
+      : Math.max(this.lastNewFrameAtMs, timestampMs);
   }
 
   recordStableCapture(stabilityScore?: number): void {
@@ -753,6 +921,8 @@ export class ExperimentMetrics {
         [VisionTimingKey, number | undefined]
       >) {
         if (raw === undefined || !Number.isFinite(raw)) continue;
+        if (stage === "geometryTotal") this.geometryBusyMs += Math.max(0, raw);
+        if (stage === "classifier") this.classifierBusyMs += Math.max(0, raw);
         let samples = this.visionTimings.get(stage);
         if (!samples) {
           samples = [];
@@ -763,7 +933,7 @@ export class ExperimentMetrics {
     }
   }
 
-  private increment(values: Map<string, number>, key: string): void {
+  private increment<Key extends string>(values: Map<Key, number>, key: Key): void {
     values.set(key, (values.get(key) ?? 0) + 1);
   }
 
@@ -948,6 +1118,14 @@ export class ExperimentMetrics {
     const elapsedMs = Math.max(0, now - this.startedAtMs);
     const decodeLatencyMs = distribution(this.latencySamples);
     const color4ErasurePolicy = this.color4ErasurePolicySnapshot();
+    const temporalPipeline = this.temporalPipelineSnapshot(elapsedMs);
+    const vision = this.visionSnapshot();
+    const newFramesPerSecond = this.newFramesRate();
+    const estimatedCapacityFps = estimatePipelineCapacityFps(
+      vision?.timingsMs.geometryTotal?.p95,
+      vision?.timingsMs.classifier?.p95,
+      this.classifierWorkers,
+    );
     const captureTelemetry = this.captureTelemetrySeen
       ? {
           stableCaptures: this.stableCaptures,
@@ -961,7 +1139,7 @@ export class ExperimentMetrics {
         }
       : {};
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       startedAt: this.startedAt,
       finishedAt: new Date(now).toISOString(),
       direction: this.direction,
@@ -993,8 +1171,11 @@ export class ExperimentMetrics {
       erasureBytes: this.erasureBytes,
       erasureBytesPerAttempt: distribution(this.erasureSamples),
       decodeLatencyMs,
+      ...(temporalPipeline === undefined ? {} : { temporalPipeline }),
+      ...(newFramesPerSecond === undefined ? {} : { newFramesPerSecond }),
+      ...(estimatedCapacityFps === undefined ? {} : { estimatedCapacityFps }),
       ...(color4ErasurePolicy === undefined ? {} : { color4ErasurePolicy }),
-      vision: this.visionSnapshot(),
+      vision,
       containerBitrateBps:
         input.payloadBytes === undefined || elapsedMs === 0
           ? undefined
@@ -1005,6 +1186,45 @@ export class ExperimentMetrics {
           : (input.fileBytes * 1_000) / elapsedMs,
       failureReason: input.failureReason,
     };
+  }
+
+  private temporalPipelineSnapshot(elapsedMs: number): TemporalPipelineExperimentSummary | undefined {
+    if (!this.temporalPipelineSeen) return undefined;
+    return {
+      capturePaths: countRecord(this.capturePaths),
+      reservations: this.captureReservations,
+      reservationCancellations: this.captureReservationCancellations,
+      drops: countRecord(this.captureDrops),
+      coldAcquisitions: this.coldAcquisitions,
+      trackedFrames: this.trackedFrames,
+      trackingFallbacks: this.trackingFallbacks,
+      transitions: this.transitions,
+      ...(this.geometryWorkers === undefined ? {} : { geometryWorkers: this.geometryWorkers }),
+      ...(this.classifierWorkers === undefined
+        ? {}
+        : { classifierWorkers: this.classifierWorkers }),
+      ...(elapsedMs <= 0 || this.geometryWorkers === undefined
+        ? {}
+        : { geometryUtilization: Math.min(1, this.geometryBusyMs / elapsedMs) }),
+      ...(elapsedMs <= 0 || this.classifierWorkers === undefined
+        ? {}
+        : {
+            classifierUtilization: Math.min(
+              1,
+              this.classifierBusyMs / (elapsedMs * this.classifierWorkers),
+            ),
+          }),
+      geometryWorkerRestarts: this.geometryWorkerRestarts,
+      classifierWorkerRestarts: this.classifierWorkerRestarts,
+    };
+  }
+
+  private newFramesRate(): number | undefined {
+    if (this.uniqueNewFrameEvents < 2 || this.firstNewFrameAtMs === undefined ||
+        this.lastNewFrameAtMs === undefined ||
+        this.lastNewFrameAtMs <= this.firstNewFrameAtMs) return undefined;
+    return ((this.uniqueNewFrameEvents - 1) * 1_000) /
+      (this.lastNewFrameAtMs - this.firstNewFrameAtMs);
   }
 
   private color4ErasurePolicySnapshot(): Color4ErasurePolicyExperimentSummary | undefined {
@@ -1188,6 +1408,26 @@ function color4ErasurePolicyAttemptSamples(): Color4ErasurePolicyAttemptSamples 
 
 function isColor4ErasurePolicy(value: unknown): value is BrowserColor4ErasurePolicy {
   return COLOR4_ERASURE_POLICIES.some((candidate) => candidate === value);
+}
+
+function isCapturePath(value: unknown): value is BrowserCapturePath {
+  return CAPTURE_PATHS.some((candidate) => candidate === value);
+}
+
+function isCaptureDropReason(value: unknown): value is BrowserCaptureDropReason {
+  return CAPTURE_DROP_REASONS.some((candidate) => candidate === value);
+}
+
+function isGeometryPath(value: unknown): value is BrowserGeometryPath {
+  return GEOMETRY_PATHS.some((candidate) => candidate === value);
+}
+
+function isWorkerKind(value: unknown): value is BrowserWorkerKind {
+  return WORKER_KINDS.some((candidate) => candidate === value);
+}
+
+function validWorkerCount(value: unknown): value is number {
+  return Number.isInteger(value) && typeof value === "number" && value > 0 && value <= MAX_WORKERS;
 }
 
 function isColor4ErasureBudgetFraction(
@@ -1376,7 +1616,7 @@ export function makeExperimentExport(
 ): ExperimentExport {
   return {
     schema: "decimen-experiment-export",
-    version: 1,
+    version: 2,
     exportedAt: now.toISOString(),
     current,
     history,
