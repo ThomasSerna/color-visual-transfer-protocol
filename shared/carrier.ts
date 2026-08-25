@@ -36,7 +36,8 @@ export type BrowserCaptureDropReason =
   | "capture-failed"
   | "stale-session"
   | "watchdog";
-export type BrowserGeometryPath = "cold" | "tracked" | "fallback";
+/** `legacy` is the full-warp pipeline, entered by probe or hold, not a per-frame fallback. */
+export type BrowserGeometryPath = "cold" | "tracked" | "fallback" | "legacy";
 export type BrowserWorkerKind = "geometry" | "classifier";
 
 /**
@@ -174,6 +175,19 @@ export interface BrowserVisionDiagnostics {
     refinementResidualAfterMaxModules?: number;
     refinementAttempted: boolean;
     refinementApplied: boolean;
+  }>;
+  /**
+   * Present only on tracked frames, and never together with `detection`,
+   * `fiducials`, `optical` or `homography`: those describe an acquisition this
+   * frame did not run.
+   */
+  readonly tracking?: Readonly<{
+    trackedCorners: number;
+    /** Worst forward/backward error among the corners that tracked. */
+    forwardBackwardMaxPx?: number;
+    residualRmsModules?: number;
+    residualMaxModules?: number;
+    areaRatio?: number;
   }>;
   readonly optical?: Readonly<{
     apparentFrameWidthPx: number;

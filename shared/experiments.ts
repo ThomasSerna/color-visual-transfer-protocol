@@ -37,7 +37,7 @@ const CAPTURE_DROP_REASONS = [
   "stale-session",
   "watchdog",
 ] as const satisfies readonly BrowserCaptureDropReason[];
-const GEOMETRY_PATHS = ["cold", "tracked", "fallback"] as const satisfies
+const GEOMETRY_PATHS = ["cold", "tracked", "fallback", "legacy"] as const satisfies
   readonly BrowserGeometryPath[];
 const WORKER_KINDS = ["geometry", "classifier"] as const satisfies readonly BrowserWorkerKind[];
 const BOOTSTRAP_SAMPLING_METRICS = [
@@ -224,6 +224,15 @@ export interface VisionExperimentSummary {
     keyof NonNullable<BrowserVisionDiagnostics["optical"]>,
     TimingDistribution
   >>>;
+  /**
+   * Temporal-tracking gates, over tracked frames only. `optical`, `detection`
+   * and `homography` cover acquisition frames only; the two never overlap, so
+   * their sample counts add up to the submitted frames rather than matching it.
+   */
+  readonly tracking?: Readonly<Partial<Record<
+    keyof NonNullable<BrowserVisionDiagnostics["tracking"]>,
+    TimingDistribution
+  >>>;
   /** Optional photometric receiver-policy distributions; absent in older schema-v1 records. */
   readonly canonical?: VisionExperimentCanonicalSummary;
   /**
@@ -281,6 +290,10 @@ export interface TemporalPipelineExperimentSummary {
   readonly coldAcquisitions: number;
   readonly trackedFrames: number;
   readonly trackingFallbacks: number;
+  /** Frames decoded by the full-warp pipeline after a probe or during a hold. */
+  readonly legacyFrames: number;
+  readonly legacyProbes: number;
+  readonly legacyHolds: number;
   readonly transitions: number;
   readonly geometryWorkers?: number;
   readonly classifierWorkers?: number;
@@ -429,6 +442,9 @@ export class ExperimentMetrics {
   private coldAcquisitions = 0;
   private trackedFrames = 0;
   private trackingFallbacks = 0;
+  private legacyFrames = 0;
+  private legacyProbes = 0;
+  private legacyHolds = 0;
   private transitions = 0;
   private geometryWorkers: number | undefined;
   private classifierWorkers: number | undefined;
@@ -470,6 +486,10 @@ export class ExperimentMetrics {
   private readonly visionTimings = new Map<VisionTimingKey, number[]>();
   private readonly visionOptical = new Map<
     keyof NonNullable<BrowserVisionDiagnostics["optical"]>,
+    number[]
+  >();
+  private readonly visionTracking = new Map<
+    keyof NonNullable<BrowserVisionDiagnostics["tracking"]>,
     number[]
   >();
   private readonly visionBootstrapSampling = new Map<
@@ -594,7 +614,16 @@ export class ExperimentMetrics {
     this.temporalPipelineSeen = true;
     if (path === "cold") this.coldAcquisitions++;
     else if (path === "tracked") this.trackedFrames++;
+    else if (path === "legacy") this.legacyFrames++;
     else this.trackingFallbacks++;
+  }
+
+  recordLegacyFallbacks(input: { probes: number; holds: number }): void {
+    if (!Number.isSafeInteger(input.probes) || input.probes < 0 ||
+        !Number.isSafeInteger(input.holds) || input.holds < 0) return;
+    this.temporalPipelineSeen = true;
+    this.legacyProbes = input.probes;
+    this.legacyHolds = input.holds;
   }
 
   recordTransition(): void {
@@ -868,6 +897,21 @@ export class ExperimentMetrics {
         if (!samples) {
           samples = [];
           this.visionOptical.set(key, samples);
+        }
+        this.pushBounded(samples, Math.max(0, raw));
+      }
+    }
+    // Tracked frames report these in place of optical/homography, so the two
+    // sets of distributions never describe the same frame.
+    if (vision.tracking) {
+      for (const [key, raw] of Object.entries(vision.tracking) as Array<
+        [keyof NonNullable<BrowserVisionDiagnostics["tracking"]>, number]
+      >) {
+        if (!Number.isFinite(raw)) continue;
+        let samples = this.visionTracking.get(key);
+        if (!samples) {
+          samples = [];
+          this.visionTracking.set(key, samples);
         }
         this.pushBounded(samples, Math.max(0, raw));
       }
@@ -1198,6 +1242,9 @@ export class ExperimentMetrics {
       coldAcquisitions: this.coldAcquisitions,
       trackedFrames: this.trackedFrames,
       trackingFallbacks: this.trackingFallbacks,
+      legacyFrames: this.legacyFrames,
+      legacyProbes: this.legacyProbes,
+      legacyHolds: this.legacyHolds,
       transitions: this.transitions,
       ...(this.geometryWorkers === undefined ? {} : { geometryWorkers: this.geometryWorkers }),
       ...(this.classifierWorkers === undefined
@@ -1297,6 +1344,9 @@ export class ExperimentMetrics {
     const optical = Object.fromEntries(
       [...this.visionOptical].map(([key, samples]) => [key, distribution(samples)]),
     ) as VisionExperimentSummary["optical"];
+    const tracking = Object.fromEntries(
+      [...this.visionTracking].map(([key, samples]) => [key, distribution(samples)]),
+    ) as VisionExperimentSummary["tracking"];
     const bootstrapSampling = Object.fromEntries(
       [...this.visionBootstrapSampling].map(([key, samples]) => [key, distribution(samples)]),
     ) as NonNullable<VisionExperimentCanonicalSummary["bootstrapSampling"]>;
@@ -1370,6 +1420,7 @@ export class ExperimentMetrics {
       timingsMs,
       ...(this.visionWarnings.size === 0 ? {} : { warnings: Object.fromEntries(this.visionWarnings) }),
       ...(this.visionOptical.size === 0 ? {} : { optical }),
+      ...(this.visionTracking.size === 0 ? {} : { tracking }),
       ...(hasCanonicalPhotometry ? { canonical } : {}),
       ...(hasWorkerPressureInputs
         ? {

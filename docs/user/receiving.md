@@ -51,9 +51,10 @@ goodput when available. COLOR_4 runs additionally record stability warmup,
 stable/unstable captures, vision submissions, unstable/redundant-stable skips
 and the bounded normalized stability-score distribution. Schema-v2 summaries
 can also include bitmap/RGBA capture counts, reservations and whitelisted drop
-causes, cold/tracked/fallback/transition counts, worker counts/restarts/utilization, bounded
-tracking/sampling/guard/classifier timings, distinct-frame rate and estimated
-pipeline capacity. Existing schema-v1 history is exported unchanged alongside
+causes, cold/tracked/fallback/legacy/transition counts, legacy probes and holds,
+worker counts/restarts/utilization, bounded
+tracking/sampling/guard/classifier timings, tracking-gate distributions,
+distinct-frame rate and estimated pipeline capacity. Existing schema-v1 history is exported unchanged alongside
 new runs. **Clear history** deletes these summaries but not app preferences. Use
 this export for paired QR/COLOR_4 benchmark runs.
 
@@ -89,6 +90,12 @@ classifier/FEC workers by default. A capture reserves geometry and one
 classifier slot before any prefilter or bitmap allocation. There is no queued
 camera frame: if either stage lacks capacity, the new callback is deliberately
 discarded, protecting latency and memory while the fountain layer absorbs loss.
+
+If the temporal path rejects three non-transition frames in a row, the receiver
+spends one capture on the legacy full-warp pipeline. When that capture decodes,
+legacy holds for a bounded run and the temporal path then resumes from a fresh
+acquisition; repeats lengthen the hold up to a cap and a sustained good run
+clears it. The receiver never abandons the temporal path for a whole session.
 
 Before that worker, COLOR_4 measures motion using a 64×48 BT.709-luma
 fingerprint. It compares 8×8 blocks, uses normalized p90 mean absolute error,

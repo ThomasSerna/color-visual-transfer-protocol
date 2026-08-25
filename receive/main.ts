@@ -947,9 +947,8 @@ function submitColor4Frame(
       decodeTimes.push(performance.now());
       const diagnostics = decoded.diagnostics as BrowserCarrierDiagnostics;
       latestCarrierDiagnostics = diagnostics;
-      experiment?.recordGeometryPath(
-        decoded.geometryPath === "legacy" ? "fallback" : decoded.geometryPath,
-      );
+      experiment?.recordGeometryPath(decoded.geometryPath);
+      experiment?.recordLegacyFallbacks(reservedDecoder.legacyFallbacks);
       if (
         diagnostics.stage === "bootstrap" &&
         (diagnostics.rejectReason === "sequence-phase-mismatch" ||
@@ -1546,10 +1545,16 @@ function updateStats() {
       latestCarrierDiagnostics?.vision?.rejectReason ??
       latestCarrierDiagnostics?.rejectReason ??
       "—";
+    // A tracked frame decodes no fiducials at all, so it reports the corners
+    // optical flow kept instead. Showing the last acquisition's 4/4 here would
+    // claim a measurement this frame never made.
     const fiducials = latestCarrierDiagnostics?.vision?.fiducials;
-    metric("m-fiducials").textContent = fiducials
-      ? `${(["TL", "TR", "BR", "BL"] as const).filter((id) => fiducials[id]?.found).length}/4`
-      : "—";
+    const tracking = latestCarrierDiagnostics?.vision?.tracking;
+    metric("m-fiducials").textContent = tracking
+      ? `${tracking.trackedCorners}/16 tracked`
+      : fiducials
+        ? `${(["TL", "TR", "BR", "BL"] as const).filter((id) => fiducials[id]?.found).length}/4`
+        : "—";
     const visionSummary = currentSummary?.vision;
     const workerTiming = visionSummary?.timingsMs.workerTotal;
     metric("m-pipeline").textContent = workerTiming

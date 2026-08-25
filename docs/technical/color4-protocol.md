@@ -330,10 +330,20 @@ oriented fiducial corners, homography, frame quad and ROI.
 
 After cold acquisition, pyramidal Lucas–Kanade tracks those corners with a
 forward/backward check. Tracking is accepted only with at least 12/16 corners,
-forward/backward p95 at most 1.5 detection pixels, homography residual at most
-0.5 modules, a convex in-frame quad and area ratio in `[0.75, 1.33]`. Any failed
-gate triggers full acquisition on that same captured frame and replaces the
-state; a doubtful homography is never forwarded.
+a forward/backward error of at most 1.5 tracking pixels on **every** corner that
+tracked, homography residual at most 0.5 modules, a convex in-frame quad and
+area ratio in `[0.75, 1.33]`. Any failed gate triggers full acquisition on that
+same captured frame and replaces the state; a doubtful homography is never
+forwarded. Acquisition inside the fast path takes the same last-seen region hint
+the legacy path uses, and a region that misses widens to the full frame within
+the same call.
+
+Repeated non-transition rejections on the fast path buy one legacy capture as a
+probe. If the probe decodes, legacy holds for a bounded run of captures and then
+the fast path resumes from a fresh cold acquisition; a repeat doubles the hold up
+to a cap, and a sustained run of fast successes clears it. The hold is never
+permanent, and `legacy` is reported as its own geometry path so a held run is
+never mistaken for per-frame fallback.
 
 ### Decode concurrency
 
@@ -346,12 +356,20 @@ Each job carries a capture sequence, tracking generation and reserved slot so a
 late response cannot cross sessions or contaminate another capture.
 
 Tracked geometry remaps a compact 688×688 sampling plane with cubic interpolation
-and reusable fixed-point maps. Sixteen samples at offsets
-`{1.5,2.5,3.5,4.5}/6` are reduced to an exact per-channel median, yielding a
-172×172 interleaved `Float32` RGB module grid. Debug and snapshot requests retain
-the comparable legacy scale-6 warp. Classification, erasure selection, RS,
-CRC32C, identity and phase rules are identical for both inputs and keep all
-photometric calibration frame-local.
+and reusable fixed-point maps. The sixteen samples per module sit on exactly the
+canonical pixels the legacy warp reduces over — the window that insets
+`floor(scale/4)` pixels on each side, so `{1,2,3,4}` at scale 6 — which centres
+them on the module. They are reduced to an exact per-channel median, yielding a
+172×172 interleaved `Float32` RGB module grid. A canonical scale whose window is
+not four pixels wide cannot be reproduced on this fixed grid and stays on the
+legacy path. Debug and snapshot requests retain the comparable legacy scale-6
+warp. Classification, erasure selection, RS, CRC32C, identity and phase rules are
+identical for both inputs and keep all photometric calibration frame-local.
+
+A tracked frame decodes no contours and no fiducials, so it reports no contour
+counters, fiducial matches, optical metrics or acquisition homography. It reports
+its tracking gates instead. Acquisition and tracking diagnostics therefore never
+describe the same frame.
 
 Where the engine provides `createImageBitmap` and `OffscreenCanvas`, captures
 reach the worker as a transferred `ImageBitmap` rather than a pixel buffer read

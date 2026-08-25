@@ -132,6 +132,21 @@ function canonicalTransferables(request: Color4ClassifyRequest): Transferable[] 
   return [...values];
 }
 
+/**
+ * How the receiver retreats from the temporal path, and comes back.
+ *
+ * Three non-transition rejections buy one legacy capture. If that capture
+ * decodes, the fast path is the likely culprit and legacy holds for a while --
+ * but only for a while. A hold that never expired turned one bad second into a
+ * session that never tried the fast path again, and the rejections that trigger
+ * it (uncorrectable FEC, CRC mismatch, failed calibration) are ordinary events
+ * on a moving camera, not evidence of a broken device. Repeated failures double
+ * the hold up to the cap; a sustained run of fast successes clears it.
+ */
+export const LEGACY_HOLD_INITIAL_CAPTURES = 30;
+export const LEGACY_HOLD_MAXIMUM_CAPTURES = 480;
+export const LEGACY_HOLD_RESET_SUCCESSES = 30;
+
 export const DEFAULT_COLOR4_WORKER_COUNT = 2;
 export const MAXIMUM_COLOR4_WORKER_COUNT = 3;
 export const COLOR4_WORKER_WATCHDOG_MS = 5_000;
@@ -161,7 +176,11 @@ export class Color4CameraDecoder implements VisualDecoder {
   private session = 1;
   private fastRejectStreak = 0;
   private probeLegacyNext = false;
-  private legacySession = false;
+  private legacyHoldRemaining = 0;
+  private legacyHoldLength = 0;
+  private fastSuccessStreak = 0;
+  private legacyProbes = 0;
+  private legacyHolds = 0;
   private disposed = false;
   private fatal = false;
   private readyComplete = false;
@@ -264,6 +283,15 @@ export class Color4CameraDecoder implements VisualDecoder {
     return this.classifiers.length;
   }
 
+  /** Legacy probes taken, and holds entered, since this decoder started. */
+  get legacyFallbacks(): Readonly<{ probes: number; holds: number; holding: boolean }> {
+    return Object.freeze({
+      probes: this.legacyProbes,
+      holds: this.legacyHolds,
+      holding: this.legacyHoldRemaining > 0,
+    });
+  }
+
   get workerRestarts(): Readonly<{ geometry: number; classifier: number }> {
     return Object.freeze({
       geometry: this.geometry.restarts,
@@ -297,8 +325,17 @@ export class Color4CameraDecoder implements VisualDecoder {
     );
     if (!classifier) return undefined;
     const reservationId = this.nextReservationId++;
-    const mode = this.legacySession || this.probeLegacyNext ? "legacy" : "fast";
-    if (this.probeLegacyNext) this.probeLegacyNext = false;
+    const mode = this.legacyHoldRemaining > 0 || this.probeLegacyNext ? "legacy" : "fast";
+    if (this.probeLegacyNext) {
+      this.probeLegacyNext = false;
+      this.legacyProbes++;
+    } else if (this.legacyHoldRemaining > 0) {
+      this.legacyHoldRemaining--;
+      // The hold just expired. Retire whatever the geometry worker still holds
+      // so the fast path resumes from a cold acquisition rather than from state
+      // captured before the trouble started.
+      if (this.legacyHoldRemaining === 0) this.trackingGeneration++;
+    }
     const token: Color4CaptureReservation = Object.freeze({
       reservationId,
       captureSequence: this.nextCaptureSequence++,
@@ -513,9 +550,19 @@ export class Color4CameraDecoder implements VisualDecoder {
   ): void {
     if (state.token.mode === "legacy") {
       if (valid) {
-        this.legacySession = true;
+        // Legacy decoded what the fast path could not, so hold it -- longer
+        // each time this repeats, never forever.
+        this.legacyHoldLength = Math.min(
+          LEGACY_HOLD_MAXIMUM_CAPTURES,
+          Math.max(LEGACY_HOLD_INITIAL_CAPTURES, this.legacyHoldLength * 2),
+        );
+        this.legacyHoldRemaining = this.legacyHoldLength;
+        this.legacyHolds++;
         this.fastRejectStreak = 0;
-      } else if (!this.legacySession) {
+        this.fastSuccessStreak = 0;
+      } else if (this.legacyHoldRemaining === 0) {
+        // Legacy failed too, so the fast path was not the problem. Retire the
+        // geometry worker's state and let it acquire again.
         this.fastRejectStreak = 0;
         this.trackingGeneration++;
       }
@@ -523,12 +570,17 @@ export class Color4CameraDecoder implements VisualDecoder {
     }
     if (valid) {
       this.fastRejectStreak = 0;
+      this.fastSuccessStreak++;
+      // A sustained run on the fast path retires the backoff, so an isolated
+      // bad stretch cannot keep escalating the next one for the whole session.
+      if (this.fastSuccessStreak >= LEGACY_HOLD_RESET_SUCCESSES) this.legacyHoldLength = 0;
       return;
     }
     const transition = diagnostics.stage === "bootstrap" &&
       (diagnostics.rejectReason === "sequence-phase-mismatch" ||
         diagnostics.vision?.rejectReason === "phase_mismatch");
     if (transition) return;
+    this.fastSuccessStreak = 0;
     this.fastRejectStreak++;
     if (this.fastRejectStreak >= 3) {
       this.fastRejectStreak = 0;

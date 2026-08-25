@@ -151,7 +151,7 @@ export interface VisionTemporalTrackCandidate {
 
 export interface VisionTemporalTrackingThresholds {
   readonly minimumTrackedCorners?: number;
-  readonly maximumForwardBackwardP95Px?: number;
+  readonly maximumForwardBackwardMaxPx?: number;
   readonly maximumResidualModules?: number;
   readonly minimumAreaRatio?: number;
   readonly maximumAreaRatio?: number;
@@ -159,7 +159,7 @@ export interface VisionTemporalTrackingThresholds {
 
 export interface VisionTemporalTrackingDiagnostics {
   readonly trackedCorners: number;
-  readonly forwardBackwardP95Px?: number;
+  readonly forwardBackwardMaxPx?: number;
   readonly residualRmsModules?: number;
   readonly residualMaxModules?: number;
   readonly areaRatio?: number;
