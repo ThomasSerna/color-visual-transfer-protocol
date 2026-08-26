@@ -13,6 +13,7 @@ import {
   type Color4Profile,
 } from "../shared/color4/index.ts";
 import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
+import { assertClassifierDistribution } from "./helpers/classifier-distribution.ts";
 import {
   runColor4ErasurePolicy,
   type Color4ErasureBudgetFraction,
@@ -834,7 +835,7 @@ async function replayFixture(
     classifierOracle.candidateErasures,
     `${fixtureName}: classifier candidate erasures changed`,
   );
-  assert.deepEqual(
+  assertClassifierDistribution(
     classified.diagnostics.erasureCandidateScore,
     classifierOracle.erasureCandidateScore,
     `${fixtureName}: classifier erasure severity distribution changed`,

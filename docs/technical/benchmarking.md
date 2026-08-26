@@ -140,6 +140,17 @@ separate 1 MiB file. All six must reach `Signal recovered`, match bytes and
 SHA-256, progress `newFrames` and `resolvedBlocks` to K, and admit no frame to
 the fountain decoder before every carrier validation passes.
 
+A replay fixture pins cardinalities, per-shard counts and SHA-256 exactly, but
+its recorded classifier score distributions (`erasureCandidateScore` and any
+statistic like it) are compared against a relative tolerance of 1e-12, not bit
+for bit — see `tests/helpers/classifier-distribution.ts`. These are continuous
+statistics over Lab distances, so an arithmetic refactor can move them by an ULP
+without changing any decision, and an exact comparison reports that as a
+behavioural change. A real regression moves them by orders of magnitude. When
+re-recording a fixture, record the computed value verbatim and keep both copies
+of it — the fixture JSON and any literal a test compares that JSON against — in
+step; that fixture-versus-literal check is exact on purpose.
+
 ## Synthetic and soak gates
 
 Before physical claims, run the frozen corpus over all four rotations,

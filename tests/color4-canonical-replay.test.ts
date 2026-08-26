@@ -12,6 +12,7 @@ import {
   type Color4UnwrapObservation,
 } from "../shared/color4/index.ts";
 import { color4SequencePhaseMatches } from "../receive/color4-binding.ts";
+import { assertClassifierDistribution } from "./helpers/classifier-distribution.ts";
 import { runColor4ErasurePolicy } from "../receive/color4-erasure-policy.ts";
 
 const FIXTURE_DIRECTORY = fileURLToPath(
@@ -195,13 +196,17 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
     erasureDistribution(classified.byteErasures, classified.profile.shards),
     { total: 87, byShard: [13, 14, 14, 15, 18, 13] },
   );
-  assert.deepEqual(classified.diagnostics.erasureCandidateScore, {
-    count: 87,
-    min: 1.000340246414468,
-    p50: 1.6532158348557915,
-    p95: 17.866086603057013,
-    max: 454.59501886870567,
-  });
+  assertClassifierDistribution(
+    classified.diagnostics.erasureCandidateScore,
+    {
+      count: 87,
+      min: 1.0003402464144684,
+      p50: 1.6532158348557915,
+      p95: 17.866086603057013,
+      max: 454.59501886870567,
+    },
+    "canonical capture-000017 erasure severity",
+  );
   assert.equal(sha256(classified.codedBytes), CODED_BYTES_SHA256);
   assert.deepEqual(metadata.oracle.classification, {
     isiStrength: 0.4,
@@ -209,7 +214,7 @@ test("canonical capture 000017 reaches a CRC-valid unwrap through the ranked era
     candidateErasures: { total: 87, byShard: [13, 14, 14, 15, 18, 13] },
     erasureCandidateScore: {
       count: 87,
-      min: 1.000340246414468,
+      min: 1.0003402464144684,
       p50: 1.6532158348557915,
       p95: 17.866086603057013,
       max: 454.59501886870567,
