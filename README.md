@@ -6,6 +6,8 @@ device reconstructs the payload from any sufficient set of frames. There is no
 backend, account, pairing step or network path between the two devices. The
 payload travels as light.
 
+**Live site:** https://thomasserna.github.io/color-visual-transfer-protocol/
+
 <p align="center">
   <img src="docs/cvtp-signal-workshop.png" width="720"
        alt="Color Visual Transfer Protocol Signal Workshop home interface" />
