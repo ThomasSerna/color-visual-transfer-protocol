@@ -21,8 +21,9 @@
     "test:e2e:install": "playwright install chromium webkit",
     "preview": "vite preview",
     "icons": "node --import tsx build/make-icons.ts",
-    "test": "node --import tsx --test tests/*.test.ts",
-    "test:color4": "npm run typecheck && node --import tsx --test tests/color4-*.test.ts tests/experiments.test.ts tests/frame-timing.test.ts tests/platform.test.ts tests/receiver-defaults.test.ts",
+    "test": "node --import tsx --test tests/*.test.ts && npm run test:perf",
+    "test:perf": "node --import tsx --test --test-concurrency=1 tests/*.perf.ts",
+    "test:color4": "npm run typecheck && node --import tsx --test tests/color4-*.test.ts tests/experiments.test.ts tests/frame-timing.test.ts tests/platform.test.ts tests/receiver-defaults.test.ts && npm run test:perf",
     "test:color4:corpus": "node --import tsx --test tests/color4-opencv-corpus.test.ts",
     "test:stress": "node --expose-gc --max-old-space-size=4096 --import tsx --test tests/stress/*.stress.ts"
   },

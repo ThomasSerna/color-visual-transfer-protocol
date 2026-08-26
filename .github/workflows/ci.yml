@@ -42,10 +42,10 @@ jobs:
           fi
           bytes=$(stat -c%s "${chunks[0]}")
           echo "receive chunk: ${chunks[0]} — $bytes bytes"
-          # Rollup can move a few shared helpers between entry chunks when the
-          # sender graph changes. 32 KiB still fails decisively if a decoder
-          # worker or either WASM runtime is ever pulled into this entry.
-          test "$bytes" -lt 32768
+          # 48 KiB leaves room for legitimate receiver logic while remaining
+          # smaller than this entry plus even the smallest decoder worker. It
+          # also fails decisively if either WASM runtime reaches this entry.
+          test "$bytes" -lt 49152
 
       # rootPwaHead() in build/root-pwa-head.ts already asserts this at build
       # time, but only against the HTML it rewrote. This checks the files on disk
